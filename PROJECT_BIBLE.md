@@ -1,6 +1,6 @@
 # Polymarket 组合套利系统
 
-## 项目圣经 v1.0
+## 项目圣经 v1.1
 
 > 本文档是项目的核心参考，包含需求定义、策略说明、技术设计、开发路线图和运维指南。
 > 所有开发决策应参照本文档执行。
@@ -50,6 +50,7 @@
 ### 短期目标（Phase 1-2，1-2个月）
 - [x] 验证核心策略可行性
 - [x] 构建MVP原型
+- [x] 支持多种LLM提供商
 - [ ] 在真实市场中发现并验证套利机会
 - [ ] 实现小额（$100-500）手动执行的工作流
 
@@ -83,7 +84,7 @@
 ### 不在范围内 ❌
 - 基于预测的方向性交易（不是套利）
 - 高频毫秒级套利（需要专业基础设施）
-- 做空策略（Polymarket不支持）
+- 做空策略（Polymarket不支持原生做空）
 - 杠杆交易
 
 ---
@@ -109,8 +110,8 @@
 ```
 Event（事件）
 ├── Market 1（市场1）: "Trump wins?"
-│   ├── YES Token
-│   └── NO Token
+│   ├── YES Token（是代币）
+│   └── NO Token（否代币）
 ├── Market 2（市场2）: "Trump wins by 1-49?"
 │   ├── YES Token
 │   └── NO Token
@@ -121,10 +122,12 @@ Event（事件）
 
 ### 定价机制
 
-- 订单簿模式（非AMM）
-- 价格范围：$0.00 - $1.00
-- 结算：YES赢得支付$1.00，NO赢得支付$1.00
-- 理论上：P(YES) + P(NO) = 1.00
+- **订单簿模式**（非AMM）：买卖双方直接匹配
+- **价格范围**：$0.00 - $1.00
+- **结算规则**：
+  - YES赢得 → 支付$1.00
+  - NO赢得 → 支付$1.00
+- **理论约束**：P(YES) + P(NO) = 1.00
 
 ## 2.2 套利机会来源分析
 
@@ -142,13 +145,13 @@ Event（事件）
 
 ### 套利机会的竞争格局
 
-| 策略类型 | 机器人竞争 | 个人机会 | 说明 |
-|----------|------------|----------|------|
-| 单市场套利 | 🔴极高 | ❌几乎无 | 毫秒级消失 |
-| 收盘扫货 | 🟡中等 | ⚠️有限 | 大户操纵风险 |
-| **组合套利** | 🟢低 | ✅有 | 需要逻辑判断 |
-| **做市** | 🟢低 | ✅有 | 需要资金和策略 |
-| **跨平台套利** | 🟢低 | ✅有 | 需要多平台资金 |
+| 策略类型 | 机器人竞争 | 个人机会 | 利润占比 | 说明 |
+|----------|------------|----------|----------|------|
+| 单市场套利 | 🔴极高 | ❌几乎无 | 99%+ | 毫秒级消失，需要节点级基础设施 |
+| 收盘扫货 | 🟡中等 | ⚠️有限 | ~0.5% | 大户操纵风险，黑天鹅事件 |
+| **组合套利** | 🟢低 | ✅有 | **0.24%** | 需要逻辑判断，LLM可辅助 |
+| **做市** | 🟢低 | ✅有 | - | 需要资金和策略 |
+| **跨平台套利** | 🟢低 | ✅有 | - | 需要多平台资金 |
 
 ### 选择组合套利的理由
 
@@ -166,8 +169,21 @@ Event（事件）
 
 **套利条件**：Σ(YES价格) < $1.00
 
-**示例**：
+**数学原理**：
+```
+设有n个互斥且完备的结果: O₁, O₂, ..., Oₙ
+约束: P(O₁) + P(O₂) + ... + P(Oₙ) = 1
 
+如果市场定价: p₁ + p₂ + ... + pₙ < 1
+则存在套利机会
+
+操作: 买入所有选项各一份
+成本: Σpᵢ < 1
+回报: 1.00（无论哪个结果发生）
+利润: 1.00 - Σpᵢ
+```
+
+**示例**：
 ```
 事件：2028年美国大选结果
 
@@ -186,6 +202,7 @@ Event（事件）
 - [ ] 这些选项真的互斥吗？
 - [ ] 这些选项覆盖了所有可能吗？
 - [ ] 结算规则是否一致？
+- [ ] 是否有遗漏的选项？
 
 ### 2.3.2 包含关系套利（Implication Arbitrage）
 
@@ -193,8 +210,29 @@ Event（事件）
 
 **套利条件**：P(B) < P(A) - ε（ε为交易成本）
 
-**示例**：
+**数学原理**：
+```
+逻辑关系: A → B（A蕴含B）
+概率约束: P(B) ≥ P(A)
 
+如果市场定价违反此约束: P(B) < P(A)
+则存在套利机会
+
+操作: 
+- 买B的YES @ P(B)
+- 买A的NO @ (1-P(A))
+
+成本: P(B) + (1-P(A))
+回报分析:
+  - 若A发生（则B必发生）: B的YES=1, A的NO=0, 回报=1
+  - 若A不发生且B发生: B的YES=1, A的NO=1, 回报=2
+  - 若A不发生且B不发生: B的YES=0, A的NO=1, 回报=1
+
+最小回报: 1.00
+利润: 1.00 - 成本
+```
+
+**示例**：
 ```
 逻辑关系: "特朗普赢" → "共和党赢"（因为特朗普是共和党候选人）
 
@@ -226,6 +264,7 @@ Event（事件）
 | 夺冠→季后赛 | 夺冠 → 进季后赛 | Lakers夺冠 → Lakers进季后赛 |
 | 具体→抽象 | 具体事件 → 抽象类别 | BTC破$100k → BTC破$90k |
 | 州→全国 | 赢关键州组合 → 赢全国 | 赢PA+GA+NC → 赢总统 |
+| 时间包含 | 年内发生 → 半年内发生 | 2025年发生 → 2025H1发生 |
 
 ### 2.3.3 等价市场套利（Equivalent Market Arbitrage）
 
@@ -234,7 +273,6 @@ Event（事件）
 **套利条件**：|P(A) - P(B)| > ε
 
 **示例**：
-
 ```
 市场A: "Will Trump win the 2024 election?"    YES = $0.52
 市场B: "Trump victory November 2024?"         YES = $0.48
@@ -242,8 +280,12 @@ Event（事件）
 价差: 4%
 
 操作:
-- 买低价市场YES
-- 买高价市场NO
+- 买低价市场YES @ $0.48
+- 买高价市场NO @ $0.48
+成本: $0.96
+
+回报: $1.00（两个市场结果必然相同）
+利润: $0.04 (4.2%)
 ```
 
 ### 2.3.4 跨平台套利（Cross-Platform Arbitrage）
@@ -253,7 +295,6 @@ Event（事件）
 **套利条件**：Polymarket_YES + Kalshi_NO < $1.00 - 费用
 
 **示例**：
-
 ```
 事件: "比特币1小时内是否突破$95,000"
 
@@ -272,6 +313,7 @@ Kalshi:     NO  = $0.48
 - ⚠️ **结算规则差异**：两平台对"同一事件"的定义可能不同
 - ⚠️ **时间差**：结算时间可能不一致
 - ⚠️ **资金分散**：需要在两个平台都存资金
+- ⚠️ **费用差异**：不同平台费用结构不同
 
 ## 2.4 研究数据支撑
 
@@ -293,6 +335,15 @@ Kalshi:     NO  = $0.48
 2. **62%的LLM识别的依赖关系未能产生利润**：执行障碍是主要问题
 3. **成功的组合套利平均利润~$19,000/对**：单个机会利润可观
 4. **选举相关市场是主要机会来源**：政治事件产生最多相关市场
+
+### 失败原因分析
+
+| 失败原因 | 占比 | 说明 |
+|----------|------|------|
+| 结算规则差异 | ~40% | 两市场对"成功"定义不同 |
+| 时间差问题 | ~25% | 结算时间不一致 |
+| 逻辑关系误判 | ~20% | LLM判断错误 |
+| 流动性不足 | ~15% | 无法以预期价格成交 |
 
 ---
 
@@ -322,8 +373,9 @@ Kalshi:     NO  = $0.48
 | FR-002-3 | 基于向量相似度识别语义相关市场 | P1 | 2 |
 | FR-002-4 | LLM分析市场间逻辑关系类型 | P0 | 1 |
 | FR-002-5 | LLM输出置信度和边界情况 | P0 | 1 |
-| FR-002-6 | 缓存已分析的市场对关系 | P1 | 2 |
-| FR-002-7 | 支持人工标注和修正 | P2 | 3 |
+| FR-002-6 | 支持多种LLM提供商切换 | P0 | 1 |
+| FR-002-7 | 缓存已分析的市场对关系 | P1 | 2 |
+| FR-002-8 | 支持人工标注和修正 | P2 | 3 |
 
 ### FR-003: 套利检测
 
@@ -436,18 +488,18 @@ Kalshi:     NO  = $0.48
 - 列出需要人工确认的检查项
 ```
 
-### US-004: 验证逻辑关系
+### US-004: 切换LLM提供商
 
 ```
-作为一个谨慎的交易者
-我想要验证LLM判断的逻辑关系是否正确
-以便我确保这真的是无风险套利
+作为一个想要控制成本的用户
+我想要能够灵活切换不同的LLM提供商
+以便我能够在成本和效果之间找到平衡
 
 验收标准:
-- 能看到LLM的完整推理过程
-- 能看到可能的边界情况
-- 能看到结算规则的兼容性分析
-- 能手动标记"已验证"或"有问题"
+- 支持通过环境变量切换提供商
+- 支持通过配置文件切换提供商
+- 切换后无需修改代码
+- 提供各提供商的成本对比
 ```
 
 ---
@@ -484,8 +536,8 @@ Kalshi:     NO  = $0.48
 ┌─────────────────────────────────────────────────────────────────┐
 │                        基础设施层                                │
 │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐    │
-│  │ Polymarket│  │  Kalshi   │  │  Claude   │  │  Vector   │    │
-│  │    API    │  │   API     │  │   API     │  │    DB     │    │
+│  │ Polymarket│  │  Kalshi   │  │  多LLM    │  │  Vector   │    │
+│  │    API    │  │   API     │  │  提供商   │  │    DB     │    │
 │  └───────────┘  └───────────┘  └───────────┘  └───────────┘    │
 │       │              │              │              │            │
 │       ▼              ▼              ▼              ▼            │
@@ -560,24 +612,34 @@ class SimilarityFilter:
 - `KeywordSimilarityFilter`: 关键词Jaccard相似度（Phase 1）
 - `EmbeddingSimilarityFilter`: 向量相似度 + Chroma（Phase 2）
 
-### 4.2.3 LLMAnalyzer - LLM分析器
+### 4.2.3 LLMAnalyzer - LLM分析器（多提供商支持）
 
 **职责**：分析两个市场之间的逻辑关系
 
 ```python
+from llm_providers import BaseLLMClient, create_llm_client
+
 class LLMAnalyzer:
-    """LLM分析器接口"""
+    """LLM分析器 - 支持多种提供商"""
+    
+    def __init__(self, config: Config):
+        # 根据配置创建对应的LLM客户端
+        self.client: BaseLLMClient = create_llm_client(
+            provider=config.llm.provider,
+            model=config.llm.model,
+            api_key=config.llm.api_key,
+            api_base=config.llm.api_base,
+        )
     
     def analyze_pair(
         self, 
         market_a: Market, 
         market_b: Market
     ) -> RelationshipAnalysis:
-        """
-        分析两个市场的逻辑关系
-        返回: 关系类型、置信度、推理过程、边界情况
-        """
-        pass
+        """分析两个市场的逻辑关系"""
+        prompt = self._build_prompt(market_a, market_b)
+        response = self.client.chat(prompt)
+        return self._parse_response(response.content)
     
     def batch_analyze(
         self,
@@ -585,12 +647,23 @@ class LLMAnalyzer:
     ) -> List[RelationshipAnalysis]:
         """批量分析"""
         pass
+    
+    def close(self):
+        """释放LLM客户端资源"""
+        self.client.close()
 ```
 
-**实现**：
-- `ClaudeAnalyzer`: 调用Claude API
-- `RuleBasedAnalyzer`: 规则匹配（备用）
-- `CachedAnalyzer`: 带缓存的分析器
+**支持的LLM提供商**：
+
+| 提供商 | 说明 | 适用场景 |
+|--------|------|----------|
+| OpenAI | GPT-4系列 | 高精度需求 |
+| Anthropic | Claude系列 | 复杂推理 |
+| DeepSeek | 国产高性价比 | 日常使用（推荐） |
+| 阿里云 | 通义千问 | 国内网络 |
+| 智谱 | GLM-4 | 国内网络 |
+| Ollama | 本地模型 | 离线/免费（推荐） |
+| OpenAI兼容 | vLLM/OneAPI等 | 自建服务 |
 
 ### 4.2.4 ArbitrageDetector - 套利检测器
 
@@ -599,6 +672,11 @@ class LLMAnalyzer:
 ```python
 class ArbitrageDetector:
     """套利检测器"""
+    
+    def check_pair(self, market_a: Market, market_b: Market,
+                   analysis: RelationshipAnalysis) -> Optional[ArbitrageOpportunity]:
+        """检查市场对是否存在套利"""
+        pass
     
     def check_exhaustive_set(
         self, 
@@ -700,7 +778,7 @@ class ArbitrageScanner:
           │                   ▼
           │           ┌────────────────┐
           │           │  LLMAnalyzer   │
-          │           │                │
+          │           │ (多提供商支持)  │
           │           └───────┬────────┘
           │                   │
           │                   ▼
@@ -736,56 +814,85 @@ class ArbitrageScanner:
 ```python
 # config.py
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import os
+import json
 
 @dataclass
-class Config:
-    """系统配置"""
-    
-    # API配置
-    polymarket_api: str = "https://gamma-api.polymarket.com"
-    kalshi_api: str = "https://trading-api.kalshi.com"
-    anthropic_api_key: Optional[str] = None
-    
-    # 扫描配置
+class LLMSettings:
+    """LLM配置"""
+    provider: str = "openai"  # openai/anthropic/deepseek/aliyun/zhipu/ollama
+    model: str = ""           # 留空使用默认
+    api_key: str = ""         # 留空从环境变量读取
+    api_base: str = ""        # 留空使用默认
+    max_tokens: int = 2000
+    temperature: float = 0.7
+    timeout: int = 60
+
+@dataclass
+class ScanSettings:
+    """扫描配置"""
     market_limit: int = 200
     similarity_threshold: float = 0.3
     min_profit_pct: float = 2.0
     min_liquidity: float = 10000
     min_confidence: float = 0.8
-    max_llm_calls_per_scan: int = 30
-    
-    # LLM配置
-    llm_model: str = "claude-sonnet-4-20250514"
-    llm_max_tokens: int = 1500
-    
-    # 存储配置
+    max_llm_calls: int = 30
+
+@dataclass
+class OutputSettings:
+    """输出配置"""
     output_dir: str = "./output"
     cache_dir: str = "./cache"
-    
-    # 日志配置
     log_level: str = "INFO"
     detailed_log: bool = True
+
+@dataclass
+class Config:
+    """主配置类"""
+    llm: LLMSettings = field(default_factory=LLMSettings)
+    scan: ScanSettings = field(default_factory=ScanSettings)
+    output: OutputSettings = field(default_factory=OutputSettings)
     
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量加载配置"""
         return cls(
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-            min_profit_pct=float(os.getenv("MIN_PROFIT_PCT", "2.0")),
-            min_liquidity=float(os.getenv("MIN_LIQUIDITY", "10000")),
-            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            llm=LLMSettings(
+                provider=os.getenv("LLM_PROVIDER", "openai"),
+                model=os.getenv("LLM_MODEL", ""),
+                api_key=os.getenv("LLM_API_KEY", ""),
+                api_base=os.getenv("LLM_API_BASE", ""),
+            ),
+            scan=ScanSettings(
+                min_profit_pct=float(os.getenv("MIN_PROFIT_PCT", "2.0")),
+                min_liquidity=float(os.getenv("MIN_LIQUIDITY", "10000")),
+            ),
+            output=OutputSettings(
+                log_level=os.getenv("LOG_LEVEL", "INFO"),
+            )
         )
     
     @classmethod
     def from_file(cls, path: str) -> "Config":
-        """从配置文件加载"""
-        import json
-        with open(path) as f:
+        """从JSON文件加载配置"""
+        with open(path, "r") as f:
             data = json.load(f)
-        return cls(**data)
+        return cls(
+            llm=LLMSettings(**data.get("llm", {})),
+            scan=ScanSettings(**data.get("scan", {})),
+            output=OutputSettings(**data.get("output", {})),
+        )
+    
+    @classmethod
+    def load(cls, config_path: Optional[str] = None) -> "Config":
+        """加载配置（优先级：指定文件 > config.json > 环境变量）"""
+        if config_path and os.path.exists(config_path):
+            return cls.from_file(config_path)
+        if os.path.exists("config.json"):
+            return cls.from_file("config.json")
+        return cls.from_env()
 ```
 
 ---
@@ -852,7 +959,7 @@ class Event:
     total_volume: float          # 总交易量
 ```
 
-### RelationshipAnalysis - 关系分析结果
+### RelationType - 逻辑关系类型
 
 ```python
 class RelationType(Enum):
@@ -863,7 +970,11 @@ class RelationType(Enum):
     MUTUAL_EXCLUSIVE = "mutual_exclusive"  # A ⊕ B
     EXHAUSTIVE = "exhaustive"          # A + B + ... = Ω
     UNRELATED = "unrelated"            # 无关
+```
 
+### RelationshipAnalysis - 关系分析结果
+
+```python
 @dataclass
 class RelationshipAnalysis:
     """LLM分析结果"""
@@ -1029,32 +1140,6 @@ def jaccard_similarity(text_a: str, text_b: str) -> float:
     return intersection / union if union > 0 else 0.0
 ```
 
-### Phase 2: 向量相似度
-
-```python
-from sentence_transformers import SentenceTransformer
-import numpy as np
-
-class EmbeddingSimilarity:
-    def __init__(self, model_name: str = "intfloat/e5-large-v2"):
-        self.model = SentenceTransformer(model_name)
-    
-    def cosine_similarity(self, text_a: str, text_b: str) -> float:
-        """
-        计算余弦相似度
-        
-        cos(θ) = (A · B) / (|A| × |B|)
-        """
-        emb_a = self.model.encode(text_a)
-        emb_b = self.model.encode(text_b)
-        
-        dot_product = np.dot(emb_a, emb_b)
-        norm_a = np.linalg.norm(emb_a)
-        norm_b = np.linalg.norm(emb_b)
-        
-        return dot_product / (norm_a * norm_b)
-```
-
 ### 综合相似度
 
 ```python
@@ -1072,9 +1157,6 @@ def calculate_similarity(market_a: Market, market_b: Market) -> float:
     if market_a.end_date and market_a.end_date == market_b.end_date:
         text_sim += 0.1
     
-    # 同类别加权（如都是政治类）
-    # ...
-    
     return min(text_sim, 1.0)
 ```
 
@@ -1083,18 +1165,21 @@ def calculate_similarity(market_a: Market, market_b: Market) -> float:
 ### Prompt工程
 
 ```python
-ANALYSIS_PROMPT = """
-你是一个专门分析预测市场逻辑关系的专家。请分析以下两个市场：
+ANALYSIS_PROMPT = """你是一个专门分析预测市场逻辑关系的专家。
 
-**市场A:** {question_a}
+请分析以下两个Polymarket预测市场之间的逻辑关系：
+
+**市场A:**
+- 问题: {question_a}
 - 描述: {description_a}
-- YES价格: ${price_a}
-- 结算源: {source_a}
+- YES价格: ${price_a:.3f}
+- 结算来源: {source_a}
 
-**市场B:** {question_b}
+**市场B:**
+- 问题: {question_b}
 - 描述: {description_b}
-- YES价格: ${price_b}
-- 结算源: {source_b}
+- YES价格: ${price_b:.3f}
+- 结算来源: {source_b}
 
 请判断逻辑关系类型（6选1）：
 1. IMPLIES_AB: A发生→B必发生，约束P(B)≥P(A)
@@ -1104,43 +1189,17 @@ ANALYSIS_PROMPT = """
 5. EXHAUSTIVE: 完备集的一部分
 6. UNRELATED: 无逻辑关系
 
-返回JSON格式：
-{
+请严格按以下JSON格式回答（不要有任何其他内容）：
+```json
+{{
   "relationship": "类型",
   "confidence": 0.0-1.0,
   "reasoning": "分析理由",
   "probability_constraint": "约束表达式",
-  "edge_cases": ["边界情况列表"],
-  "resolution_compatible": true/false
-}
-"""
-```
-
-### 响应解析
-
-```python
-def parse_llm_response(response: str) -> RelationshipAnalysis:
-    """解析LLM响应"""
-    
-    # 提取JSON
-    if "```json" in response:
-        json_str = response.split("```json")[1].split("```")[0]
-    elif "```" in response:
-        json_str = response.split("```")[1].split("```")[0]
-    else:
-        json_str = response
-    
-    data = json.loads(json_str.strip())
-    
-    return RelationshipAnalysis(
-        relationship=RelationType(data["relationship"].lower()),
-        confidence=data["confidence"],
-        reasoning=data["reasoning"],
-        probability_constraint=data.get("probability_constraint"),
-        edge_cases=data.get("edge_cases", []),
-        resolution_compatible=data.get("resolution_compatible", True),
-        # ...
-    )
+  "edge_cases": ["边界情况"],
+  "resolution_compatible": true或false
+}}
+```"""
 ```
 
 ## 6.3 套利检测算法
@@ -1223,11 +1282,9 @@ def detect_implication_arbitrage(
     """
     
     if analysis.relationship == RelationType.IMPLIES_AB:
-        # A → B，检查 P(B) >= P(A)
         implying = market_a  # 蕴含方
         implied = market_b   # 被蕴含方
     elif analysis.relationship == RelationType.IMPLIES_BA:
-        # B → A，检查 P(A) >= P(B)
         implying = market_b
         implied = market_a
     else:
@@ -1268,7 +1325,6 @@ def detect_implication_arbitrage(
         needs_review=[
             "验证逻辑关系确实成立",
             "检查结算规则是否兼容",
-            analysis.resolution_notes or "检查结算规则"
         ],
         discovered_at=datetime.now().isoformat()
     )
@@ -1327,54 +1383,84 @@ GET /markets
 ]
 ```
 
-#### 获取事件列表
+## 7.2 LLM API（多提供商支持）
 
-```http
-GET /events
-```
+### 7.2.1 支持的提供商
 
-#### 获取事件下的市场
+| 提供商 | 环境变量 | 默认模型 | API Base |
+|--------|----------|----------|----------|
+| **OpenAI** | `OPENAI_API_KEY` | gpt-4o | api.openai.com |
+| **Anthropic** | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | api.anthropic.com |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | deepseek-chat | api.deepseek.com |
+| **阿里云通义** | `DASHSCOPE_API_KEY` | qwen-plus | dashscope.aliyuncs.com |
+| **智谱GLM** | `ZHIPU_API_KEY` | glm-4-plus | open.bigmodel.cn |
+| **Ollama** | (本地运行) | llama3.1:8b | localhost:11434 |
+| **OpenAI兼容** | `LLM_API_KEY` + `LLM_API_BASE` | 自定义 | 自定义 |
 
-```http
-GET /markets?event_slug={slug}
-```
-
-### CLOB API（交易）
-
-**Base URL**: `https://clob.polymarket.com`
-
-> 注：交易API需要钱包签名，Phase 4+实现
-
-## 7.2 Claude API
-
-**Base URL**: `https://api.anthropic.com/v1`
-
-### 消息接口
+### 7.2.2 统一调用接口
 
 ```python
-import anthropic
+from llm_providers import create_llm_client
 
-client = anthropic.Anthropic(api_key="...")
+# 方式1: 自动检测（根据环境变量）
+client = create_llm_client()
 
-response = client.messages.create(
-    model="claude-sonnet-4-20250514",
-    max_tokens=1500,
-    messages=[
-        {"role": "user", "content": prompt}
-    ]
+# 方式2: 指定提供商
+client = create_llm_client(provider="openai", model="gpt-4o")
+client = create_llm_client(provider="deepseek", model="deepseek-chat")
+client = create_llm_client(provider="aliyun", model="qwen-max")
+
+# 方式3: 使用本地Ollama
+client = create_llm_client(provider="ollama", model="llama3.1:70b")
+
+# 方式4: 自定义OpenAI兼容接口（如vLLM, OneAPI）
+client = create_llm_client(
+    provider="openai_compatible",
+    api_base="http://my-server:8000/v1",
+    model="my-model"
 )
 
-content = response.content[0].text
+# 统一的调用方式
+response = client.chat("你好")
+print(response.content)
+
+# 带系统提示词
+response = client.chat(
+    message="分析这两个市场的关系",
+    system_prompt="你是一个预测市场分析专家"
+)
+
+# 清理资源
+client.close()
 ```
 
-### 成本估算
+### 7.2.3 成本估算
 
-| 模型 | 输入价格 | 输出价格 | 每次分析估算 |
-|------|----------|----------|--------------|
-| Claude Sonnet | $3/M tokens | $15/M tokens | ~$0.01 |
-| Claude Haiku | $0.25/M | $1.25/M | ~$0.001 |
+| 提供商 | 模型 | 输入价格 | 输出价格 | 每次分析估算 |
+|--------|------|----------|----------|--------------|
+| OpenAI | gpt-4o | $2.5/M | $10/M | ~$0.008 |
+| OpenAI | gpt-4o-mini | $0.15/M | $0.6/M | ~$0.0005 |
+| Anthropic | Claude Sonnet | $3/M | $15/M | ~$0.01 |
+| Anthropic | Claude Haiku | $0.25/M | $1.25/M | ~$0.001 |
+| **DeepSeek** | deepseek-chat | ¥1/M | ¥2/M | **~¥0.002** |
+| 阿里云 | qwen-plus | ¥0.8/M | ¥2/M | ~¥0.002 |
+| 智谱 | glm-4-plus | ¥50/M | ¥50/M | ~¥0.05 |
+| **Ollama** | llama3.1:8b | 免费 | 免费 | **$0** |
 
-**建议**：开发阶段用Sonnet，生产阶段可切换Haiku降本
+**推荐配置**：
+- **开发测试**：Ollama本地模型（免费）或 DeepSeek（极低成本）
+- **生产环境**：DeepSeek 或 Claude Haiku（平衡成本与效果）
+- **高精度需求**：GPT-4o 或 Claude Sonnet
+
+### 7.2.4 提供商选择建议
+
+| 场景 | 推荐提供商 | 理由 |
+|------|------------|------|
+| 国内网络 | DeepSeek / 阿里云 | 无需代理，延迟低 |
+| 成本敏感 | Ollama / DeepSeek | 免费或极低成本 |
+| 效果优先 | OpenAI / Anthropic | 逻辑推理能力强 |
+| 离线环境 | Ollama | 本地运行，无需网络 |
+| 企业部署 | OpenAI兼容接口 | 可对接内部模型服务 |
 
 ## 7.3 Kalshi API（Phase 3）
 
@@ -1388,8 +1474,27 @@ content = response.content[0].text
 
 ```
 requests>=2.28.0       # HTTP客户端
-anthropic>=0.18.0      # Claude API
+httpx>=0.24.0          # 异步HTTP客户端（LLM调用）
 python-dotenv>=1.0.0   # 环境变量管理
+```
+
+### LLM提供商依赖（按需安装）
+
+```
+# 使用httpx即可支持所有OpenAI兼容接口
+# 以下SDK是可选的
+
+# OpenAI
+openai>=1.0.0
+
+# Anthropic
+anthropic>=0.18.0
+
+# 阿里云通义
+dashscope>=1.10.0
+
+# 智谱GLM
+zhipuai>=2.0.0
 ```
 
 ### Phase 2扩展
@@ -1398,22 +1503,6 @@ python-dotenv>=1.0.0   # 环境变量管理
 sentence-transformers>=2.2.0   # 文本嵌入
 chromadb>=0.4.0               # 向量数据库
 numpy>=1.24.0                 # 数值计算
-```
-
-### Phase 3扩展
-
-```
-websockets>=11.0       # WebSocket客户端
-aiohttp>=3.8.0        # 异步HTTP
-apscheduler>=3.10.0   # 定时任务
-```
-
-### Phase 4扩展
-
-```
-web3>=6.0.0           # 以太坊交互
-flask>=2.3.0          # Web框架
-sqlalchemy>=2.0.0     # ORM
 ```
 
 ---
@@ -1435,13 +1524,17 @@ sqlalchemy>=2.0.0     # ORM
 - [x] T1.5 实现完备集套利检测
 - [x] T1.6 实现包含关系套利检测
 - [x] T1.7 实现报告生成
-- [x] T1.8 编写README文档
+- [x] T1.8 实现多LLM提供商支持
+- [x] T1.9 编写项目文档
 
 ### 交付物
 
 - [x] `polymarket_arb_mvp.py` - MVP完整脚本
+- [x] `local_scanner_v2.py` - 支持多LLM的扫描器
+- [x] `llm_providers.py` - LLM提供商抽象层
+- [x] `config.py` - 配置管理
 - [x] `README.md` - 基础文档
-- [x] `requirements.txt` - 依赖列表
+- [x] `PROJECT_BIBLE.md` - 完整项目文档
 
 ## 8.2 Phase 2: 真实数据验证
 
@@ -1453,18 +1546,10 @@ sqlalchemy>=2.0.0     # ORM
 
 - [ ] T2.1 实现Polymarket API客户端
 - [ ] T2.2 测试API连接和数据解析
-- [ ] T2.3 集成Claude API
-- [ ] T2.4 实现LLM分析器
-- [ ] T2.5 添加分析结果缓存
-- [ ] T2.6 在真实数据上运行扫描
-- [ ] T2.7 手动验证发现的机会
-- [ ] T2.8 优化Prompt提高准确率
-
-### 交付物
-
-- [ ] `local_scanner.py` - 本地扫描脚本（已完成框架）
-- [ ] 至少5个经人工验证的真实套利机会记录
-- [ ] LLM分析准确率评估报告
+- [ ] T2.3 在真实数据上运行扫描
+- [ ] T2.4 手动验证发现的机会
+- [ ] T2.5 优化Prompt提高准确率
+- [ ] T2.6 添加分析结果缓存
 
 ### 验收标准
 
@@ -1480,30 +1565,13 @@ sqlalchemy>=2.0.0     # ORM
 
 ### 任务清单
 
-- [ ] T3.1 实现向量相似度筛选
-  - [ ] 集成sentence-transformers
-  - [ ] 集成Chroma向量数据库
-  - [ ] 实现增量索引
+- [ ] T3.1 实现向量相似度筛选（sentence-transformers + Chroma）
 - [ ] T3.2 实现WebSocket实时监控
-  - [ ] 订阅价格更新
-  - [ ] 实现变化检测
 - [ ] T3.3 实现定时扫描
-  - [ ] 每小时自动扫描
-  - [ ] 结果去重
-- [ ] T3.4 实现通知功能
-  - [ ] Telegram Bot
-  - [ ] 微信通知（可选）
+- [ ] T3.4 实现通知功能（Telegram/微信）
 - [ ] T3.5 实现Kalshi API客户端
 - [ ] T3.6 实现跨平台套利检测
 - [ ] T3.7 实现历史回测
-
-### 交付物
-
-- [ ] 向量搜索模块
-- [ ] WebSocket监控模块
-- [ ] 通知服务
-- [ ] 跨平台套利模块
-- [ ] 回测报告
 
 ## 8.4 Phase 4: 自动化执行
 
@@ -1517,37 +1585,12 @@ sqlalchemy>=2.0.0     # ORM
 - [ ] T4.2 实现Polymarket交易接口
 - [ ] T4.3 实现钱包管理
 - [ ] T4.4 实现风控模块
-  - [ ] 单笔限额
-  - [ ] 日限额
-  - [ ] 止损
 - [ ] T4.5 实现半自动执行（确认后执行）
 - [ ] T4.6 实现小额全自动执行
 - [ ] T4.7 实现交易记录和追踪
 - [ ] T4.8 实现盈亏统计
 
-### 交付物
-
-- [ ] 执行引擎模块
-- [ ] 风控模块
-- [ ] 交易记录系统
-- [ ] 盈亏报表
-
-## 8.5 Phase 5: Web界面
-
-**目标**：提供友好的用户界面
-**时间**：4周
-**状态**：远期计划
-
-### 任务清单
-
-- [ ] T5.1 设计UI/UX
-- [ ] T5.2 实现后端API
-- [ ] T5.3 实现前端界面
-- [ ] T5.4 实现用户认证
-- [ ] T5.5 实现仪表盘
-- [ ] T5.6 部署上线
-
-## 8.6 里程碑
+## 8.5 里程碑
 
 ```
 2024/12/29 ─── M1: MVP完成 ✅
@@ -1563,10 +1606,6 @@ sqlalchemy>=2.0.0     # ORM
      ├─ Phase 4 开始
      │
 2025/03/31 ─── M4: 自动化执行完成
-     │
-     ├─ Phase 5 开始（可选）
-     │
-2025/05/31 ─── M5: Web界面完成
 ```
 
 ---
@@ -1585,9 +1624,7 @@ sqlalchemy>=2.0.0     # ORM
 └─────────────────────────────────────┘
 ```
 
-## 9.2 单元测试
-
-### 测试用例示例
+## 9.2 单元测试示例
 
 ```python
 # tests/test_similarity.py
@@ -1603,14 +1640,6 @@ def test_jaccard_similarity_different():
     text_b = "Lakers championship odds"
     assert jaccard_similarity(text_a, text_b) < 0.1
 
-def test_jaccard_similarity_partial():
-    """部分重叠文本相似度在0-1之间"""
-    text_a = "Will Trump win the 2024 election?"
-    text_b = "Will Biden win the 2024 election?"
-    sim = jaccard_similarity(text_a, text_b)
-    assert 0.3 < sim < 0.8
-
-
 # tests/test_arbitrage_detector.py
 
 def test_exhaustive_arbitrage_exists():
@@ -1623,135 +1652,6 @@ def test_exhaustive_arbitrage_exists():
     opp = detect_exhaustive_arbitrage(markets, min_profit_pct=2.0)
     assert opp is not None
     assert opp.profit_pct > 2.0
-
-def test_exhaustive_no_arbitrage():
-    """完备集总和>=1时无套利"""
-    markets = [
-        Market(id="1", question="A", yes_price=0.50, ...),
-        Market(id="2", question="B", yes_price=0.50, ...),
-    ]
-    opp = detect_exhaustive_arbitrage(markets, min_profit_pct=2.0)
-    assert opp is None
-
-def test_implication_arbitrage_exists():
-    """包含关系违规时检测到套利"""
-    market_a = Market(id="1", question="Trump wins", yes_price=0.55, ...)
-    market_b = Market(id="2", question="GOP wins", yes_price=0.50, ...)
-    analysis = RelationshipAnalysis(
-        relationship=RelationType.IMPLIES_AB,
-        confidence=0.95,
-        ...
-    )
-    opp = detect_implication_arbitrage(market_a, market_b, analysis)
-    assert opp is not None
-```
-
-## 9.3 集成测试
-
-```python
-# tests/test_integration.py
-
-def test_full_scan_with_mock_data():
-    """使用模拟数据的完整扫描流程"""
-    scanner = ArbitrageScanner(
-        fetcher=MockFetcher(),
-        filter=KeywordSimilarityFilter(),
-        analyzer=RuleBasedAnalyzer(),
-        detector=ArbitrageDetector()
-    )
-    
-    opportunities = scanner.scan()
-    
-    # 验证返回结构正确
-    assert isinstance(opportunities, list)
-    for opp in opportunities:
-        assert isinstance(opp, ArbitrageOpportunity)
-        assert opp.profit_pct > 0
-```
-
-## 9.4 LLM分析测试
-
-```python
-# tests/test_llm_analyzer.py
-
-# 预定义的测试用例
-TEST_CASES = [
-    {
-        "market_a": "Will Trump win the 2028 election?",
-        "market_b": "Will the Republican candidate win 2028?",
-        "expected_relationship": "IMPLIES_AB",
-        "expected_constraint": "P(B) >= P(A)"
-    },
-    {
-        "market_a": "Lakers win NBA Championship 2025",
-        "market_b": "Lakers make 2025 playoffs",
-        "expected_relationship": "IMPLIES_AB",
-        "expected_constraint": "P(B) >= P(A)"
-    },
-    # ... 更多测试用例
-]
-
-def test_llm_relationship_detection():
-    """测试LLM逻辑关系识别准确率"""
-    analyzer = ClaudeAnalyzer()
-    correct = 0
-    
-    for case in TEST_CASES:
-        result = analyzer.analyze(
-            Market(question=case["market_a"], ...),
-            Market(question=case["market_b"], ...)
-        )
-        if result.relationship.value == case["expected_relationship"].lower():
-            correct += 1
-    
-    accuracy = correct / len(TEST_CASES)
-    assert accuracy >= 0.7, f"LLM准确率{accuracy:.0%}低于70%"
-```
-
-## 9.5 回测验证
-
-```python
-def backtest_strategy(
-    historical_data: List[Dict],
-    strategy: Callable
-) -> Dict:
-    """
-    策略回测
-    
-    输入: 历史市场数据和套利机会
-    输出: 回测结果统计
-    """
-    results = {
-        "total_opportunities": 0,
-        "profitable": 0,
-        "unprofitable": 0,
-        "total_profit": 0,
-        "total_cost": 0,
-        "roi": 0
-    }
-    
-    for snapshot in historical_data:
-        opportunities = strategy(snapshot["markets"])
-        
-        for opp in opportunities:
-            results["total_opportunities"] += 1
-            
-            # 检查实际结算结果
-            actual_return = calculate_actual_return(
-                opp,
-                snapshot["resolution"]
-            )
-            
-            if actual_return > opp.total_cost:
-                results["profitable"] += 1
-            else:
-                results["unprofitable"] += 1
-            
-            results["total_profit"] += actual_return - opp.total_cost
-            results["total_cost"] += opp.total_cost
-    
-    results["roi"] = results["total_profit"] / results["total_cost"]
-    return results
 ```
 
 ---
@@ -1769,47 +1669,7 @@ def backtest_strategy(
 | API变更 | 低 | 中 | 🟢低 | 版本监控、及时适配 |
 | 平台风险 | 低 | 高 | 🟡中 | 不存大额、及时提现 |
 
-## 10.2 风险缓解策略
-
-### 10.2.1 逻辑关系误判
-
-**问题**：LLM可能错误判断两个市场的逻辑关系
-
-**缓解措施**：
-1. 设置高置信度阈值（≥0.8）
-2. 要求LLM列出边界情况
-3. 所有机会执行前人工复核
-4. 建立错误案例库，改进Prompt
-5. 对重要决策多次询问LLM
-
-### 10.2.2 结算规则差异
-
-**问题**：两个看似相关的市场可能有不同的结算规则
-
-**真实案例**：
-> 2024年美国政府关门事件中，Polymarket以"OPM发布关门公告"为结算标准，
-> 而Kalshi要求"实际关门超过24小时"。套利者以为是完美对冲，结果两边都亏钱。
-
-**缓解措施**：
-1. 仔细阅读每个市场的结算规则
-2. 检查结算数据来源是否一致
-3. 对边界情况特别警惕
-4. 优先选择结算规则明确的市场
-
-### 10.2.3 Oracle操纵风险
-
-**问题**：Polymarket使用UMA预言机，可能被大户操纵
-
-**真实案例**：
-> 2025年3月，一个持有500万UMA代币（25%投票权）的巨鲸操纵了一个700万美元市场的结算
-
-**缓解措施**：
-1. 关注UMA治理动态
-2. 避免在争议性结算的市场下大注
-3. 分散投资，单笔≤总资金10%
-4. 优先选择高流动性、低争议市场
-
-### 10.2.4 仓位管理规则
+## 10.2 仓位管理规则
 
 ```python
 # 风控参数
@@ -1817,32 +1677,6 @@ MAX_SINGLE_POSITION = 0.10      # 单笔最大仓位（占总资金）
 MAX_DAILY_EXPOSURE = 0.30       # 日最大敞口
 MAX_EVENT_EXPOSURE = 0.20       # 单事件最大敞口
 MIN_LIQUIDITY_RATIO = 0.10      # 仓位不超过市场流动性的10%
-
-def calculate_position_size(
-    total_capital: float,
-    opportunity: ArbitrageOpportunity,
-    current_exposure: float
-) -> float:
-    """计算建议仓位"""
-    
-    # 基于利润率的基础仓位
-    base_size = total_capital * MAX_SINGLE_POSITION
-    
-    # 根据置信度调整
-    confidence_adj = opportunity.confidence  # 0.8-1.0
-    
-    # 根据流动性调整
-    min_liquidity = min(m.liquidity for m in opportunity.markets)
-    liquidity_adj = min(1.0, min_liquidity * MIN_LIQUIDITY_RATIO / base_size)
-    
-    # 根据当前敞口调整
-    remaining_exposure = MAX_DAILY_EXPOSURE - current_exposure
-    exposure_adj = remaining_exposure / MAX_SINGLE_POSITION
-    
-    # 最终仓位
-    position = base_size * confidence_adj * liquidity_adj * exposure_adj
-    
-    return max(0, position)
 ```
 
 ## 10.3 人工复核清单
@@ -1852,16 +1686,10 @@ def calculate_position_size(
 ```markdown
 ## 套利机会复核清单
 
-### 基本信息
-- 机会ID: _______________
-- 发现时间: _______________
-- 潜在利润: _______________
-
 ### 逻辑验证 ✓/✗
 - [ ] LLM判断的逻辑关系我理解并认同
 - [ ] 我能用自己的话解释为什么这个关系成立
 - [ ] 我考虑过所有边界情况
-- [ ] 边界情况发生的概率很低
 
 ### 结算规则验证 ✓/✗
 - [ ] 我已阅读所有相关市场的结算规则
@@ -1872,17 +1700,11 @@ def calculate_position_size(
 ### 流动性验证 ✓/✗
 - [ ] 我检查了订单簿深度
 - [ ] 我的仓位≤市场流动性的10%
-- [ ] 滑点预期在可接受范围内
 
 ### 风控验证 ✓/✗
 - [ ] 单笔仓位≤总资金10%
 - [ ] 今日总敞口≤总资金30%
 - [ ] 我能承受最坏情况的亏损
-
-### 最终决策
-- [ ] 执行 → 记录执行详情
-- [ ] 放弃 → 记录放弃原因
-- [ ] 需要更多信息 → 列出需要的信息
 ```
 
 ---
@@ -1904,92 +1726,23 @@ def calculate_position_size(
     └── logs/
 ```
 
-### Phase 4+: 云部署
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      云服务器                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │
-│  │  扫描服务   │  │  通知服务   │  │  Web服务    │      │
-│  └─────────────┘  └─────────────┘  └─────────────┘      │
-│         │              │              │                 │
-│         ▼              ▼              ▼                 │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │                   数据库                         │    │
-│  │               PostgreSQL                        │    │
-│  └─────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────┘
-```
-
-## 11.2 日志规范
-
-```python
-import logging
-
-# 日志格式
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-
-# 日志级别
-# DEBUG: 详细调试信息
-# INFO: 正常运行信息
-# WARNING: 警告信息
-# ERROR: 错误信息
-
-# 日志示例
-logger.info(f"开始扫描，市场数量: {len(markets)}")
-logger.debug(f"分析市场对: {market_a.id} vs {market_b.id}")
-logger.warning(f"API请求重试: {retry_count}/3")
-logger.error(f"LLM分析失败: {error}")
-
-# 结构化日志（Phase 3+）
-logger.info("opportunity_found", extra={
-    "opportunity_id": opp.id,
-    "type": opp.type,
-    "profit_pct": opp.profit_pct,
-    "confidence": opp.confidence
-})
-```
-
-## 11.3 监控指标
-
-| 指标 | 说明 | 告警阈值 |
-|------|------|----------|
-| scan_duration | 单次扫描耗时 | >10分钟 |
-| api_error_rate | API错误率 | >10% |
-| llm_latency | LLM响应时间 | >30秒 |
-| opportunities_found | 发现机会数 | 连续3天=0 |
-| llm_cost_daily | LLM日成本 | >$5 |
-
-## 11.4 定时任务
+## 11.2 定时任务
 
 ```bash
 # crontab配置
 
 # 每小时扫描
-0 * * * * cd /path/to/project && python local_scanner.py >> logs/scan.log 2>&1
+0 * * * * cd /path/to/project && python local_scanner_v2.py >> logs/scan.log 2>&1
 
 # 每天汇总报告
 0 20 * * * cd /path/to/project && python generate_daily_report.py
-
-# 每周清理旧数据
-0 3 * * 0 cd /path/to/project && python cleanup_old_data.py --days=30
 ```
 
 ---
 
 # 12. 扩展计划
 
-## 12.1 策略扩展
-
-### 更多套利类型
-
-| 类型 | 说明 | 优先级 |
-|------|------|--------|
-| 时间套利 | 同一事件不同时间点市场价差 | P2 |
-| 相关性套利 | 历史相关性高的事件价格偏离 | P3 |
-| 信息套利 | 基于信息优势的快速反应 | P3 |
-
-### 更多平台
+## 12.1 更多平台
 
 | 平台 | 说明 | 优先级 |
 |------|------|--------|
@@ -1997,32 +1750,12 @@ logger.info("opportunity_found", extra={
 | PredictIt | 学术预测市场 | P2 |
 | Betfair | 传统博彩交易所 | P3 |
 
-## 12.2 技术扩展
+## 12.2 更多策略
 
-### AI能力增强
-
-| 能力 | 说明 | 优先级 |
+| 类型 | 说明 | 优先级 |
 |------|------|--------|
-| 多模型验证 | 用多个LLM交叉验证 | P2 |
-| 专家微调 | 在套利案例上微调模型 | P3 |
-| Agent自动执行 | LLM自主决策执行 | P4 |
-
-### 基础设施
-
-| 能力 | 说明 | 优先级 |
-|------|------|--------|
-| 分布式扫描 | 多机并行扫描 | P3 |
-| 实时流处理 | Kafka + Flink | P4 |
-| 高可用部署 | K8s集群 | P4 |
-
-## 12.3 商业化可能（远期）
-
-| 方向 | 说明 |
-|------|------|
-| SaaS服务 | 为其他交易者提供信号服务 |
-| 基金 | 募资运营套利基金 |
-| 数据服务 | 出售市场分析数据 |
-| 教育 | 套利策略培训课程 |
+| 时间套利 | 同一事件不同时间点市场价差 | P2 |
+| 相关性套利 | 历史相关性高的事件价格偏离 | P3 |
 
 ---
 
@@ -2038,26 +1771,67 @@ logger.info("opportunity_found", extra={
 | 预言机 | Oracle | 向区块链提供链外数据的机制 |
 | 流动性 | Liquidity | 市场中可交易的资金量 |
 | 滑点 | Slippage | 预期价格与实际成交价的差异 |
-| YES Token | - | 代表"是"结果的代币 |
-| NO Token | - | 代表"否"结果的代币 |
 
 ## 13.2 常用命令
 
-```bash
-# 运行扫描
-python local_scanner.py
+### 基本运行
 
-# 指定配置
-python local_scanner.py --config=config.json
+```bash
+# 运行扫描（自动检测LLM提供商）
+python local_scanner_v2.py
+
+# 指定配置文件
+python local_scanner_v2.py --config=config.json
 
 # 调试模式
-LOG_LEVEL=DEBUG python local_scanner.py
+LOG_LEVEL=DEBUG python local_scanner_v2.py
+```
 
-# 指定最小利润
-MIN_PROFIT_PCT=3.0 python local_scanner.py
+### 不同LLM提供商
 
-# 查看帮助
-python local_scanner.py --help
+```bash
+# 使用OpenAI
+export OPENAI_API_KEY="sk-..."
+python local_scanner_v2.py
+
+# 使用DeepSeek（推荐，低成本）
+export DEEPSEEK_API_KEY="sk-..."
+export LLM_PROVIDER=deepseek
+python local_scanner_v2.py
+
+# 使用阿里云通义千问
+export DASHSCOPE_API_KEY="sk-..."
+export LLM_PROVIDER=aliyun
+python local_scanner_v2.py
+
+# 使用本地Ollama（免费）
+ollama serve
+ollama pull llama3.1:8b
+export LLM_PROVIDER=ollama
+python local_scanner_v2.py
+```
+
+### 配置文件示例
+
+```json
+{
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "max_tokens": 2000,
+    "temperature": 0.7
+  },
+  "scan": {
+    "market_limit": 200,
+    "min_profit_pct": 2.0,
+    "min_liquidity": 10000,
+    "min_confidence": 0.8
+  },
+  "output": {
+    "output_dir": "./output",
+    "log_level": "INFO"
+  }
+}
 ```
 
 ## 13.3 常见问题
@@ -2072,7 +1846,7 @@ A:
 1. 检查Prompt是否清晰
 2. 提高置信度阈值
 3. 所有机会都人工复核
-4. 收集错误案例改进Prompt
+4. 尝试更强的模型（如GPT-4o）
 
 ### Q: 发现机会后如何执行？
 
@@ -2082,13 +1856,13 @@ A:
 3. 先小额测试（$10-50）
 4. 确认流程后再放大仓位
 
-### Q: 如何评估策略效果？
+### Q: 如何选择LLM提供商？
 
 A:
-1. 记录每个机会的发现和执行
-2. 跟踪最终结算结果
-3. 计算准确率和收益率
-4. 定期回顾和优化
+- **开发测试**：Ollama（免费）
+- **日常使用**：DeepSeek（低成本，效果好）
+- **高精度需求**：GPT-4o或Claude Sonnet
+- **国内网络**：DeepSeek或阿里云
 
 ## 13.4 参考资源
 
@@ -2115,15 +1889,7 @@ A:
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
 | 1.0 | 2024-12-29 | 初始版本 |
-
----
-
-# 联系方式
-
-如有问题或建议，请通过以下方式联系：
-
-- GitHub Issues: [项目仓库]
-- Email: [你的邮箱]
+| 1.1 | 2024-12-29 | 添加多LLM提供商支持，完善文档结构 |
 
 ---
 

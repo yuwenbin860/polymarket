@@ -6,18 +6,21 @@
 
 1. **完备集套利** - 检测互斥且完备的市场组合是否总价<1
 2. **包含关系套利** - 检测逻辑包含关系是否被价格违反
-3. **LLM辅助分析** - 使用Claude分析市场间的逻辑关系
-4. **自动化扫描** - 定期扫描所有活跃市场
+3. **LLM辅助分析** - 使用AI分析市场间的逻辑关系
+4. **多LLM支持** - 支持OpenAI、Claude、DeepSeek、通义、GLM、Ollama等
 
 ## 📁 项目结构
 
 ```
 polymarket_arb/
-├── polymarket_arb_mvp.py    # MVP完整版本（可直接运行）
-├── config.py                 # 配置文件
-├── requirements.txt          # 依赖列表
-├── arbitrage_report.json     # 扫描结果报告
-└── README.md                 # 本文件
+├── PROJECT_BIBLE.md         # 📖 项目完整文档（必读）
+├── local_scanner_v2.py      # 主程序（支持多LLM）
+├── llm_providers.py         # LLM提供商抽象层
+├── config.py                # 配置管理
+├── config.example.json      # 配置文件示例
+├── polymarket_arb_mvp.py    # MVP版本（模拟数据）
+├── requirements.txt         # 依赖列表
+└── README.md                # 本文件
 ```
 
 ## 🚀 快速开始
@@ -25,69 +28,77 @@ polymarket_arb/
 ### 1. 安装依赖
 
 ```bash
-pip install requests anthropic
+pip install requests httpx
 ```
 
-### 2. 设置API密钥
+### 2. 配置LLM（任选一个）
 
 ```bash
-export ANTHROPIC_API_KEY="your-api-key-here"
+# 方式A: OpenAI
+export OPENAI_API_KEY="sk-..."
+
+# 方式B: DeepSeek（推荐，低成本）
+export DEEPSEEK_API_KEY="sk-..."
+export LLM_PROVIDER=deepseek
+
+# 方式C: 阿里云通义千问
+export DASHSCOPE_API_KEY="sk-..."
+export LLM_PROVIDER=aliyun
+
+# 方式D: 本地Ollama（免费）
+ollama serve  # 先启动服务
+ollama pull llama3.1:8b
+export LLM_PROVIDER=ollama
 ```
 
 ### 3. 运行扫描
 
 ```bash
-# 使用模拟数据测试
-python polymarket_arb_mvp.py
-
-# 使用真实API（修改 USE_MOCK_DATA = False）
-python polymarket_arb_mvp.py
+python local_scanner_v2.py
 ```
 
-## 📊 系统架构
+## 🤖 支持的LLM提供商
 
+| 提供商 | 环境变量 | 成本 | 推荐场景 |
+|--------|----------|------|----------|
+| OpenAI | `OPENAI_API_KEY` | 中 | 高精度需求 |
+| Claude | `ANTHROPIC_API_KEY` | 中 | 复杂推理 |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | **低** | **日常使用** |
+| 阿里云 | `DASHSCOPE_API_KEY` | 低 | 国内网络 |
+| 智谱GLM | `ZHIPU_API_KEY` | 中 | 国内网络 |
+| **Ollama** | (本地) | **免费** | **离线/测试** |
+
+## 📋 使用配置文件
+
+```bash
+# 1. 复制示例配置
+cp config.example.json config.json
+
+# 2. 编辑配置
+{
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-chat"
+  },
+  "scan": {
+    "min_profit_pct": 2.0,
+    "min_liquidity": 10000
+  }
+}
+
+# 3. 运行
+python local_scanner_v2.py
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  第一层：数据获取 (DataFetcher)                              │
-│  - Polymarket Gamma API                                     │
-│  - 获取活跃市场和事件                                        │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  第二层：语义筛选 (SimilarityFilter)                         │
-│  - 关键词匹配（MVP版本）                                     │
-│  - sentence-transformers + 向量数据库（完整版本）            │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  第三层：LLM分析 (LLMAnalyzer)                               │
-│  - 分析逻辑关系类型                                          │
-│  - 输出置信度和约束条件                                      │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  第四层：套利检测 (ArbitrageDetector)                        │
-│  - 检查定价是否违反逻辑约束                                  │
-│  - 计算利润空间                                              │
-└─────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  第五层：报告生成                                            │
-│  - 生成可操作的套利建议                                      │
-│  - 标记需要人工复核的项目                                    │
-└─────────────────────────────────────────────────────────────┘
-```
 
-## 🔍 支持的逻辑关系类型
+## 📚 详细文档
 
-| 关系类型 | 说明 | 示例 |
-|----------|------|------|
-| IMPLIES_AB | A发生则B必发生 | "特朗普赢" → "共和党赢" |
-| IMPLIES_BA | B发生则A必发生 | "夺冠" → "进季后赛" |
-| EQUIVALENT | A和B等价 | 同一问题不同表述 |
-| MUTUAL_EXCLUSIVE | A和B互斥 | "湖人冠军" vs "凯尔特人冠军" |
-| EXHAUSTIVE | 完备集 | 选举人票各区间 |
-| UNRELATED | 无关 | 不同领域的事件 |
+**请阅读 [PROJECT_BIBLE.md](./PROJECT_BIBLE.md)** 了解：
+
+- 完整的策略原理和市场背景
+- 系统架构和技术设计
+- 开发路线图和任务分解
+- 风险管理和人工复核清单
+- API参考和常见问题
 
 ## 💰 套利示例
 
@@ -98,7 +109,7 @@ python polymarket_arb_mvp.py
 市场2: "共和党获300-319票" YES = $0.12
 市场3: "共和党获320+票"    YES = $0.05
 市场4: "民主党获胜"        YES = $0.58
-───────────────────────────────────
+───────────────────────────────────────
 总成本: $0.93
 保证回报: $1.00
 利润: $0.07 (7.5%)
@@ -107,85 +118,23 @@ python polymarket_arb_mvp.py
 ### 包含关系套利
 
 ```
+逻辑: "特朗普赢" → "共和党赢"
+
 市场A: "特朗普赢总统" YES = $0.55
 市场B: "共和党赢总统" YES = $0.50  ← 违反逻辑！
 
 操作: 
 - 买 "共和党赢" YES @ $0.50
 - 买 "特朗普赢" NO @ $0.45
-总成本: $0.95，保证回报 $1.00
+总成本: $0.95，保证回报 $1.00，利润 5.3%
 ```
-
-## 🛣️ 开发路线图
-
-### Phase 0 ✅ 已完成
-- [x] API连接测试
-- [x] 基础数据结构
-- [x] 简单规则匹配
-
-### Phase 1 🔄 进行中
-- [x] LLM逻辑分析集成
-- [x] 完备集检测
-- [x] 包含关系检测
-- [ ] 真实API测试
-
-### Phase 2 📋 计划中
-- [ ] sentence-transformers嵌入
-- [ ] Chroma向量数据库
-- [ ] 批量扫描优化
-- [ ] WebSocket实时监控
-
-### Phase 3 📋 计划中
-- [ ] Web界面
-- [ ] 自动化执行（小额）
-- [ ] 风控系统
-- [ ] 历史分析
 
 ## ⚠️ 风险提示
 
-1. **结算规则差异** - 两个市场的"赢"定义可能不同
-2. **流动性风险** - 实际执行价格可能与显示价格不同
-3. **Oracle风险** - Polymarket使用UMA预言机，可能被操纵
-4. **逻辑误判** - LLM可能误判逻辑关系
-5. **黑天鹅事件** - 意外事件可能改变结果
-
-**建议**：
-- 每个机会都进行人工复核
-- 单笔不超过总资金的10%
-- 优先选择高流动性市场
-- 仔细阅读结算规则
-
-## 📝 人工复核清单
-
-每个套利机会执行前，请确认：
-
-- [ ] 逻辑关系判断正确
-- [ ] 结算规则兼容
-- [ ] 结算时间接近
-- [ ] 流动性足够
-- [ ] 计算复核无误
-- [ ] 最坏情况可接受
-
-## 🔧 配置说明
-
-在 `polymarket_arb_mvp.py` 中：
-
-```python
-# 使用真实API（需要能访问Polymarket）
-USE_MOCK_DATA = False
-
-# 套利阈值
-MIN_PROFIT_PCT = 2.0  # 最小利润百分比
-
-# LLM配置
-LLM_MODEL = "claude-sonnet-4-20250514"
-```
-
-## 📚 参考资料
-
-- [Polymarket API文档](https://docs.polymarket.com/)
-- [IMDEA研究论文: Arbitrage in Prediction Markets](https://arxiv.org/abs/2508.03474)
-- [py-clob-client](https://github.com/Polymarket/py-clob-client)
+1. **逻辑关系误判** - 所有机会需人工复核
+2. **结算规则差异** - 仔细阅读每个市场的规则
+3. **流动性风险** - 检查订单簿深度
+4. **单笔限制** - 建议不超过总资金10%
 
 ## 📄 License
 

@@ -1,8 +1,17 @@
 # Polymarket组合套利系统依赖
 
-# 核心依赖
+# 核心依赖（必需）
 requests>=2.28.0
-anthropic>=0.18.0
+httpx>=0.24.0
+
+# LLM提供商SDK（按需安装，选择你使用的）
+# openai>=1.0.0          # OpenAI GPT系列
+# anthropic>=0.18.0      # Anthropic Claude系列
+# dashscope>=1.10.0      # 阿里云通义千问
+# zhipuai>=2.0.0         # 智谱GLM
+
+# 注：httpx已支持所有OpenAI兼容接口，无需额外依赖
+# 包括：DeepSeek、Ollama、vLLM、OneAPI等
 
 # Phase 2 扩展依赖（可选）
 # sentence-transformers>=2.2.0
@@ -12,3 +21,4 @@ anthropic>=0.18.0
 # 开发依赖（可选）
 # pytest>=7.0.0
 # black>=23.0.0
+# python-dotenv>=1.0.0
