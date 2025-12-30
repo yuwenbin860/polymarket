@@ -3,36 +3,37 @@
 Polymarket 组合套利系统 - 本地完整版 v2
 ========================================
 
-支持多种LLM提供商：
-- OpenAI (GPT-4, GPT-4o)
-- Anthropic (Claude)
-- 阿里云通义千问 (Qwen)
-- 智谱GLM
-- DeepSeek
-- Ollama (本地模型)
-- 任何OpenAI兼容接口
+支持多种LLM提供商，可快速切换：
+- SiliconFlow (国内聚合，推荐)
+- DeepSeek (便宜好用)
+- OpenAI / Anthropic / 阿里云 / 智谱
+- Ollama (本地免费)
 
 使用方法：
-1. pip install requests httpx
-2. 设置环境变量（任选一个）:
-   - OPENAI_API_KEY
-   - ANTHROPIC_API_KEY
-   - DEEPSEEK_API_KEY
-   - DASHSCOPE_API_KEY (阿里云)
-   - ZHIPU_API_KEY
-   - 或启动本地Ollama
-3. python local_scanner_v2.py
-
-或使用配置文件：
-1. 复制 config.example.json 为 config.json
-2. 修改配置
-3. python local_scanner_v2.py
+    # 方式1: 使用预设配置（推荐）
+    python local_scanner_v2.py --profile siliconflow
+    python local_scanner_v2.py --profile deepseek
+    python local_scanner_v2.py --profile ollama
+    
+    # 方式2: 环境变量
+    export SILICONFLOW_API_KEY="your-key"
+    python local_scanner_v2.py --profile siliconflow
+    
+    # 方式3: 自动检测
+    python local_scanner_v2.py
+    
+    # 查看所有可用配置
+    python llm_config.py --list
+    
+    # 切换模型
+    python local_scanner_v2.py --profile siliconflow --model deepseek-ai/DeepSeek-V3
 """
 
 import requests
 import json
 import os
 import sys
+import argparse
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime
@@ -220,22 +221,69 @@ ANALYSIS_PROMPT = """你是一个专门分析预测市场逻辑关系的专家�
 class LLMAnalyzer:
     """LLM分析器 - 支持多种提供商"""
     
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig = None, profile_name: str = None, model_override: str = None):
         self.config = config
         self.use_llm = True
         self.client: Optional[BaseLLMClient] = None
+        self.profile_name = profile_name
+        self.model_name = model_override
         
         try:
-            # 使用配置创建LLM客户端
-            self.client = create_llm_client(
-                provider=config.llm.provider,
-                model=config.llm.model or None,
-                api_key=config.llm.api_key or None,
-                api_base=config.llm.api_base or None,
-                max_tokens=config.llm.max_tokens,
-                temperature=config.llm.temperature,
-            )
-            print(f"✅ LLM已初始化: {config.llm.provider} / {self.client.config.model}")
+            # 方式1: 使用profile配置
+            if profile_name:
+                from llm_config import get_llm_config_by_name
+                profile = get_llm_config_by_name(profile_name)
+                if profile:
+                    if not profile.is_configured():
+                        raise ValueError(f"配置 {profile_name} 未设置API Key (需要: {profile.api_key_env})")
+                    
+                    model = model_override or profile.model
+                    self.client = create_llm_client(
+                        provider=profile.provider,
+                        api_base=profile.api_base,
+                        api_key=profile.get_api_key(),
+                        model=model,
+                        max_tokens=profile.max_tokens,
+                        temperature=profile.temperature,
+                    )
+                    self.model_name = model
+                    print(f"✅ LLM已初始化: {profile_name} / {model}")
+                else:
+                    raise ValueError(f"未找到配置: {profile_name}")
+            
+            # 方式2: 自动检测profile
+            elif not config or not config.llm.provider:
+                from llm_config import get_llm_config
+                profile = get_llm_config()
+                if profile:
+                    model = model_override or profile.model
+                    self.client = create_llm_client(
+                        provider=profile.provider,
+                        api_base=profile.api_base,
+                        api_key=profile.get_api_key(),
+                        model=model,
+                        max_tokens=profile.max_tokens,
+                        temperature=profile.temperature,
+                    )
+                    self.profile_name = profile.name
+                    self.model_name = model
+                    print(f"✅ LLM已初始化 (自动检测): {profile.name} / {model}")
+                else:
+                    raise ValueError("未检测到可用的LLM配置，请设置API Key或使用 --profile 参数")
+            
+            # 方式3: 使用config配置
+            else:
+                self.client = create_llm_client(
+                    provider=config.llm.provider,
+                    model=model_override or config.llm.model or None,
+                    api_key=config.llm.api_key or None,
+                    api_base=config.llm.api_base or None,
+                    max_tokens=config.llm.max_tokens,
+                    temperature=config.llm.temperature,
+                )
+                self.model_name = self.client.config.model
+                print(f"✅ LLM已初始化: {config.llm.provider} / {self.client.config.model}")
+                
         except ValueError as e:
             print(f"⚠️ LLM初始化失败: {e}")
             print("   将使用规则匹配替代LLM分析")
@@ -562,10 +610,12 @@ class SimilarityFilter:
 class ArbitrageScanner:
     """主扫描器"""
     
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, profile_name: str = None, model_override: str = None):
         self.config = config
+        self.profile_name = profile_name
+        self.model_override = model_override
         self.client = PolymarketClient()
-        self.analyzer = LLMAnalyzer(config)
+        self.analyzer = LLMAnalyzer(config, profile_name=profile_name, model_override=model_override)
         self.detector = ArbitrageDetector(config)
         self.filter = SimilarityFilter(config.scan.similarity_threshold)
     
@@ -655,15 +705,18 @@ class ArbitrageScanner:
     
     def _print_header(self):
         """打印标题"""
-        llm_info = f"{self.config.llm.provider}"
-        if self.analyzer.client:
-            llm_info += f" / {self.analyzer.client.config.model}"
+        if self.analyzer.profile_name:
+            llm_info = f"{self.analyzer.profile_name} / {self.analyzer.model_name or 'default'}"
+        elif self.analyzer.client:
+            llm_info = f"{self.config.llm.provider} / {self.analyzer.client.config.model}"
+        else:
+            llm_info = "规则匹配 (无LLM)"
         
         print(f"""
 ╔═══════════════════════════════════════════════════════════════╗
 ║         Polymarket 组合套利扫描系统 v2.0                       ║
 ║                                                               ║
-║  LLM提供商: {llm_info:<48}║
+║  LLM配置: {llm_info:<50}║
 ║  最小利润: {self.config.scan.min_profit_pct}%                                              ║
 ║  最小流动性: ${self.config.scan.min_liquidity:,.0f}                                       ║
 ╚═══════════════════════════════════════════════════════════════╝
@@ -734,11 +787,75 @@ class ArbitrageScanner:
 
 def main():
     """主程序"""
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description="Polymarket组合套利扫描系统",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python local_scanner_v2.py --profile siliconflow
+  python local_scanner_v2.py --profile deepseek --model deepseek-reasoner
+  python local_scanner_v2.py --profile ollama --model llama3.1:70b
+  
+查看所有可用配置:
+  python llm_config.py --list
+        """
+    )
+    parser.add_argument(
+        "--profile", "-p",
+        type=str,
+        help="LLM配置名称 (如: siliconflow, deepseek, ollama, openai)"
+    )
+    parser.add_argument(
+        "--model", "-m",
+        type=str,
+        help="覆盖默认模型 (如: Qwen/Qwen2.5-72B-Instruct)"
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        help="配置文件路径"
+    )
+    parser.add_argument(
+        "--min-profit",
+        type=float,
+        help="最小利润百分比 (默认: 2.0)"
+    )
+    parser.add_argument(
+        "--market-limit",
+        type=int,
+        help="获取市场数量 (默认: 200)"
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="列出所有可用的LLM配置"
+    )
+    
+    args = parser.parse_args()
+    
+    # 列出配置
+    if args.list_profiles:
+        from llm_config import LLMConfigManager, print_profiles_table
+        manager = LLMConfigManager()
+        print_profiles_table(manager.list_profiles())
+        return 0
+    
     # 加载配置
-    config = AppConfig.load()
+    config = AppConfig.load(args.config)
+    
+    # 覆盖配置
+    if args.min_profit:
+        config.scan.min_profit_pct = args.min_profit
+    if args.market_limit:
+        config.scan.market_limit = args.market_limit
     
     # 创建扫描器
-    scanner = ArbitrageScanner(config)
+    scanner = ArbitrageScanner(
+        config,
+        profile_name=args.profile,
+        model_override=args.model
+    )
     
     try:
         # 执行扫描
