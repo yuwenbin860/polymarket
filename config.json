@@ -1,0 +1,20 @@
+{
+  "llm": {
+    "provider": "openai_compatible",
+    "api_base": "https://api.siliconflow.cn/v1",
+    "api_key": "sk-yayehrysmtzbfbmpewdzjtwvpfnjzmelypfrtbnvcduketzf",
+    "model": "Qwen/Qwen2.5-72B-Instruct-128K",
+    "max_tokens": 2000,
+    "temperature": 0.7
+  },
+  "scan": {
+    "market_limit": 500,
+    "min_profit_pct": 2.0,
+    "min_liquidity": 10000,
+    "max_llm_calls": 20
+  },
+  "output": {
+    "output_dir": "./output",
+    "log_level": "INFO"
+  }
+}
