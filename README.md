@@ -16,8 +16,11 @@ polymarket_arb/
 ├── PROJECT_BIBLE.md         # 📖 项目完整文档（必读）
 ├── local_scanner_v2.py      # 主程序（支持多LLM）
 ├── llm_providers.py         # LLM提供商抽象层
+├── llm_config.py            # LLM配置管理器
+├── prompts.py               # Prompt工程模块
 ├── config.py                # 配置管理
 ├── config.example.json      # 配置文件示例
+├── test_prompts.py          # Prompt测试脚本
 ├── polymarket_arb_mvp.py    # MVP版本（模拟数据）
 ├── requirements.txt         # 依赖列表
 └── README.md                # 本文件
@@ -31,27 +34,45 @@ polymarket_arb/
 pip install requests httpx
 ```
 
-### 2. 配置LLM（任选一个）
+### 2. 配置LLM（三种方式任选）
 
+**方式A: 使用 --profile 预设配置（推荐）**
 ```bash
-# 方式A: OpenAI
-export OPENAI_API_KEY="sk-..."
-
-# 方式B: DeepSeek（推荐，低成本）
+# 设置API Key
 export DEEPSEEK_API_KEY="sk-..."
-export LLM_PROVIDER=deepseek
 
-# 方式C: 阿里云通义千问
-export DASHSCOPE_API_KEY="sk-..."
-export LLM_PROVIDER=aliyun
+# 使用预设配置运行
+python local_scanner_v2.py --profile deepseek
+python local_scanner_v2.py --profile siliconflow
+python local_scanner_v2.py --profile ollama
 
-# 方式D: 本地Ollama（免费）
-ollama serve  # 先启动服务
-ollama pull llama3.1:8b
-export LLM_PROVIDER=ollama
+# 查看所有可用配置
+python llm_config.py --list
 ```
 
-### 3. 运行扫描
+**方式B: 使用 config.json**
+```bash
+cp config.example.json config.json
+# 编辑 config.json 填入 provider 和 api_key
+python local_scanner_v2.py
+```
+
+**方式C: 使用环境变量**
+```bash
+export DEEPSEEK_API_KEY="sk-..."
+python local_scanner_v2.py  # 自动检测
+```
+
+### 3. 配置优先级
+
+```
+1. --profile 参数      (最高优先级)
+2. config.json 配置
+3. 环境变量自动检测
+4. 规则匹配模式        (最低优先级，不使用LLM)
+```
+
+### 4. 运行扫描
 
 ```bash
 python local_scanner_v2.py
@@ -61,9 +82,10 @@ python local_scanner_v2.py
 
 | 提供商 | 环境变量 | 成本 | 推荐场景 |
 |--------|----------|------|----------|
+| **SiliconFlow** | `SILICONFLOW_API_KEY` | **低** | **国内聚合平台，速度快** |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | **低** | **日常使用** |
 | OpenAI | `OPENAI_API_KEY` | 中 | 高精度需求 |
 | Claude | `ANTHROPIC_API_KEY` | 中 | 复杂推理 |
-| **DeepSeek** | `DEEPSEEK_API_KEY` | **低** | **日常使用** |
 | 阿里云 | `DASHSCOPE_API_KEY` | 低 | 国内网络 |
 | 智谱GLM | `ZHIPU_API_KEY` | 中 | 国内网络 |
 | **Ollama** | (本地) | **免费** | **离线/测试** |
@@ -74,20 +96,40 @@ python local_scanner_v2.py
 # 1. 复制示例配置
 cp config.example.json config.json
 
-# 2. 编辑配置
+# 2. 编辑 config.json
+```
+
+```json
 {
   "llm": {
     "provider": "deepseek",
-    "model": "deepseek-chat"
+    "model": "deepseek-chat",
+    "api_key": "sk-your-api-key",
+    "api_base": "https://api.deepseek.com/v1"
   },
   "scan": {
     "min_profit_pct": 2.0,
     "min_liquidity": 10000
   }
 }
+```
 
-# 3. 运行
+```bash
+# 3. 运行（会自动读取config.json）
 python local_scanner_v2.py
+```
+
+## 🧪 测试Prompt效果
+
+```bash
+# 运行所有测试用例
+python test_prompts.py
+
+# 指定LLM配置
+python test_prompts.py --profile deepseek
+
+# 只运行第一个测试
+python test_prompts.py --test 0
 ```
 
 ## 📚 详细文档

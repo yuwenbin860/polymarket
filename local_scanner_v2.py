@@ -42,6 +42,12 @@ from enum import Enum
 # 导入LLM提供商和配置
 from llm_providers import create_llm_client, BaseLLMClient, LLMResponse
 from config import Config as AppConfig
+from prompts import (
+    format_analysis_prompt,
+    format_exhaustive_prompt,
+    PromptConfig,
+    RELATIONSHIP_ANALYSIS_PROMPT_V2
+)
 
 
 # ============================================================
@@ -181,7 +187,8 @@ class PolymarketClient:
 # LLM分析器（支持多种提供商）
 # ============================================================
 
-ANALYSIS_PROMPT = """你是一个专门分析预测市场逻辑关系的专家。
+# 旧版Prompt（保留用于兼容）
+ANALYSIS_PROMPT_LEGACY = """你是一个专门分析预测市场逻辑关系的专家。
 
 请分析以下两个Polymarket预测市场之间的逻辑关系：
 
@@ -217,73 +224,38 @@ ANALYSIS_PROMPT = """你是一个专门分析预测市场逻辑关系的专家�
 }}
 ```"""
 
+# 使用新版Prompt（从prompts.py导入）
+ANALYSIS_PROMPT = RELATIONSHIP_ANALYSIS_PROMPT_V2
+
 
 class LLMAnalyzer:
     """LLM分析器 - 支持多种提供商"""
-    
+
     def __init__(self, config: AppConfig = None, profile_name: str = None, model_override: str = None):
         self.config = config
         self.use_llm = True
         self.client: Optional[BaseLLMClient] = None
         self.profile_name = profile_name
         self.model_name = model_override
-        
+
         try:
-            # 方式1: 使用profile配置
+            # 方式1: 命令行指定 --profile
             if profile_name:
-                from llm_config import get_llm_config_by_name
-                profile = get_llm_config_by_name(profile_name)
-                if profile:
-                    if not profile.is_configured():
-                        raise ValueError(f"配置 {profile_name} 未设置API Key (需要: {profile.api_key_env})")
-                    
-                    model = model_override or profile.model
-                    self.client = create_llm_client(
-                        provider=profile.provider,
-                        api_base=profile.api_base,
-                        api_key=profile.get_api_key(),
-                        model=model,
-                        max_tokens=profile.max_tokens,
-                        temperature=profile.temperature,
-                    )
-                    self.model_name = model
-                    print(f"✅ LLM已初始化: {profile_name} / {model}")
-                else:
-                    raise ValueError(f"未找到配置: {profile_name}")
-            
-            # 方式2: 自动检测profile
-            elif not config or not config.llm.provider:
-                from llm_config import get_llm_config
-                profile = get_llm_config()
-                if profile:
-                    model = model_override or profile.model
-                    self.client = create_llm_client(
-                        provider=profile.provider,
-                        api_base=profile.api_base,
-                        api_key=profile.get_api_key(),
-                        model=model,
-                        max_tokens=profile.max_tokens,
-                        temperature=profile.temperature,
-                    )
-                    self.profile_name = profile.name
-                    self.model_name = model
-                    print(f"✅ LLM已初始化 (自动检测): {profile.name} / {model}")
-                else:
-                    raise ValueError("未检测到可用的LLM配置，请设置API Key或使用 --profile 参数")
-            
-            # 方式3: 使用config配置
+                self._init_from_profile(profile_name, model_override)
+
+            # 方式2: config.json 中指定了 provider（优先于自动检测）
+            elif config and config.llm.provider and config.llm.provider != "openai":
+                # 注意：openai是默认值，如果没改过就跳过
+                self._init_from_config(config, model_override)
+
+            # 方式3: config.json 中指定了 api_key 或 api_base
+            elif config and (config.llm.api_key or config.llm.api_base):
+                self._init_from_config(config, model_override)
+
+            # 方式4: 自动检测已配置的API Key
             else:
-                self.client = create_llm_client(
-                    provider=config.llm.provider,
-                    model=model_override or config.llm.model or None,
-                    api_key=config.llm.api_key or None,
-                    api_base=config.llm.api_base or None,
-                    max_tokens=config.llm.max_tokens,
-                    temperature=config.llm.temperature,
-                )
-                self.model_name = self.client.config.model
-                print(f"✅ LLM已初始化: {config.llm.provider} / {self.client.config.model}")
-                
+                self._init_from_auto_detect(model_override)
+
         except ValueError as e:
             print(f"⚠️ LLM初始化失败: {e}")
             print("   将使用规则匹配替代LLM分析")
@@ -291,6 +263,87 @@ class LLMAnalyzer:
         except Exception as e:
             print(f"⚠️ LLM初始化异常: {e}")
             self.use_llm = False
+
+    def _init_from_profile(self, profile_name: str, model_override: str = None):
+        """从profile配置初始化"""
+        from llm_config import get_llm_config_by_name
+        profile = get_llm_config_by_name(profile_name)
+        if not profile:
+            raise ValueError(f"未找到配置: {profile_name}")
+
+        if not profile.is_configured():
+            raise ValueError(f"配置 {profile_name} 未设置API Key (需要: {profile.api_key_env})")
+
+        model = model_override or profile.model
+        self.client = create_llm_client(
+            provider=profile.provider,
+            api_base=profile.api_base,
+            api_key=profile.get_api_key(),
+            model=model,
+            max_tokens=profile.max_tokens,
+            temperature=profile.temperature,
+        )
+        self.profile_name = profile_name
+        self.model_name = model
+        print(f"✅ LLM已初始化 (--profile): {profile_name} / {model}")
+
+    def _init_from_config(self, config: AppConfig, model_override: str = None):
+        """从config.json初始化"""
+        provider = config.llm.provider
+        model = model_override or config.llm.model or None
+        api_key = config.llm.api_key or None
+        api_base = config.llm.api_base or None
+
+        # 如果config没有api_key，尝试从环境变量读取
+        if not api_key:
+            env_key_map = {
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "deepseek": "DEEPSEEK_API_KEY",
+                "aliyun": "DASHSCOPE_API_KEY",
+                "zhipu": "ZHIPU_API_KEY",
+                "siliconflow": "SILICONFLOW_API_KEY",
+                "openai_compatible": "LLM_API_KEY",
+            }
+            env_var = env_key_map.get(provider, "LLM_API_KEY")
+            api_key = os.getenv(env_var)
+
+        self.client = create_llm_client(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            api_base=api_base,
+            max_tokens=config.llm.max_tokens,
+            temperature=config.llm.temperature,
+        )
+        self.model_name = self.client.config.model
+        print(f"✅ LLM已初始化 (config.json): {provider} / {self.client.config.model}")
+
+    def _init_from_auto_detect(self, model_override: str = None):
+        """自动检测可用的LLM配置"""
+        from llm_config import get_llm_config
+        profile = get_llm_config()
+
+        if not profile:
+            raise ValueError(
+                "未检测到可用的LLM配置。请选择以下方式之一:\n"
+                "  1. 设置环境变量 (如 DEEPSEEK_API_KEY)\n"
+                "  2. 使用 --profile 参数 (如 --profile deepseek)\n"
+                "  3. 在 config.json 中配置 llm.provider 和 llm.api_key"
+            )
+
+        model = model_override or profile.model
+        self.client = create_llm_client(
+            provider=profile.provider,
+            api_base=profile.api_base,
+            api_key=profile.get_api_key(),
+            model=model,
+            max_tokens=profile.max_tokens,
+            temperature=profile.temperature,
+        )
+        self.profile_name = profile.name
+        self.model_name = model
+        print(f"✅ LLM已初始化 (自动检测): {profile.name} / {model}")
     
     def analyze(self, market_a: Market, market_b: Market) -> Dict:
         """分析两个市场的逻辑关系"""
@@ -301,36 +354,77 @@ class LLMAnalyzer:
     
     def _analyze_with_llm(self, market_a: Market, market_b: Market) -> Dict:
         """使用LLM分析"""
-        prompt = ANALYSIS_PROMPT.format(
-            question_a=market_a.question,
-            description_a=(market_a.description or "")[:500],
-            price_a=market_a.yes_price,
-            source_a=market_a.resolution_source or "未指定",
-            question_b=market_b.question,
-            description_b=(market_b.description or "")[:500],
-            price_b=market_b.yes_price,
-            source_b=market_b.resolution_source or "未指定",
+        # 将Market对象转换为字典格式
+        market_a_dict = {
+            "question": market_a.question,
+            "description": market_a.description or "",
+            "yes_price": market_a.yes_price,
+            "end_date": market_a.end_date or "未指定",
+            "event_id": market_a.event_id or "未指定",
+            "resolution_source": market_a.resolution_source or "未指定",
+        }
+        market_b_dict = {
+            "question": market_b.question,
+            "description": market_b.description or "",
+            "yes_price": market_b.yes_price,
+            "end_date": market_b.end_date or "未指定",
+            "event_id": market_b.event_id or "未指定",
+            "resolution_source": market_b.resolution_source or "未指定",
+        }
+
+        # 使用新版Prompt格式化函数
+        prompt = format_analysis_prompt(
+            market_a_dict,
+            market_b_dict,
+            PromptConfig(version="v2")
         )
-        
+
         try:
             response = self.client.chat(prompt)
             content = response.content
-            
+
             # 提取JSON
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0]
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
-            
+
             result = json.loads(content.strip())
-            return result
-            
+
+            # 标准化输出格式（兼容新旧格式）
+            normalized = self._normalize_llm_response(result)
+            return normalized
+
         except json.JSONDecodeError as e:
             print(f"    JSON解析失败: {e}")
             return self._analyze_with_rules(market_a, market_b)
         except Exception as e:
             print(f"    LLM分析失败: {e}")
             return self._analyze_with_rules(market_a, market_b)
+
+    def _normalize_llm_response(self, result: Dict) -> Dict:
+        """标准化LLM响应格式"""
+        # 处理嵌套的reasoning结构
+        reasoning = result.get("reasoning", "")
+        if isinstance(reasoning, dict):
+            reasoning = reasoning.get("conclusion", "") or reasoning.get("logical_analysis", "")
+
+        # 提取关键字段
+        normalized = {
+            "relationship": result.get("relationship", "UNRELATED"),
+            "confidence": result.get("confidence", 0.5),
+            "reasoning": reasoning,
+            "probability_constraint": result.get("probability_constraint"),
+            "edge_cases": result.get("edge_cases", []),
+            "resolution_compatible": result.get("resolution_check", {}).get("rules_compatible", True)
+                                      if isinstance(result.get("resolution_check"), dict)
+                                      else result.get("resolution_compatible", True),
+            "constraint_violated": result.get("constraint_violated", False),
+            "violation_amount": result.get("violation_amount", 0),
+            "arbitrage_viable": result.get("arbitrage_viable", False),
+        }
+
+        return normalized
     
     def _analyze_with_rules(self, market_a: Market, market_b: Market) -> Dict:
         """使用规则匹配分析（备用方案）"""

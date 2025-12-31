@@ -32,9 +32,15 @@ python polymarket_arb_mvp.py
 **Using config file instead of environment variables:**
 ```bash
 cp config.example.json config.json
-# Edit config.json, then run:
+# Edit config.json with your provider and api_key, then run:
 python local_scanner_v2.py
 ```
+
+**LLM配置加载优先级:**
+1. 命令行 `--profile` 参数 (最高优先级)
+2. `config.json` 中的 `llm.provider` + `llm.api_key`
+3. 环境变量自动检测 (DEEPSEEK_API_KEY, SILICONFLOW_API_KEY等)
+4. 默认值/规则匹配 (最低优先级)
 
 ## Architecture
 
@@ -138,6 +144,35 @@ Config loading priority: `--config` argument > `config.json` > environment varia
 - Minimum profit percentage defaults to 2%
 - Markets are filtered by minimum liquidity (default: $10,000 USDC)
 - LLM calls are limited per scan (default: 30) to control costs
+
+## Development Principles / 开发准则
+
+### 1. 小步快跑 (Incremental Progress)
+- 将宏大目标拆分为小目标和具体实现步骤
+- 每个小目标独立验证后再进行下一步
+- 避免一次性做太多，保持每步可验证
+
+### 2. 进度持久化 (Progress Persistence)
+- 每完成一个目标，验证无误后更新进度到 `PROJECT_BIBLE.md`
+- 使用 `PROGRESS.md` 记录详细工作日志（如果需要）
+- 确保可以在任何时间、任何地点恢复工作上下文
+
+### 3. 开放创新 (Open Innovation)
+- 欢迎任何能改进套利系统的新点子
+- 新点子需经确认后记录到 `PROJECT_BIBLE.md` 的扩展计划
+- 保持系统活力，不断迭代优化
+
+### 4. 核心聚焦 (Core Focus)
+- **套利是核心中的核心** - 如何找到套利机会、如何利用LLM辅助发现套利关系
+- 第一步重心：组合套利（完备集、包含关系、等价市场）
+- 预留不同套利模式的接入口（跨平台、时间套利等）
+- 执行和下单可以暂时人工，发现机会才是关键
+
+### 5. LLM赋能 (LLM Empowerment)
+- 组合套利需要大量语义分析和逻辑分析
+- **最大化利用LLM** 来识别市场间的逻辑关系
+- 持续优化Prompt，提高关系识别准确率
+- 探索多模型协作、验证等高级用法
 
 ## Project Guidance
 

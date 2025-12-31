@@ -1,9 +1,33 @@
 {
+  "_comment": "复制此文件为 config.json 并修改配置",
+  "_llm_providers": {
+    "_说明": "以下是各provider的配置示例，取消注释你需要的配置",
+    "deepseek": {
+      "provider": "deepseek",
+      "model": "deepseek-chat",
+      "api_base": "https://api.deepseek.com/v1"
+    },
+    "siliconflow": {
+      "provider": "openai_compatible",
+      "model": "Qwen/Qwen2.5-72B-Instruct",
+      "api_base": "https://api.siliconflow.cn/v1"
+    },
+    "aliyun": {
+      "provider": "aliyun",
+      "model": "qwen-plus",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    "openai": {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "api_base": "https://api.openai.com/v1"
+    }
+  },
   "llm": {
-    "provider": "openai",
-    "model": "",
+    "provider": "deepseek",
+    "model": "deepseek-chat",
     "api_key": "",
-    "api_base": "",
+    "api_base": "https://api.deepseek.com/v1",
     "max_tokens": 2000,
     "temperature": 0.7,
     "timeout": 60
