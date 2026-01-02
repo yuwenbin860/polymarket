@@ -286,6 +286,196 @@ def format_exhaustive_prompt(
 
 
 # ============================================================
+# 找碴验证Prompt (Devil's Advocate) - v1.3新增
+# ============================================================
+
+DEVILS_ADVOCATE_PROMPT = """你是一位预测市场的风险分析专家，专门负责"找碴" - 寻找套利策略可能失败的原因。
+
+## 背景
+我们的系统认为市场A和市场B之间存在以下逻辑关系：
+**{relationship}**
+
+这意味着如果策略正确，我们可以通过买卖这两个市场来获得无风险利润。
+
+## 市场信息
+
+### 市场A
+- **问题**: {question_a}
+- **YES价格**: ${price_a:.3f}
+- **结算日期**: {end_date_a}
+- **结算来源**: {source_a}
+
+### 市场B
+- **问题**: {question_b}
+- **YES价格**: ${price_b:.3f}
+- **结算日期**: {end_date_b}
+- **结算来源**: {source_b}
+
+## 你的任务
+
+**假设我们的关系判断是正确的**，请深入思考：有哪些情况可能导致"A发生但B没有结算为YES"（或反过来）？
+
+请从以下角度分析可能的失败场景：
+
+### 1. 结算规则差异
+- 两个市场的结算标准是否完全相同？
+- 是否使用不同的数据来源？
+- 对"发生"的定义是否有细微差别？
+
+### 2. 时间窗口差异
+- 结算时间是否不同？
+- 是否可能出现"在时间点T1为真，在时间点T2为假"的情况？
+
+### 3. 边界条件
+- 如果出现平局/取消/无效结果会怎样？
+- 候选人退选/规则变更/定义模糊等情况？
+- 法律争议、计票争议等导致结果不确定？
+
+### 4. 技术风险
+- 预言机（Oracle）可能出错吗？
+- 是否可能出现治理攻击或争议裁决？
+
+### 5. 市场特性
+- 两个市场是否由同一方运营？
+- 结算机制是否相同（UMA vs 其他）？
+
+## 输出格式
+
+请严格按以下JSON格式回答：
+
+```json
+{{
+  "relationship_challenged": "{relationship}",
+  "overall_risk_level": "low|medium|high|critical",
+  "failure_scenarios": [
+    {{
+      "scenario": "失败场景描述",
+      "probability": "low|medium|high",
+      "impact": "描述如果发生会如何影响套利",
+      "mitigation": "如何降低这个风险"
+    }}
+  ],
+  "resolution_risks": {{
+    "different_sources": true或false,
+    "different_timing": true或false,
+    "definition_ambiguity": true或false,
+    "oracle_risk": true或false,
+    "details": "详细说明"
+  }},
+  "edge_cases": [
+    "具体的边界情况1",
+    "具体的边界情况2"
+  ],
+  "recommendation": "proceed|proceed_with_caution|avoid|need_human_review",
+  "human_checks_needed": [
+    "需要人工确认的事项1",
+    "需要人工确认的事项2"
+  ],
+  "confidence_in_challenge": 0.0到1.0的数值,
+  "summary": "一句话总结风险评估"
+}}
+```
+
+注意：你的任务是找问题，不是确认安全。请尽可能挑剔地分析。
+"""
+
+
+DEVILS_ADVOCATE_PROMPT_LITE = """作为风险分析专家，请找出以下套利策略可能失败的原因：
+
+关系: {relationship}
+市场A: {question_a} (YES=${price_a:.2f})
+市场B: {question_b} (YES=${price_b:.2f})
+
+问题：有哪些情况可能导致"A发生但B没结算为YES"？
+
+考虑：结算规则差异、时间窗口、边界条件、预言机风险
+
+回答JSON格式：
+```json
+{{"risk_level": "low/medium/high", "failure_scenarios": ["场景1", "场景2"], "recommendation": "proceed/avoid/review", "summary": "总结"}}
+```
+"""
+
+
+def format_devils_advocate_prompt(
+    market_a: Dict,
+    market_b: Dict,
+    relationship: str,
+    lite: bool = False
+) -> str:
+    """格式化找碴验证Prompt"""
+    template = DEVILS_ADVOCATE_PROMPT_LITE if lite else DEVILS_ADVOCATE_PROMPT
+
+    return template.format(
+        relationship=relationship,
+        question_a=market_a.get("question", ""),
+        price_a=market_a.get("yes_price", 0.5),
+        end_date_a=market_a.get("end_date", "未指定"),
+        source_a=market_a.get("resolution_source", "未指定"),
+        question_b=market_b.get("question", ""),
+        price_b=market_b.get("yes_price", 0.5),
+        end_date_b=market_b.get("end_date", "未指定"),
+        source_b=market_b.get("resolution_source", "未指定"),
+    )
+
+
+# ============================================================
+# 多模型投票Prompt - v1.3新增
+# ============================================================
+
+SECOND_OPINION_PROMPT = """你是一位独立的预测市场分析师。另一位分析师对两个市场做了以下判断，请提供你的独立意见。
+
+## 市场信息
+
+市场A: {question_a} (YES=${price_a:.2f})
+市场B: {question_b} (YES=${price_b:.2f})
+
+## 第一位分析师的判断
+
+- **关系类型**: {first_relationship}
+- **置信度**: {first_confidence}
+- **理由**: {first_reasoning}
+
+## 你的任务
+
+1. **独立分析**这两个市场的关系，不要受第一位分析师影响
+2. **给出你自己的判断**
+3. **对比差异**：如果你的判断与第一位不同，解释为什么
+
+## 输出格式
+
+```json
+{{
+  "my_relationship": "IMPLIES_AB|IMPLIES_BA|EQUIVALENT|MUTUAL_EXCLUSIVE|EXHAUSTIVE|UNRELATED",
+  "my_confidence": 0.0到1.0,
+  "my_reasoning": "你的分析理由",
+  "agree_with_first": true或false,
+  "disagreement_reason": "如果不同意，解释原因，否则为null",
+  "final_recommendation": "agree|partial_agree|disagree",
+  "combined_confidence": 0.0到1.0
+}}
+```
+"""
+
+
+def format_second_opinion_prompt(
+    market_a: Dict,
+    market_b: Dict,
+    first_analysis: Dict
+) -> str:
+    """格式化第二意见Prompt"""
+    return SECOND_OPINION_PROMPT.format(
+        question_a=market_a.get("question", ""),
+        price_a=market_a.get("yes_price", 0.5),
+        question_b=market_b.get("question", ""),
+        price_b=market_b.get("yes_price", 0.5),
+        first_relationship=first_analysis.get("relationship", ""),
+        first_confidence=first_analysis.get("confidence", 0),
+        first_reasoning=first_analysis.get("reasoning", "")
+    )
+
+
+# ============================================================
 # Prompt测试工具
 # ============================================================
 

@@ -13,10 +13,12 @@ httpx>=0.24.0
 # 注：httpx已支持所有OpenAI兼容接口，无需额外依赖
 # 包括：DeepSeek、Ollama、vLLM、OneAPI等
 
-# Phase 2 扩展依赖（可选）
-# sentence-transformers>=2.2.0
+# Phase 2 扩展依赖
+sentence-transformers>=2.2.0   # 语义相似度计算
+numpy>=1.24.0                  # 向量计算
+
+# 可选：向量数据库（大规模市场时使用）
 # chromadb>=0.4.0
-# numpy>=1.24.0
 
 # 开发依赖（可选）
 # pytest>=7.0.0

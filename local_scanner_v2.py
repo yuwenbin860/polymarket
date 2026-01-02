@@ -409,10 +409,28 @@ class LLMAnalyzer:
         if isinstance(reasoning, dict):
             reasoning = reasoning.get("conclusion", "") or reasoning.get("logical_analysis", "")
 
+        relationship = result.get("relationship", "UNRELATED").upper()
+        confidence = result.get("confidence", 0.5)
+
+        # 一致性检查: 检测 relationship 与 reasoning 是否矛盾
+        reasoning_upper = reasoning.upper() if isinstance(reasoning, str) else ""
+        inconsistency_detected = False
+
+        if relationship == "IMPLIES_AB" and "IMPLIES_BA" in reasoning_upper:
+            print(f"    ⚠️ LLM响应不一致: relationship={relationship}, 但reasoning提到IMPLIES_BA")
+            inconsistency_detected = True
+        elif relationship == "IMPLIES_BA" and "IMPLIES_AB" in reasoning_upper and "IMPLIES_BA" not in reasoning_upper:
+            print(f"    ⚠️ LLM响应不一致: relationship={relationship}, 但reasoning提到IMPLIES_AB")
+            inconsistency_detected = True
+
+        # 如果检测到不一致，降低置信度
+        if inconsistency_detected:
+            confidence = min(confidence, 0.5)  # 降低到最多0.5
+
         # 提取关键字段
         normalized = {
-            "relationship": result.get("relationship", "UNRELATED"),
-            "confidence": result.get("confidence", 0.5),
+            "relationship": relationship,
+            "confidence": confidence,
             "reasoning": reasoning,
             "probability_constraint": result.get("probability_constraint"),
             "edge_cases": result.get("edge_cases", []),
@@ -422,6 +440,7 @@ class LLMAnalyzer:
             "constraint_violated": result.get("constraint_violated", False),
             "violation_amount": result.get("violation_amount", 0),
             "arbitrage_viable": result.get("arbitrage_viable", False),
+            "inconsistency_detected": inconsistency_detected,  # 标记不一致
         }
 
         return normalized
@@ -529,21 +548,40 @@ class ArbitrageDetector:
         """检查完备集套利"""
         if len(markets) < 2:
             return None
-        
+
+        # 验证1: 检查结算来源一致性
+        sources = set(m.resolution_source for m in markets if m.resolution_source)
+        if len(sources) > 1:
+            return None  # 结算来源不一致，可能不是真正的完备集
+
+        # 验证2: 检查结算日期一致性（已在 _group_by_event 中处理，这里再次确认）
+        dates = set()
+        for m in markets:
+            if m.end_date:
+                date_part = m.end_date.split('T')[0] if 'T' in m.end_date else m.end_date
+                dates.add(date_part)
+        if len(dates) > 1:
+            return None  # 结算日期不一致
+
         total = sum(m.yes_price for m in markets)
-        
+
         if total < 0.98:
             profit = 1.0 - total
-            profit_pct = (profit / total) * 100
-            
+            profit_pct = (profit / total) * 100 if total > 0 else 0
+
             if profit_pct < self.min_profit_pct:
                 return None
-            
+
+            # 验证3: 利润率合理性检查
+            needs_extra_review = []
+            if profit_pct > 100:
+                needs_extra_review.append("⚠️ 利润率超过100%，请重点验证数据准确性")
+
             action_lines = [
                 f"买 '{m.question[:60]}...' YES @ ${m.yes_price:.3f}"
                 for m in markets
             ]
-            
+
             return ArbitrageOpportunity(
                 id=f"exhaustive_{datetime.now().strftime('%Y%m%d%H%M%S')}",
                 type="EXHAUSTIVE_SET_UNDERPRICED",
@@ -561,28 +599,39 @@ class ArbitrageDetector:
                     "确认所有选项互斥且覆盖全部可能",
                     "检查结算规则是否一致",
                     "确认没有遗漏的选项"
-                ],
+                ] + needs_extra_review,
                 timestamp=datetime.now().isoformat()
             )
-        
+
         return None
     
     def _check_implication(self, implying: Market, implied: Market,
                            analysis: Dict, direction: str) -> Optional[ArbitrageOpportunity]:
         """检查包含关系套利"""
+        # 检查 LLM 响应是否存在不一致
+        if analysis.get("inconsistency_detected", False):
+            return None  # 不一致的分析结果不可信，跳过
+
+        # 蕴含关系约束检查：如果 A → B，则 P(B) >= P(A)
+        # 套利条件：P(B) < P(A)（违反约束）
         if implied.yes_price >= implying.yes_price - 0.01:
-            return None
-        
+            return None  # 约束满足，无套利
+
         cost = implied.yes_price + implying.no_price
         profit = 1.0 - cost
         profit_pct = (profit / cost) * 100 if cost > 0 else 0
-        
+
         if profit_pct < self.min_profit_pct:
             return None
-        
+
         if analysis.get("confidence", 0) < self.min_confidence:
             return None
-        
+
+        # 利润率合理性检查
+        needs_extra_review = []
+        if profit_pct > 100:
+            needs_extra_review.append("⚠️ 利润率超过100%，请重点验证数据准确性和逻辑关系")
+
         return ArbitrageOpportunity(
             id=f"impl_{direction}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
             type="IMPLICATION_VIOLATION",
@@ -603,7 +652,7 @@ class ArbitrageDetector:
             needs_review=[
                 "验证逻辑关系确实成立",
                 "检查结算规则是否兼容",
-            ],
+            ] + needs_extra_review,
             timestamp=datetime.now().isoformat()
         )
     
@@ -787,14 +836,18 @@ class ArbitrageScanner:
         return opportunities
     
     def _group_by_event(self, markets: List[Market]) -> Dict[str, List[Market]]:
-        """按事件分组"""
+        """按事件分组（考虑结算日期，避免将不同日期的市场误归为完备集）"""
         groups = {}
         for m in markets:
-            key = m.event_id or m.event_title
-            if key:
-                if key not in groups:
-                    groups[key] = []
-                groups[key].append(m)
+            event_key = m.event_id or m.event_title
+            if event_key:
+                # 关键改进: 同时考虑 event_id 和 end_date
+                # 确保只有同一天结算的市场才归为一组
+                date_part = ""
+                if m.end_date:
+                    date_part = m.end_date.split('T')[0] if 'T' in m.end_date else m.end_date
+                key = f"{event_key}_{date_part}" if date_part else event_key
+                groups.setdefault(key, []).append(m)
         return groups
     
     def _print_header(self):
