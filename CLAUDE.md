@@ -153,13 +153,13 @@ Config loading priority: `--config` argument > `config.json` > environment varia
 - 避免一次性做太多，保持每步可验证
 
 ### 2. 进度持久化 (Progress Persistence)
-- 每完成一个目标，验证无误后更新进度到 `PROJECT_BIBLE.md`
-- 使用 `PROGRESS.md` 记录详细工作日志（如果需要）
+- 每完成一个目标，验证无误后更新进度到 `docs/PROGRESS.md`
+- 使用 `docs/PROGRESS.md` 记录详细工作日志（如果需要）
 - 确保可以在任何时间、任何地点恢复工作上下文
 
 ### 3. 开放创新 (Open Innovation)
 - 欢迎任何能改进套利系统的新点子
-- 新点子需经确认后记录到 `PROJECT_BIBLE.md` 的扩展计划
+- 新点子需经确认后记录到 `docs/PROJECT_BIBLE.md` 的扩展计划
 - 保持系统活力，不断迭代优化
 
 ### 4. 核心聚焦 (Core Focus)
@@ -176,17 +176,18 @@ Config loading priority: `--config` argument > `config.json` > environment varia
 
 ## Project Guidance
 
-**`PROJECT_BIBLE.md` is the authoritative guide** for all project work. It contains:
+**`docs/PROJECT_BIBLE.md` is the authoritative guide** for all project work. It contains:
 - Complete strategy analysis and market background
 - Detailed technical architecture and API reference
 - Development roadmap (Phase 1-5) with task breakdown
 - Risk management guidelines and manual review checklist
 - All appendices and FAQs
 
-When making decisions about features, architecture changes, or priorities, always reference `PROJECT_BIBLE.md` first.
+When making decisions about features, architecture changes, or priorities, always reference `docs/PROJECT_BIBLE.md` first.
 
 ## References
 
-- `PROJECT_BIBLE.md` - Comprehensive project documentation (authoritative guide)
+- `docs/PROJECT_BIBLE.md` - Comprehensive project documentation (authoritative guide)
+- `docs/PROGRESS.md` - Project progress tracking and work logs
 - `README.md` - Quick start guide
 - `config.example.json` - Configuration template

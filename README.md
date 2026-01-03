@@ -140,13 +140,27 @@ python test_prompts.py --test 0
 
 ## 📚 详细文档
 
-**请阅读 [PROJECT_BIBLE.md](./PROJECT_BIBLE.md)** 了解：
+### 核心文档
 
-- 完整的策略原理和市场背景
-- 系统架构和技术设计
-- 开发路线图和任务分解
-- 风险管理和人工复核清单
-- API参考和常见问题
+- **[docs/PROJECT_BIBLE.md](./docs/PROJECT_BIBLE.md)** - 项目完整指导文档
+  - 完整的策略原理和市场背景
+  - 系统架构和技术设计
+  - 开发路线图和任务分解
+  - 风险管理和人工复核清单
+  - API参考和常见问题
+
+### 进度文档
+
+- **[docs/PROGRESS.md](./docs/PROGRESS.md)** - 项目进度追踪
+  - 当前状态和已完成里程碑
+  - 进行中任务和工作日志
+  - 每日工作记录
+  - 版本历史
+
+### 技术文档
+
+- **[PHASE2_FIX_PLAN.md](./PHASE2_FIX_PLAN.md)** - Phase 2 详细修复计划
+- **[CLAUDE.md](./CLAUDE.md)** - Claude Code 开发指南
 
 ## 💰 套利示例
 

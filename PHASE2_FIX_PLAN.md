@@ -1255,7 +1255,7 @@ python -m pytest tests/ --cov=. --cov-report=html
 #### 其他
 - [ ] 更新配置文件
 - [ ] 创建单元测试
-- [ ] 更新 PROJECT_BIBLE.md 工作日志
+- [ ] 更新 docs/PROGRESS.md 工作日志
 
 ### 9.2 成功指标
 
