@@ -49,6 +49,9 @@ from prompts import (
     RELATIONSHIP_ANALYSIS_PROMPT_V2
 )
 
+# ✅ 新增：导入验证层
+from validators import MathValidator
+
 
 # ============================================================
 # 数据结构
@@ -69,8 +72,8 @@ class Market:
     condition_id: str
     question: str
     description: str
-    yes_price: float
-    no_price: float
+    yes_price: float              # 中间价/参考价 (展示用)
+    no_price: float               # 1 - yes_price (展示用)
     volume: float
     liquidity: float
     end_date: str
@@ -78,9 +81,24 @@ class Market:
     event_title: str
     resolution_source: str
     outcomes: List[str]
-    
+    # 陷阱1修复: 增加真实的 Bid/Ask 价格
+    best_bid: float = 0.0         # 最佳买价 (你卖出时的价格)
+    best_ask: float = 0.0         # 最佳卖价 (你买入时的价格)
+    spread: float = 0.0           # 价差 = ask - bid
+    token_id: str = ""            # CLOB token ID (用于获取订单簿)
+
     def __repr__(self):
-        return f"Market('{self.question[:50]}...', YES=${self.yes_price:.2f})"
+        return f"Market('{self.question[:50]}...', YES=${self.yes_price:.2f}, spread={self.spread:.3f})"
+
+    @property
+    def effective_buy_price(self) -> float:
+        """实际买入价格 - 套利计算时使用 best_ask"""
+        return self.best_ask if self.best_ask > 0 else self.yes_price
+
+    @property
+    def effective_sell_price(self) -> float:
+        """实际卖出价格 - 套利计算时使用 best_bid"""
+        return self.best_bid if self.best_bid > 0 else self.yes_price
 
 
 @dataclass
@@ -155,15 +173,27 @@ class PolymarketClient:
                 prices = json.loads(outcome_prices)
             else:
                 prices = outcome_prices
-            
+
             yes_price = float(prices[0]) if prices else 0.5
-            
+
             outcomes_str = data.get('outcomes', '["Yes","No"]')
             if isinstance(outcomes_str, str):
                 outcomes = json.loads(outcomes_str)
             else:
                 outcomes = outcomes_str
-            
+
+            # 陷阱1修复: 获取 CLOB token ID (用于后续获取订单簿)
+            clob_token_ids = data.get('clobTokenIds', '[]')
+            if isinstance(clob_token_ids, str):
+                try:
+                    token_ids = json.loads(clob_token_ids)
+                except:
+                    token_ids = []
+            else:
+                token_ids = clob_token_ids or []
+            # YES token 是第一个
+            yes_token_id = token_ids[0] if token_ids else ""
+
             return Market(
                 id=data.get('id', ''),
                 condition_id=data.get('conditionId', ''),
@@ -177,10 +207,100 @@ class PolymarketClient:
                 event_id=data.get('eventSlug', '') or data.get('groupItemTitle', '') or '',
                 event_title=data.get('groupItemTitle', '') or data.get('eventSlug', '') or '',
                 resolution_source=data.get('resolutionSource', ''),
-                outcomes=outcomes
+                outcomes=outcomes,
+                token_id=yes_token_id
             )
         except Exception:
             return None
+
+    def fetch_orderbook(self, token_id: str) -> Dict:
+        """
+        从 CLOB API 获取订单簿数据
+
+        陷阱1修复: 获取真实的 Bid/Ask 价格
+
+        Args:
+            token_id: CLOB token ID
+
+        Returns:
+            {"best_bid": float, "best_ask": float, "spread": float}
+        """
+        if not token_id:
+            return {"best_bid": 0.0, "best_ask": 0.0, "spread": 0.0}
+
+        clob_url = f"https://clob.polymarket.com/book"
+        try:
+            response = self.session.get(
+                clob_url,
+                params={"token_id": token_id},
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # 解析订单簿
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+
+            # Best bid = 最高买价 (别人愿意买的最高价)
+            best_bid = float(bids[0]["price"]) if bids else 0.0
+            # Best ask = 最低卖价 (别人愿意卖的最低价)
+            best_ask = float(asks[0]["price"]) if asks else 0.0
+            spread = best_ask - best_bid if (best_ask > 0 and best_bid > 0) else 0.0
+
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread
+            }
+        except Exception as e:
+            # 静默失败，返回默认值
+            return {"best_bid": 0.0, "best_ask": 0.0, "spread": 0.0}
+
+    def enrich_market_with_orderbook(self, market: Market) -> Market:
+        """
+        为市场对象补充订单簿数据
+
+        Args:
+            market: Market 对象
+
+        Returns:
+            补充了 best_bid/best_ask/spread 的 Market 对象
+        """
+        if not market.token_id:
+            return market
+
+        orderbook = self.fetch_orderbook(market.token_id)
+        market.best_bid = orderbook["best_bid"]
+        market.best_ask = orderbook["best_ask"]
+        market.spread = orderbook["spread"]
+
+        return market
+
+    def get_markets_with_orderbook(self, limit: int = 100, active: bool = True,
+                                   min_liquidity: float = 0, fetch_orderbook: bool = True) -> List[Market]:
+        """
+        获取市场列表并可选地补充订单簿数据
+
+        Args:
+            limit: 返回数量限制
+            active: 是否只返回活跃市场
+            min_liquidity: 最小流动性过滤
+            fetch_orderbook: 是否获取订单簿数据 (会增加API调用)
+
+        Returns:
+            Market 列表
+        """
+        markets = self.get_markets(limit, active, min_liquidity)
+
+        if fetch_orderbook:
+            print(f"正在获取 {len(markets)} 个市场的订单簿数据...")
+            for i, market in enumerate(markets):
+                self.enrich_market_with_orderbook(market)
+                if (i + 1) % 20 == 0:
+                    print(f"  已处理 {i + 1}/{len(markets)} 个市场")
+
+        return markets
 
 
 # ============================================================
@@ -412,7 +532,24 @@ class LLMAnalyzer:
         relationship = result.get("relationship", "UNRELATED").upper()
         confidence = result.get("confidence", 0.5)
 
-        # 一致性检查: 检测 relationship 与 reasoning 是否矛盾
+        # 构建临时结果用于一致性检查
+        temp_result = {
+            'relationship': relationship,
+            'reasoning': reasoning,
+            'confidence': confidence
+        }
+
+        # ✅ 调用一致性检查方法
+        is_consistent, consistency_error = self._validate_llm_response_consistency(temp_result)
+
+        if not is_consistent:
+            print(f"    ⚠️ LLM输出一致性检查失败: {consistency_error}")
+            print(f"       降级为 INDEPENDENT 以防止假套利")
+            # 降级为 INDEPENDENT
+            relationship = "INDEPENDENT"
+            confidence = 0.0
+
+        # 一致性检查: 检测 relationship 与 reasoning 是否矛盾（保留原有逻辑作为双重检查）
         reasoning_upper = reasoning.upper() if isinstance(reasoning, str) else ""
         inconsistency_detected = False
 
@@ -441,6 +578,8 @@ class LLMAnalyzer:
             "violation_amount": result.get("violation_amount", 0),
             "arbitrage_viable": result.get("arbitrage_viable", False),
             "inconsistency_detected": inconsistency_detected,  # 标记不一致
+            "is_consistent": is_consistent,  # ✅ 新增：一致性检查结果
+            "consistency_error": consistency_error if not is_consistent else None  # ✅ 新增：错误信息
         }
 
         return normalized
@@ -513,6 +652,70 @@ class LLMAnalyzer:
             "resolution_compatible": None,
         }
     
+    def _validate_llm_response_consistency(self, llm_result: dict) -> tuple[bool, str]:
+        """
+        验证 LLM 输出的 consistency
+
+        检查 reasoning 字段是否与 relationship 分类矛盾
+
+        Args:
+            llm_result: LLM 返回的分析结果
+                {
+                    'relationship': 'IMPLIES_AB',
+                    'reasoning': '...',
+                    'confidence': 0.95
+                }
+
+        Returns:
+            (is_valid, error_message)
+            - is_valid: True 表示一致，False 表示发现矛盾
+            - error_message: 矛盾描述
+
+        Examples:
+            >>> # 矛盾案例：reasoning 说互斥，但 relationship 是 IMPLIES
+            >>> result = {
+            ...     'relationship': 'IMPLIES_AB',
+            ...     'reasoning': 'These markets are mutually exclusive'
+            ... }
+            >>> is_valid, msg = analyzer._validate_llm_response_consistency(result)
+            >>> assert not is_valid
+            >>> assert 'mutual' in msg.lower()
+        """
+        relationship = llm_result.get('relationship', '')
+        reasoning = llm_result.get('reasoning', '').lower()
+
+        # 定义矛盾模式
+        contradictions = {
+            'IMPLIES_AB': [
+                'mutual', 'exclusive', 'independent', 'unrelated',
+                '矛盾', '互斥', '无关', '独立'
+            ],
+            'IMPLIES_BA': [
+                'mutual', 'exclusive', 'independent', 'unrelated',
+                '矛盾', '互斥', '无关', '独立'
+            ],
+            'EQUIVALENT': [
+                'different', 'exclusive', 'independent', 'opposite',
+                '不同', '互斥', '矛盾', '相反'
+            ],
+            'MUTUAL_EXCLUSIVE': [
+                'implies', 'equivalent', 'same event', 'identical',
+                '蕴含', '等价', '相同', '一致'
+            ],
+        }
+
+        # 检查是否矛盾
+        if relationship in contradictions:
+            forbidden_terms = contradictions[relationship]
+            for term in forbidden_terms:
+                if term in reasoning:
+                    return False, (
+                        f"LLM 输出矛盾: relationship={relationship}, "
+                        f"但 reasoning 包含 '{term}'"
+                    )
+
+        return True, ""
+
     def close(self):
         """关闭LLM客户端"""
         if self.client:
@@ -529,6 +732,10 @@ class ArbitrageDetector:
     def __init__(self, config: AppConfig):
         self.min_profit_pct = config.scan.min_profit_pct
         self.min_confidence = config.scan.min_confidence
+
+        # ✅ 新增：初始化数学验证器
+        self.math_validator = MathValidator()
+        print(f"✅ MathValidator 已初始化")
     
     def check_pair(self, market_a: Market, market_b: Market, 
                    analysis: Dict) -> Optional[ArbitrageOpportunity]:
@@ -563,42 +770,54 @@ class ArbitrageDetector:
         if len(dates) > 1:
             return None  # 结算日期不一致
 
-        total = sum(m.yes_price for m in markets)
+        # 陷阱1修复: 使用真实的 best_ask 计算成本
+        # 买入所有选项的 YES，使用各自的 best_ask
+        real_total = sum(m.effective_buy_price for m in markets)
+        mid_total = sum(m.yes_price for m in markets)
 
-        if total < 0.98:
-            profit = 1.0 - total
-            profit_pct = (profit / total) * 100 if total > 0 else 0
+        if real_total < 0.98:
+            real_profit = 1.0 - real_total
+            real_profit_pct = (real_profit / real_total) * 100 if real_total > 0 else 0
+            mid_profit_pct = ((1.0 - mid_total) / mid_total) * 100 if mid_total > 0 else 0
 
-            if profit_pct < self.min_profit_pct:
+            if real_profit_pct < self.min_profit_pct:
                 return None
 
             # 验证3: 利润率合理性检查
             needs_extra_review = []
-            if profit_pct > 100:
-                needs_extra_review.append("⚠️ 利润率超过100%，请重点验证数据准确性")
+            if real_profit_pct > 100:
+                needs_extra_review.append("!! 利润率超过100%，请重点验证数据准确性")
+
+            # 陷阱1修复: 检查是否有较大价差
+            high_spread_markets = [m for m in markets if m.spread > 0.02]
+            if high_spread_markets:
+                spread_info = ", ".join([f"{m.question[:30]}:{m.spread:.1%}" for m in high_spread_markets[:3]])
+                needs_extra_review.append(f"!! 部分市场价差较大: {spread_info}")
 
             action_lines = [
-                f"买 '{m.question[:60]}...' YES @ ${m.yes_price:.3f}"
+                f"买 '{m.question[:60]}...' YES @ ${m.effective_buy_price:.3f} (ask)"
                 for m in markets
             ]
 
             return ArbitrageOpportunity(
                 id=f"exhaustive_{datetime.now().strftime('%Y%m%d%H%M%S')}",
                 type="EXHAUSTIVE_SET_UNDERPRICED",
-                markets=[{"id": m.id, "question": m.question, "yes_price": m.yes_price} for m in markets],
+                markets=[{"id": m.id, "question": m.question, "yes_price": m.yes_price,
+                          "best_ask": m.best_ask, "spread": m.spread} for m in markets],
                 relationship="exhaustive",
                 confidence=0.85,
-                total_cost=total,
+                total_cost=real_total,
                 guaranteed_return=1.0,
-                profit=profit,
-                profit_pct=profit_pct,
+                profit=real_profit,
+                profit_pct=real_profit_pct,
                 action="\n".join(action_lines),
                 reasoning="完备集市场总价小于1，买入所有选项可锁定利润",
                 edge_cases=["需确认这些选项真的构成完备集"],
                 needs_review=[
                     "确认所有选项互斥且覆盖全部可能",
                     "检查结算规则是否一致",
-                    "确认没有遗漏的选项"
+                    "确认没有遗漏的选项",
+                    f"中间价利润: {mid_profit_pct:.1f}% vs 实际利润: {real_profit_pct:.1f}%",
                 ] + needs_extra_review,
                 timestamp=datetime.now().isoformat()
             )
@@ -608,7 +827,37 @@ class ArbitrageDetector:
     def _check_implication(self, implying: Market, implied: Market,
                            analysis: Dict, direction: str) -> Optional[ArbitrageOpportunity]:
         """检查包含关系套利"""
-        # 检查 LLM 响应是否存在不一致
+
+        # ✅ 新增：LLM 输出一致性检查
+        if not analysis.get("is_consistent", True):
+            print(f"    ⚠️ LLM 输出不一致，跳过套利检测")
+            print(f"       错误: {analysis.get('consistency_error', 'Unknown')}")
+            return None
+
+        # ✅ 新增：数据有效性检查
+        if not self._validate_market_data(implying, implied):
+            print(f"    ❌ 数据有效性检查失败，跳过套利检测")
+            return None
+
+        # ✅ 新增：调用 MathValidator 验证数学约束
+        relation_type = analysis.get("relationship", "")
+        reasoning = analysis.get("reasoning", "")
+
+        validation_result = self.math_validator.validate_implication(
+            market_a=implying.__dict__,
+            market_b=implied.__dict__,
+            relation_type=relation_type,
+            reasoning=reasoning
+        )
+
+        if not validation_result['is_valid']:
+            print(f"    ❌ 数学验证失败: {validation_result['message']}")
+            print(f"       验证详情: {validation_result.get('details', {})}")
+            return None
+        else:
+            print(f"    ✅ 数学验证通过: {validation_result['message']}")
+
+        # 检查 LLM 响应是否存在不一致（原有逻辑，保留作为双重检查）
         if analysis.get("inconsistency_detected", False):
             return None  # 不一致的分析结果不可信，跳过
 
@@ -617,11 +866,22 @@ class ArbitrageDetector:
         if implied.yes_price >= implying.yes_price - 0.01:
             return None  # 约束满足，无套利
 
-        cost = implied.yes_price + implying.no_price
-        profit = 1.0 - cost
-        profit_pct = (profit / cost) * 100 if cost > 0 else 0
+        # 陷阱1修复: 使用真实的 best_ask 计算买入成本
+        # 买入 implied 的 YES: 使用 best_ask
+        implied_buy_cost = implied.effective_buy_price
+        # 买入 implying 的 NO: 使用 1 - best_bid (相当于卖出 YES)
+        implying_no_cost = 1 - implying.effective_sell_price if implying.best_bid > 0 else implying.no_price
 
-        if profit_pct < self.min_profit_pct:
+        # 使用真实成本计算利润
+        real_cost = implied_buy_cost + implying_no_cost
+        real_profit = 1.0 - real_cost
+        real_profit_pct = (real_profit / real_cost) * 100 if real_cost > 0 else 0
+
+        # 同时保留中间价计算（用于对比）
+        mid_cost = implied.yes_price + implying.no_price
+        mid_profit_pct = ((1.0 - mid_cost) / mid_cost) * 100 if mid_cost > 0 else 0
+
+        if real_profit_pct < self.min_profit_pct:
             return None
 
         if analysis.get("confidence", 0) < self.min_confidence:
@@ -629,71 +889,152 @@ class ArbitrageDetector:
 
         # 利润率合理性检查
         needs_extra_review = []
-        if profit_pct > 100:
-            needs_extra_review.append("⚠️ 利润率超过100%，请重点验证数据准确性和逻辑关系")
+        if real_profit_pct > 100:
+            needs_extra_review.append("!! 利润率超过100%，请重点验证数据准确性和逻辑关系")
+
+        # 陷阱1修复: 如果有价差数据，显示滑点警告
+        if implied.spread > 0.02 or implying.spread > 0.02:
+            needs_extra_review.append(f"!! 价差较大 (implied:{implied.spread:.1%}, implying:{implying.spread:.1%})，注意滑点风险")
 
         return ArbitrageOpportunity(
             id=f"impl_{direction}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
             type="IMPLICATION_VIOLATION",
             markets=[
-                {"id": implied.id, "question": implied.question, "yes_price": implied.yes_price},
-                {"id": implying.id, "question": implying.question, "yes_price": implying.yes_price}
+                {"id": implied.id, "question": implied.question, "yes_price": implied.yes_price,
+                 "best_ask": implied.best_ask, "spread": implied.spread},
+                {"id": implying.id, "question": implying.question, "yes_price": implying.yes_price,
+                 "best_bid": implying.best_bid, "spread": implying.spread}
             ],
             relationship=f"implies_{direction.lower().replace('→', '_')}",
             confidence=analysis.get("confidence", 0.5),
-            total_cost=cost,
+            total_cost=real_cost,
             guaranteed_return=1.0,
-            profit=profit,
-            profit_pct=profit_pct,
-            action=f"买 '{implied.question[:60]}...' YES @ ${implied.yes_price:.3f}\n"
-                   f"买 '{implying.question[:60]}...' NO @ ${implying.no_price:.3f}",
+            profit=real_profit,
+            profit_pct=real_profit_pct,
+            action=f"买 '{implied.question[:60]}...' YES @ ${implied_buy_cost:.3f} (ask)\n"
+                   f"买 '{implying.question[:60]}...' NO @ ${implying_no_cost:.3f}",
             reasoning=analysis.get("reasoning", ""),
             edge_cases=analysis.get("edge_cases", []),
             needs_review=[
                 "验证逻辑关系确实成立",
                 "检查结算规则是否兼容",
+                f"中间价利润: {mid_profit_pct:.1f}% vs 实际利润: {real_profit_pct:.1f}%",
             ] + needs_extra_review,
             timestamp=datetime.now().isoformat()
         )
-    
+
+    def _validate_market_data(
+        self,
+        market_a: Market,
+        market_b: Market
+    ) -> bool:
+        """
+        验证市场数据的有效性
+
+        检查：
+        1. 价格字段是否有效（非 0.0，非 None）
+        2. 必需字段是否存在
+        3. 价格范围是否合理（0-1）
+
+        Args:
+            market_a, market_b: 待验证的市场
+
+        Returns:
+            True 表示数据有效，False 表示无效
+        """
+        # 检查价格有效性
+        for market, name in [(market_a, 'A'), (market_b, 'B')]:
+            # YES 价格检查
+            if market.yes_price == 0.0 or market.yes_price is None:
+                print(f"    ❌ 市场 {name} YES 价格无效: {market.yes_price}")
+                return False
+
+            if not (0.0 <= market.yes_price <= 1.0):
+                print(f"    ❌ 市场 {name} YES 价格超出范围: {market.yes_price}")
+                return False
+
+            # NO 价格检查
+            if market.no_price == 0.0 or market.no_price is None:
+                print(f"    ❌ 市场 {name} NO 价格无效: {market.no_price}")
+                return False
+
+            if not (0.0 <= market.no_price <= 1.0):
+                print(f"    ❌ 市场 {name} NO 价格超出范围: {market.no_price}")
+                return False
+
+            # 流动性检查
+            if market.liquidity <= 0:
+                print(f"    ❌ 市场 {name} 流动性为 0: {market.liquidity}")
+                return False
+
+            # Question 检查
+            if not market.question or market.question.strip() == '':
+                print(f"    ❌ 市场 {name} question 为空")
+                return False
+
+        print(f"    ✅ 数据有效性检查通过")
+        return True
+
     def _check_equivalent(self, market_a: Market, market_b: Market,
                           analysis: Dict) -> Optional[ArbitrageOpportunity]:
         """检查等价市场套利"""
         spread = abs(market_a.yes_price - market_b.yes_price)
-        
+
         if spread < 0.03:
             return None
-        
+
         if market_a.yes_price < market_b.yes_price:
             cheap, expensive = market_a, market_b
         else:
             cheap, expensive = market_b, market_a
-        
-        cost = cheap.yes_price + expensive.no_price
-        profit = 1.0 - cost
-        profit_pct = (profit / cost) * 100 if cost > 0 else 0
-        
-        if profit_pct < self.min_profit_pct:
+
+        # 陷阱1修复: 使用真实的 best_ask/best_bid 计算成本
+        # 买入 cheap 的 YES: 使用 best_ask
+        cheap_buy_cost = cheap.effective_buy_price
+        # 买入 expensive 的 NO: 使用 1 - best_bid
+        expensive_no_cost = 1 - expensive.effective_sell_price if expensive.best_bid > 0 else expensive.no_price
+
+        # 使用真实成本计算利润
+        real_cost = cheap_buy_cost + expensive_no_cost
+        real_profit = 1.0 - real_cost
+        real_profit_pct = (real_profit / real_cost) * 100 if real_cost > 0 else 0
+
+        # 保留中间价计算（用于对比）
+        mid_cost = cheap.yes_price + expensive.no_price
+        mid_profit_pct = ((1.0 - mid_cost) / mid_cost) * 100 if mid_cost > 0 else 0
+
+        if real_profit_pct < self.min_profit_pct:
             return None
-        
+
+        # 陷阱1修复: 价差警告
+        needs_extra_review = []
+        if cheap.spread > 0.02 or expensive.spread > 0.02:
+            needs_extra_review.append(f"!! 价差较大 (cheap:{cheap.spread:.1%}, expensive:{expensive.spread:.1%})")
+
         return ArbitrageOpportunity(
             id=f"equiv_{datetime.now().strftime('%Y%m%d%H%M%S')}",
             type="EQUIVALENT_MISPRICING",
             markets=[
-                {"id": cheap.id, "question": cheap.question, "yes_price": cheap.yes_price},
-                {"id": expensive.id, "question": expensive.question, "yes_price": expensive.yes_price}
+                {"id": cheap.id, "question": cheap.question, "yes_price": cheap.yes_price,
+                 "best_ask": cheap.best_ask, "spread": cheap.spread},
+                {"id": expensive.id, "question": expensive.question, "yes_price": expensive.yes_price,
+                 "best_bid": expensive.best_bid, "spread": expensive.spread}
             ],
             relationship="equivalent",
             confidence=analysis.get("confidence", 0.5),
-            total_cost=cost,
+            total_cost=real_cost,
             guaranteed_return=1.0,
-            profit=profit,
-            profit_pct=profit_pct,
-            action=f"买 '{cheap.question[:60]}...' YES @ ${cheap.yes_price:.3f}\n"
-                   f"买 '{expensive.question[:60]}...' NO @ ${expensive.no_price:.3f}",
+            profit=real_profit,
+            profit_pct=real_profit_pct,
+            action=f"买 '{cheap.question[:60]}...' YES @ ${cheap_buy_cost:.3f} (ask)\n"
+                   f"买 '{expensive.question[:60]}...' NO @ ${expensive_no_cost:.3f}",
             reasoning="等价市场存在显著价差",
             edge_cases=analysis.get("edge_cases", []),
-            needs_review=["确认两个市场真的等价", "检查结算规则"],
+            needs_review=[
+                "确认两个市场真的等价",
+                "检查结算规则",
+                f"中间价利润: {mid_profit_pct:.1f}% vs 实际利润: {real_profit_pct:.1f}%",
+            ] + needs_extra_review,
             timestamp=datetime.now().isoformat()
         )
 
@@ -835,6 +1176,27 @@ class ArbitrageScanner:
         
         return opportunities
     
+    def _generate_polymarket_links(self, markets: List[Dict]) -> List[str]:
+        """
+        生成 Polymarket 市场链接
+
+        Args:
+            markets: 市场列表（从 ArbitrageOpportunity.markets 获取）
+
+        Returns:
+            链接列表
+        """
+        links = []
+        for market in markets:
+            # Polymarket URL 格式
+            # https://polymarket.com/event/{event_slug}?market={market_id}
+            market_id = market.get('id', '')
+            # 使用 event_id 或简单的市场 ID
+            url = f"https://polymarket.com/event/market?market={market_id}"
+            links.append(url)
+
+        return links
+
     def _group_by_event(self, markets: List[Market]) -> Dict[str, List[Market]]:
         """按事件分组（考虑结算日期，避免将不同日期的市场误归为完备集）"""
         groups = {}
@@ -900,14 +1262,14 @@ class ArbitrageScanner:
         print("\n" + "=" * 65)
         print("扫描结果摘要")
         print("=" * 65)
-        
+
         if not opportunities:
             print("\n暂未发现符合条件的套利机会")
             print("这很正常——好机会不是时时都有\n")
             return
-        
+
         print(f"\n🎯 发现 {len(opportunities)} 个潜在套利机会:\n")
-        
+
         for i, opp in enumerate(opportunities, 1):
             print(f"{'─' * 60}")
             print(f"机会 #{i}: {opp.type}")
@@ -918,9 +1280,35 @@ class ArbitrageScanner:
             print(f"\n操作:")
             for line in opp.action.split('\n'):
                 print(f"  {line}")
-            print(f"\n⚠️ 需要复核:")
-            for item in opp.needs_review:
-                print(f"  • {item}")
+
+            # ✅ 新增：Polymarket 链接
+            links = self._generate_polymarket_links(opp.markets)
+            print(f"\n🔗 Polymarket 链接:")
+            for j, (market, link) in enumerate(zip(opp.markets, links), 1):
+                question = market.get('question', '')[:60]
+                print(f"  {j}. {question}...")
+                print(f"     {link}")
+
+            # ✅ 新增：人工验证清单
+            print(f"\n⚠️  人工验证清单:")
+            print(f"  ☐ 验证逻辑关系是否正确: {opp.type}")
+            print(f"  ☐ 检查结算规则是否兼容")
+
+            # 如果有两个市场，显示结算时间对比
+            if len(opp.markets) >= 2:
+                market_1 = opp.markets[0]
+                market_2 = opp.markets[1]
+                print(f"  ☐ 在 Polymarket 上确认当前价格")
+                print(f"  ☐ 检查流动性: ${market_1.get('yes_price', 0):.2f} vs ${market_2.get('yes_price', 0):.2f}")
+            print(f"  ☐ 检查是否有特殊规则（如提前结算）")
+            print(f"  ☐ 验证 LLM 分析的合理性")
+
+            # 原有的 needs_review 内容
+            if opp.needs_review:
+                print(f"\n📋 额外注意事项:")
+                for item in opp.needs_review:
+                    print(f"  • {item}")
+
             print()
     
     def close(self):

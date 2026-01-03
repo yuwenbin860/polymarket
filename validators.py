@@ -89,6 +89,7 @@ class MarketData:
     no_price: float
     liquidity: float
     volume: float = 0.0
+    end_date: str = ""  # 陷阱3修复: 增加结算日期字段
 
     @property
     def spread(self) -> float:
@@ -135,6 +136,107 @@ class MathValidator:
 
         # 滑点上限为 5%
         return min(slippage, 0.05)
+
+    def validate_time_consistency(
+        self,
+        market_a: MarketData,
+        market_b: MarketData,
+        relation: str,  # "IMPLIES_AB" 或 "IMPLIES_BA"
+        max_time_diff_hours: float = 24.0
+    ) -> ValidationReport:
+        """
+        陷阱3修复: 验证时间一致性
+
+        规则：
+        1. 蕴含关系 (A→B) 中，B的结算时间应该 >= A的结算时间
+        2. 两市场的结算时间差应该 <= max_time_diff_hours
+
+        Args:
+            market_a: 市场A数据
+            market_b: 市场B数据
+            relation: 关系类型
+            max_time_diff_hours: 最大允许的时间差（小时）
+
+        Returns:
+            ValidationReport
+        """
+        report = ValidationReport(
+            result=ValidationResult.PASSED,
+            reason="时间一致性检查通过"
+        )
+        report.details["check_type"] = "time_consistency"
+
+        # 如果没有结算日期数据，标记为需要人工复核
+        if not market_a.end_date or not market_b.end_date:
+            report.result = ValidationResult.NEEDS_REVIEW
+            report.reason = "缺少结算日期数据，需人工确认时间一致性"
+            report.warnings.append("无法自动验证时间一致性")
+            return report
+
+        try:
+            from datetime import datetime
+
+            # 解析日期（支持多种格式）
+            def parse_date(date_str: str) -> datetime:
+                formats = [
+                    "%Y-%m-%dT%H:%M:%S.%fZ",
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d",
+                ]
+                for fmt in formats:
+                    try:
+                        return datetime.strptime(date_str.split('+')[0].split('.')[0] + ('' if 'T' not in fmt else ''), fmt if 'T' not in fmt else fmt.split('.')[0])
+                    except:
+                        continue
+                # 简化解析：只取日期部分
+                date_part = date_str.split('T')[0] if 'T' in date_str else date_str
+                return datetime.strptime(date_part, "%Y-%m-%d")
+
+            end_a = parse_date(market_a.end_date)
+            end_b = parse_date(market_b.end_date)
+
+            report.details["end_date_a"] = str(end_a)
+            report.details["end_date_b"] = str(end_b)
+
+            # 计算时间差
+            time_diff = abs((end_a - end_b).total_seconds())
+            time_diff_hours = time_diff / 3600
+            report.details["time_diff_hours"] = time_diff_hours
+
+            # 检查1: 蕴含关系的时间约束
+            if relation == "IMPLIES_AB":
+                # A蕴含B：B的结算时间应该 >= A的结算时间
+                if end_b < end_a:
+                    report.result = ValidationResult.FAILED
+                    report.reason = f"时间约束违反: B的结算时间 ({end_b}) 早于 A ({end_a})"
+                    report.checks_failed.append("implication_time_constraint")
+                    return report
+                report.checks_passed.append("implication_time_constraint")
+
+            elif relation == "IMPLIES_BA":
+                # B蕴含A：A的结算时间应该 >= B的结算时间
+                if end_a < end_b:
+                    report.result = ValidationResult.FAILED
+                    report.reason = f"时间约束违反: A的结算时间 ({end_a}) 早于 B ({end_b})"
+                    report.checks_failed.append("implication_time_constraint")
+                    return report
+                report.checks_passed.append("implication_time_constraint")
+
+            # 检查2: 时间差是否在安全范围内
+            if time_diff_hours > max_time_diff_hours:
+                report.result = ValidationResult.WARNING
+                report.reason = f"结算时间差 {time_diff_hours:.1f} 小时，超过 {max_time_diff_hours} 小时阈值"
+                report.warnings.append(f"时间差较大，需人工确认是否会影响套利")
+            else:
+                report.checks_passed.append("time_diff_threshold")
+
+        except Exception as e:
+            report.result = ValidationResult.NEEDS_REVIEW
+            report.reason = f"日期解析失败: {str(e)}"
+            report.warnings.append("需人工验证时间一致性")
+
+        return report
 
     def validate_implication(
         self,

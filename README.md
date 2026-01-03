@@ -8,16 +8,22 @@
 2. **包含关系套利** - 检测逻辑包含关系是否被价格违反
 3. **LLM辅助分析** - 使用AI分析市场间的逻辑关系
 4. **多LLM支持** - 支持OpenAI、Claude、DeepSeek、通义、GLM、Ollama等
+5. **真实订单簿价格** - 使用CLOB API获取best_bid/best_ask，而非最后成交价
+6. **三层验证架构** - 数学验证 + LLM找碴验证 + 双模型交叉验证
 
 ## 📁 项目结构
 
 ```
 polymarket_arb/
 ├── PROJECT_BIBLE.md         # 📖 项目完整文档（必读）
-├── local_scanner_v2.py      # 主程序（支持多LLM）
+├── local_scanner_v2.py      # 主程序（支持多LLM + 订单簿价格）
 ├── llm_providers.py         # LLM提供商抽象层
 ├── llm_config.py            # LLM配置管理器
-├── prompts.py               # Prompt工程模块
+├── prompts.py               # Prompt工程模块（含时间验证）
+├── validators.py            # 数学验证层（时间一致性验证）
+├── similarity.py            # 向量相似度计算
+├── dual_verification.py     # 双模型交叉验证
+├── simulation.py            # 模拟执行跟踪
 ├── config.py                # 配置管理
 ├── config.example.json      # 配置文件示例
 ├── test_prompts.py          # Prompt测试脚本
@@ -173,10 +179,29 @@ python test_prompts.py --test 0
 
 ## ⚠️ 风险提示
 
+### 核心风险
+
 1. **逻辑关系误判** - 所有机会需人工复核
 2. **结算规则差异** - 仔细阅读每个市场的规则
 3. **流动性风险** - 检查订单簿深度
 4. **单笔限制** - 建议不超过总资金10%
+
+### 三大实战陷阱（已修复）
+
+**陷阱1: Bid/Ask vs Last Price**
+- ❌ **问题**: 使用中间价/最后成交价计算套利，而实际成交需要支付 best_ask（更贵）
+- ✅ **修复**: 系统现已集成 CLOB API 获取真实订单簿价格
+- 📍 **影响**: 套利计算更准确，避免高估利润
+
+**陷阱2: 跨链套利成本**
+- ❌ **问题**: 跨链套利（Polygon ↔ BNB/Solana）未考虑桥接费、gas、时延（数分钟至半小时）
+- ✅ **修复**: 策略优先级降级，小资金建议专注 Polymarket 内部套利
+- 📍 **影响**: 避免跨链摩擦吞噬小额套利利润
+
+**陷阱3: 时间一致性**
+- ❌ **问题**: LLM可能忽略时间修饰符（"1月前""3月后"），未自动验证 `end_date(B) >= end_date(A)`
+- ✅ **修复**: 新增自动时间验证函数 + 强化 Prompt 时间检查规则
+- 📍 **影响**: 避免因结算时间差导致蕴含关系失效
 
 ## 📄 License
 
