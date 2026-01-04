@@ -520,3 +520,200 @@ def test_prompt():
 
 if __name__ == "__main__":
     test_prompt()
+
+
+# ============================================================
+# 区间完备集验证Prompt - Phase 2.5 新增
+# ============================================================
+
+INTERVAL_EXHAUSTIVE_PROMPT = """你是一位预测市场分析专家，专门验证区间市场是否构成完备集。
+
+## 什么是区间完备集？
+
+区间完备集是指一组**区间市场**满足：
+1. **互斥性**：任意两个区间不重叠（如 "$0-50k" 和 "$50-100k" 不重叠）
+2. **完备性**：所有可能的值都被覆盖，无遗漏区间
+3. **边界明确**：边界值（如恰好为 $50,000）如何处理
+
+## 需要验证的市场组
+
+**事件**: {event_title}
+
+**区间市场列表**：
+{intervals_list}
+
+**总YES价格**: ${total_price:.4f}
+
+## 验证步骤
+
+### 步骤1: 区间解析
+请从每个市场的问题中提取：
+- 区间的最小值 (min_val)
+- 区间的最大值 (max_val)
+- 是否包含边界（如 "at least $50k" 包含 $50,000）
+
+### 步骤2: 互斥性检查
+- 检查所有区间对是否重叠
+- 例如：区间A [$0, $50k] 和 区间B [$40k, $100k] 在 $40k-$50k 重叠
+- 如果发现重叠，说明不完备
+
+### 步骤3: 完备性检查
+- 从最小值到最大值，是否有覆盖缺口？
+- 例如：只有 "$0-$50k" 和 "$100-$150k"，缺失 $50k-$100k
+- 对于无上限的区间（如 ">$100k"），是否需要负无穷到最小值的区间？
+
+### 步骤4: 边界值处理
+- 边界值（恰好等于区间端点）如何结算？
+- 例如：Gold价格为 $4,850，属于 "$4,725-$4,850" 还是 ">$4,850"？
+- 检查结算规则是否说明边界处理方式
+
+### 步骤5: 套利安全性评估
+- 如果发现完备集（总价格 < 1.0），套利是否安全？
+- 边界值结算的不确定性是否影响套利？
+
+## 输出格式
+
+请严格按以下JSON格式回答：
+
+```json
+{{
+  "is_interval_exhaustive_set": true或false,
+  "parsed_intervals": [
+    {{"min": 数值, "max": 数值, "includes_boundary": true/false, "market": "市场名称"}}
+  ],
+  "overlap_checks": {{
+    "has_overlaps": true或false,
+    "overlapping_pairs": ["区间A与区间B重叠"],
+    "overlap_details": "重叠情况说明"
+  }},
+  "completeness_checks": {{
+    "is_complete": true或false,
+    "missing_intervals": ["遗漏的区间1", "遗漏的区间2"],
+    "has_gaps": true或false,
+    "gap_details": "缺口说明",
+    "coverage_percentage": 0.0到1.0
+  }},
+  "boundary_handling": {{
+    "clear_rules": true或false,
+    "boundary_examples": ["边界值如何处理的例子"],
+    "uncertainty_level": "low|medium|high"
+  }},
+  "arbitrage_safety": {{
+    "safe_to_arbitrage": true或false,
+    "risk_factors": ["风险因素1", "风险因素2"],
+    "recommended_action": "proceed|avoid|verify_further"
+  }},
+  "confidence": 0.0到1.0,
+  "reasoning": "整体分析说明"
+}}
+```
+
+## 重要提示
+
+- 区间市场的完备性比二元市场更复杂，因为需要处理数值连续性
+- 边界值的处理方式可能导致套利失败
+- 如果缺少明确的边界规则，建议人工复核后再执行
+"""
+
+
+# ============================================================
+# 阈值层级验证Prompt - Phase 2.5 新增
+# ============================================================
+
+THRESHOLD_HIERARCHY_PROMPT = """你是一位预测市场分析专家，专门验证阈值市场的蕴含关系。
+
+## 什么是阈值层级套利？
+
+当多个阈值市场描述同一变量的不同阈值时，会形成蕴含链：
+- 例如："BTC > $100k", "BTC > $150k", "BTC > $200k"
+- 蕴含关系：更高阈值蕴含更低阈值
+  - "BTC > $200k" → "BTC > $150k" → "BTC > $100k"
+- 价格约束：P($100k) ≥ P($150k) ≥ P($200k)
+- 套利条件：当违反约束时存在套利（如 P($150k) > P($100k)）
+
+## 需要验证的市场组
+
+**变量**: {variable_name}（如 "Bitcoin价格"）
+
+**阈值市场列表**：
+{thresholds_list}
+
+## 验证步骤
+
+### 步骤1: 阈值提取
+从每个市场问题中提取：
+- 阈值数值（如 $100k → 100000）
+- 比较操作符（>、≥、<、≤）
+- 单位换算（k=1000, M=1000000）
+
+### 步骤2: 蕴含链构建
+按阈值大小排序，确定蕴含方向：
+- 对于 ">" 操作符：阈值越大，条件越严格
+  - ">$200k" → ">$150k" → ">$100k"
+- 对于 "<" 操作符：阈值越小，条件越严格
+  - "<$50k" → "<$100k" → "<$150k"
+
+### 步骤3: 价格约束验证
+检查当前价格是否符合蕴含约束：
+- 如果 M_high → M_low（高阈值蕴含低阈值）
+- 则应该：P(M_high) ≤ P(M_low)
+- 如果 P(M_high) > P(M_low)，则存在套利机会
+
+### 步骤4: 边界情况
+- 恰好等于阈值时如何结算？
+- 例如：BTC价格恰好为 $100,000，">$100k" 结算为YES还是NO？
+
+## 输出格式
+
+请严格按以下JSON格式回答：
+
+```json
+{{
+  "threshold_chains_detected": [
+    {{
+      "chain_type": ">"或"<"或"≥",
+      "markets_in_order": ["阈值1", "阈值2", "阈值3"],
+      "threshold_values": [数值1, 数值2, 数值3],
+      "implication_direction": "高→低"或"低→高"
+    }}
+  ],
+  "price_constraint_checks": [
+    {{
+      "market_high": "高阈值市场",
+      "market_low": "低阈值市场",
+      "expected_relation": "P(高) ≤ P(低)",
+      "actual_prices": {{
+        "high_price": 数值,
+        "low_price": 数值
+      }},
+      "constraint_satisfied": true或false,
+      "violation_amount": 数值（如果违反）
+    }}
+  ],
+  "arbitrage_opportunities": [
+    {{
+      "type": "threshold_violation",
+      "markets_involved": ["市场A", "市场B"],
+      "strategy": "买X的YES，买Y的NO",
+      "expected_profit": "利润百分比",
+      "risk_level": "low|medium|high"
+    }}
+  ],
+  "boundary_handling": {{
+    "clear_rules": true或false,
+    "examples": ["边界值处理例子"],
+    "notes": "说明"
+  }},
+  "overall_safe_to_arbitrage": true或false,
+  "confidence": 0.0到1.0,
+  "reasoning": "整体分析"
+}}
+```
+
+## 重要提示
+
+- 阈值套利的关键是确保阈值形成线性蕴含链
+- 边界值处理（恰好等于阈值）需要查看具体市场规则
+- 如果阈值来自不同事件或不同结算源，蕴含关系可能不成立
+- 建议只对同一变量的阈值市场进行蕴含链分析
+"""

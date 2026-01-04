@@ -97,6 +97,92 @@ class MarketData:
         return abs(1.0 - self.yes_price - self.no_price)
 
 
+@dataclass
+class IntervalData:
+    """
+    区间市场数据（用于 T6 区间完备集套利）
+
+    表示一个数值区间市场，如 "Gold price between $4,725-$4,850"
+    """
+    market: MarketData           # 底层市场数据
+    min_val: float               # 区间最小值
+    max_val: float               # 区间最大值
+    includes_min: bool = True    # 是否包含最小值边界
+    includes_max: bool = True    # 是否包含最大值边界
+    description: str = ""        # 区间描述（如 "$4,725-$4,850"）
+
+    @property
+    def range_size(self) -> float:
+        """区间大小"""
+        return self.max_val - self.min_val
+
+    def overlaps_with(self, other: 'IntervalData') -> bool:
+        """
+        检查与另一个区间是否重叠
+
+        重叠条件: not (self.max_val < other.min_val or other.max_val < self.min_val)
+        但需要考虑边界包含情况
+
+        对于完备集区间：
+        - [0, 100) 和 [100, 200] 不重叠（边界相接，无公共点）
+        - [0, 100] 和 [100, 200] 重叠（都包含100）
+        """
+        # 情况1: 完全不相交
+        if self.max_val < other.min_val:
+            return False
+        if other.max_val < self.min_val:
+            return False
+
+        # 情况2: 边界相接
+        if self.max_val == other.min_val:
+            # 只有当两个区间都包含边界时才算重叠
+            # 如果至少有一个不包含边界，则它们不相交
+            # 例如: [0, 100) 和 [100, 200] 不重叠
+            #       [0, 100] 和 [100, 200] 重叠于点100
+            return self.includes_max and other.includes_min
+
+        if other.max_val == self.min_val:
+            return other.includes_max and self.includes_min
+
+        # 情况3: 部分重叠或完全包含
+        return True
+
+    def gap_to(self, other: 'IntervalData') -> Optional[float]:
+        """
+        计算与另一个区间的间隙
+
+        考虑边界包含情况：
+        - [0, 100) 和 [100, 200] 无间隙（相接）
+        - [0, 99] 和 [100, 200] 有间隙（99到100之间）
+        - [0, 100] 和 [100, 200] 无间隙（都包含100）
+
+        Returns:
+            float: 间隙大小，如果没有间隙则返回 None
+        """
+        # 如果重叠，无间隙
+        if self.overlaps_with(other):
+            return None
+
+        # 检查边界相接情况
+        if self.max_val == other.min_val:
+            # 边界相接，如果不重叠说明至少有一个不包含边界
+            return None
+
+        if other.max_val == self.min_val:
+            return None
+
+        # 计算间隙
+        if self.max_val < other.min_val:
+            # self 在 other 左边
+            return other.min_val - self.max_val
+        elif other.max_val < self.min_val:
+            # other 在 self 左边
+            return self.min_val - other.max_val
+        else:
+            # 重叠（已处理）
+            return None
+
+
 class MathValidator:
     """
     数学验证器
@@ -592,6 +678,389 @@ class MathValidator:
         }
 
         return report
+
+    # ============================================================
+    # T6: 区间完备集套利验证方法
+    # ============================================================
+
+    def validate_interval_overlaps(
+        self,
+        intervals: List[IntervalData]
+    ) -> ValidationReport:
+        """
+        验证区间是否重叠（T6 区间完备集套利 - 互斥性检查）
+
+        Args:
+            intervals: 区间列表
+
+        Returns:
+            ValidationReport 包含重叠检测结果
+        """
+        report = ValidationReport(
+            result=ValidationResult.PASSED,
+            reason="区间互斥性检查通过",
+            details={
+                "num_intervals": len(intervals),
+                "intervals": [
+                    {
+                        "market": iv.market.question[:50],
+                        "min": iv.min_val,
+                        "max": iv.max_val,
+                        "description": iv.description
+                    }
+                    for iv in intervals
+                ]
+            }
+        )
+
+        if len(intervals) < 2:
+            report.reason = "至少需要2个区间才能检查重叠"
+            report.warnings.append("区间数量不足")
+            return report
+
+        # 按最小值排序
+        sorted_intervals = sorted(intervals, key=lambda x: x.min_val)
+
+        # 检查所有区间对
+        overlapping_pairs = []
+        for i in range(len(sorted_intervals)):
+            for j in range(i + 1, len(sorted_intervals)):
+                interval_a = sorted_intervals[i]
+                interval_b = sorted_intervals[j]
+
+                if interval_a.overlaps_with(interval_b):
+                    overlapping_pairs.append({
+                        "interval_a": {
+                            "question": interval_a.market.question[:50],
+                            "range": f"[{interval_a.min_val}, {interval_a.max_val}]"
+                        },
+                        "interval_b": {
+                            "question": interval_b.market.question[:50],
+                            "range": f"[{interval_b.min_val}, {interval_b.max_val}]"
+                        },
+                        "overlap_type": "boundary" if (
+                            abs(interval_a.max_val - interval_b.min_val) < 0.01 or
+                            abs(interval_b.max_val - interval_a.min_val) < 0.01
+                        ) else "substantial"
+                    })
+
+        report.details["overlapping_pairs"] = overlapping_pairs
+        report.details["num_overlaps"] = len(overlapping_pairs)
+
+        if overlapping_pairs:
+            report.result = ValidationResult.FAILED
+            report.reason = f"发现 {len(overlapping_pairs)} 对重叠区间，不满足互斥性"
+            report.checks_failed.append("interval_mutual_exclusivity")
+        else:
+            report.checks_passed.append("interval_mutual_exclusivity")
+
+        return report
+
+    def validate_interval_gaps(
+        self,
+        intervals: List[IntervalData],
+        global_min: Optional[float] = None,
+        global_max: Optional[float] = None
+    ) -> ValidationReport:
+        """
+        验证区间是否有遗漏（T6 区间完备集套利 - 完备性检查）
+
+        Args:
+            intervals: 区间列表
+            global_min: 全局最小值（如果已知，如 0）
+            global_max: 全局最大值（如果已知）
+
+        Returns:
+            ValidationReport 包含遗漏检测结果
+        """
+        report = ValidationReport(
+            result=ValidationResult.PASSED,
+            reason="区间完备性检查通过",
+            details={
+                "num_intervals": len(intervals),
+                "intervals": [
+                    {
+                        "market": iv.market.question[:50],
+                        "min": iv.min_val,
+                        "max": iv.max_val,
+                    }
+                    for iv in intervals
+                ]
+            }
+        )
+
+        if len(intervals) < 2:
+            report.reason = "至少需要2个区间才能检查遗漏"
+            report.warnings.append("区间数量不足")
+            return report
+
+        # 按最小值排序
+        sorted_intervals = sorted(intervals, key=lambda x: x.min_val)
+
+        # 检查相邻区间之间的间隙
+        gaps = []
+        for i in range(len(sorted_intervals) - 1):
+            current = sorted_intervals[i]
+            next_interval = sorted_intervals[i + 1]
+
+            gap = current.gap_to(next_interval)
+            if gap is not None and gap > 0:
+                gaps.append({
+                    "after_interval": {
+                        "question": current.market.question[:50],
+                        "max": current.max_val
+                    },
+                    "before_interval": {
+                        "question": next_interval.market.question[:50],
+                        "min": next_interval.min_val
+                    },
+                    "gap_size": gap,
+                    "missing_range": f"({current.max_val}, {next_interval.min_val})"
+                })
+
+        # 检查全局范围
+        range_warnings = []
+        if global_min is not None:
+            first_interval = sorted_intervals[0]
+            if first_interval.min_val > global_min:
+                range_warnings.append({
+                    "type": "lower_gap",
+                    "missing_range": f"[{global_min}, {first_interval.min_val})",
+                    "description": f"全局最小值 {global_min} 到第一个区间 {first_interval.min_val} 之间有遗漏"
+                })
+
+        if global_max is not None:
+            last_interval = sorted_intervals[-1]
+            if last_interval.max_val < global_max:
+                range_warnings.append({
+                    "type": "upper_gap",
+                    "missing_range": f"({last_interval.max_val}, {global_max}]",
+                    "description": f"最后一个区间 {last_interval.max_val} 到全局最大值 {global_max} 之间有遗漏"
+                })
+
+        report.details["gaps"] = gaps
+        report.details["num_gaps"] = len(gaps)
+        report.details["range_warnings"] = range_warnings
+        report.details["global_min"] = global_min
+        report.details["global_max"] = global_max
+
+        if gaps or range_warnings:
+            if range_warnings:
+                # 全局范围遗漏是严重问题
+                report.result = ValidationResult.FAILED
+                report.reason = f"发现 {len(gaps)} 个间隙 + {len(range_warnings)} 个全局范围遗漏，不完备"
+            else:
+                # 仅有间隙可能是可以接受的（如果有明确的边界处理）
+                report.result = ValidationResult.WARNING
+                report.reason = f"发现 {len(gaps)} 个间隙，可能不完备"
+            report.checks_failed.append("interval_completeness")
+        else:
+            report.checks_passed.append("interval_completeness")
+
+        return report
+
+    def validate_interval_exhaustive_set(
+        self,
+        intervals: List[IntervalData],
+        global_min: Optional[float] = None,
+        global_max: Optional[float] = None,
+        trade_size: float = 100.0
+    ) -> ValidationReport:
+        """
+        综合验证区间完备集套利（T6）
+
+        包含以下检查：
+        1. 互斥性检查（区间不重叠）
+        2. 完备性检查（无遗漏区间）
+        3. 价格总和检查（ΣP < 1.0）
+        4. 流动性检查
+        5. 利润计算
+
+        Args:
+            intervals: 区间列表
+            global_min: 全局最小值
+            global_max: 全局最大值
+            trade_size: 交易规模
+
+        Returns:
+            ValidationReport 包含完整的验证结果
+        """
+        report = ValidationReport(
+            result=ValidationResult.FAILED,
+            reason="",
+            details={
+                "validation_type": "interval_exhaustive_set",
+                "num_intervals": len(intervals)
+            }
+        )
+
+        if len(intervals) < 2:
+            report.reason = "区间完备集至少需要2个区间"
+            return report
+
+        # === 检查1: 互斥性（无重叠）===
+        overlap_report = self.validate_interval_overlaps(intervals)
+        report.details["overlap_check"] = overlap_report.to_dict()
+
+        if overlap_report.result == ValidationResult.FAILED:
+            report.result = ValidationResult.FAILED
+            report.reason = overlap_report.reason
+            report.checks_failed.append("interval_mutual_exclusivity")
+            return report
+
+        report.checks_passed.append("interval_mutual_exclusivity")
+
+        # === 检查2: 完备性（无遗漏）===
+        gap_report = self.validate_interval_gaps(intervals, global_min, global_max)
+        report.details["gap_check"] = gap_report.to_dict()
+
+        if gap_report.result == ValidationResult.FAILED:
+            report.result = ValidationResult.FAILED
+            report.reason = gap_report.reason
+            report.checks_failed.append("interval_completeness")
+            return report
+        elif gap_report.result == ValidationResult.WARNING:
+            report.warnings.append(gap_report.reason)
+
+        report.checks_passed.append("interval_completeness")
+
+        # === 检查3: 价格总和 ===
+        total_yes_price = sum(iv.market.yes_price for iv in intervals)
+        report.details["total_yes_price"] = total_yes_price
+        report.details["individual_prices"] = {
+            iv.market.question[:30]: iv.market.yes_price
+            for iv in intervals
+        }
+
+        if total_yes_price >= 1.0:
+            report.result = ValidationResult.FAILED
+            report.reason = f"价格总和 {total_yes_price:.4f} >= 1.0，无套利空间"
+            report.checks_failed.append("price_sum_below_one")
+            return report
+
+        report.checks_passed.append("price_sum_below_one")
+
+        # === 检查4: 流动性 ===
+        low_liquidity_intervals = [
+            iv for iv in intervals
+            if iv.market.liquidity < self.min_liquidity
+        ]
+        if low_liquidity_intervals:
+            for iv in low_liquidity_intervals:
+                report.warnings.append(
+                    f"流动性不足: {iv.market.question[:30]}... (${iv.market.liquidity:.0f})"
+                )
+
+        report.checks_passed.append("liquidity_check")
+
+        # === 检查5: 利润计算 ===
+        total_cost = total_yes_price
+        guaranteed_return = 1.0
+        gross_profit = guaranteed_return - total_cost
+
+        report.total_cost = total_cost
+        report.guaranteed_return = guaranteed_return
+        report.expected_profit = gross_profit
+        report.profit_pct = (gross_profit / total_cost) * 100
+
+        # === 检查6: 滑点和费用 ===
+        per_interval_size = trade_size / len(intervals)
+        total_slippage = sum(
+            self.estimate_slippage(iv.market, per_interval_size)
+            for iv in intervals
+        )
+        total_slippage_dollar = total_slippage * trade_size / 100
+
+        fee = total_cost * self.fee_rate * trade_size / 100
+
+        net_profit = gross_profit * trade_size / 100 - total_slippage_dollar - fee
+        net_profit_pct = (net_profit / (total_cost * trade_size / 100)) * 100
+
+        report.slippage_estimate = total_slippage
+        report.fee_estimate = self.fee_rate
+        report.net_profit = net_profit
+
+        # === 检查7: 利润阈值 ===
+        min_threshold = max(1.0, self.min_profit_pct - 1.0)
+
+        if net_profit_pct < min_threshold:
+            report.result = ValidationResult.WARNING
+            report.reason = (
+                f"区间完备集验证通过，但净利润率较低: {net_profit_pct:.2f}%\n"
+                f"价格总和: {total_yes_price:.4f}，"
+                f"区间数: {len(intervals)}"
+            )
+            report.warnings.append("利润空间较小，需要更大资金量才能覆盖固定成本")
+        else:
+            report.result = ValidationResult.PASSED
+            report.reason = (
+                f"区间完备集验证通过！\n"
+                f"价格总和: {total_yes_price:.4f}，"
+                f"净利润率: {net_profit_pct:.2f}%，"
+                f"区间数: {len(intervals)}"
+            )
+
+        report.checks_passed.append("net_profit_threshold")
+
+        # 添加执行建议
+        report.details["execution"] = [
+            {
+                "market": iv.market.question[:50],
+                "action": "buy_yes",
+                "price": iv.market.yes_price,
+                "amount": per_interval_size,
+                "interval": f"[{iv.min_val}, {iv.max_val}]"
+            }
+            for iv in intervals
+        ]
+
+        # 添加区间汇总信息
+        report.details["interval_summary"] = {
+            "total_range": f"[{sorted(iv.min_val for iv in intervals)[0]}, {sorted(iv.max_val for iv in intervals)[-1]}]",
+            "has_gaps": gap_report.details.get("num_gaps", 0) > 0,
+            "has_overlaps": overlap_report.details.get("num_overlaps", 0) > 0,
+            "coverage_percentage": self._calculate_coverage(intervals, global_min, global_max)
+        }
+
+        return report
+
+    def _calculate_coverage(
+        self,
+        intervals: List[IntervalData],
+        global_min: Optional[float],
+        global_max: Optional[float]
+    ) -> Optional[float]:
+        """
+        计算区间覆盖率
+
+        Returns:
+            float: 0.0-1.0 的覆盖率，如果无法计算则返回 None
+        """
+        if not intervals:
+            return 0.0
+
+        try:
+            # 计算所有区间的并集大小（简化计算：假设区间不重叠）
+            total_covered = sum(iv.range_size for iv in intervals)
+
+            # 确定全局范围
+            actual_min = min(iv.min_val for iv in intervals)
+            actual_max = max(iv.max_val for iv in intervals)
+
+            if global_min is not None:
+                actual_min = min(actual_min, global_min)
+            if global_max is not None:
+                actual_max = max(actual_max, global_max)
+
+            total_range = actual_max - actual_min
+
+            if total_range <= 0:
+                return None
+
+            return min(1.0, total_covered / total_range)
+
+        except Exception:
+            return None
 
     def generate_checklist(self, report: ValidationReport) -> List[str]:
         """生成人工验证清单"""

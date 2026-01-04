@@ -857,6 +857,67 @@ class ArbitrageDetector:
         else:
             print(f"    ✅ 数学验证通过: {validation_result['message']}")
 
+        # ✅ Priority 2: 时间一致性验证
+        if relation_type in ['IMPLIES_AB', 'IMPLIES_BA']:
+            # 导入 MarketData 用于类型转换
+            from validators import MarketData
+
+            # 转换 Market 对象为 MarketData
+            market_a_data = MarketData(
+                id=implying.id,
+                question=implying.question,
+                yes_price=implying.yes_price,
+                no_price=implying.no_price,
+                liquidity=implying.liquidity,
+                volume=implying.volume,
+                end_date=implying.end_date
+            )
+
+            market_b_data = MarketData(
+                id=implied.id,
+                question=implied.question,
+                yes_price=implied.yes_price,
+                no_price=implied.no_price,
+                liquidity=implied.liquidity,
+                volume=implied.volume,
+                end_date=implied.end_date
+            )
+
+            time_validation = self.math_validator.validate_time_consistency(
+                market_a=market_a_data,
+                market_b=market_b_data,
+                relation=relation_type
+            )
+
+            # 使用 .result.value 获取字符串值
+            if time_validation.result.value == 'FAILED':
+                print(f"    ❌ 时间一致性验证失败: {time_validation.reason}")
+                print(f"       结算时间: {implying.end_date} vs {implied.end_date}")
+                return None
+            elif time_validation.result.value == 'NEEDS_REVIEW':
+                print(f"    ⚠️  时间一致性验证: {time_validation.reason}")
+                # 时间不一致的蕴含关系通常是误判，但仍返回 None
+                return None
+            else:
+                print(f"    ✅ 时间一致性验证通过: {time_validation.reason}")
+
+        # ✅ Priority 2: 语义验证
+        is_semantically_valid, semantic_msg = self._validate_arbitrage_semantics(
+            implying=implying,
+            implied=implied,
+            relation_type=relation_type
+        )
+
+        if not is_semantically_valid:
+            print(f"    ⚠️  语义验证失败: {semantic_msg}")
+            print(f"       建议: 人工复核此机会")
+            # 语义验证失败时，降低置信度但不直接拒绝
+            confidence = analysis.get("confidence", 0.8) * 0.7
+            analysis["confidence"] = confidence
+            analysis["semantic_warning"] = semantic_msg
+        else:
+            print(f"    ✅ 语义验证通过: {semantic_msg}")
+
         # 检查 LLM 响应是否存在不一致（原有逻辑，保留作为双重检查）
         if analysis.get("inconsistency_detected", False):
             return None  # 不一致的分析结果不可信，跳过
@@ -974,6 +1035,62 @@ class ArbitrageDetector:
 
         print(f"    ✅ 数据有效性检查通过")
         return True
+
+    def _validate_arbitrage_semantics(
+        self,
+        implying: Market,
+        implied: Market,
+        relation_type: str
+    ) -> tuple[bool, str]:
+        """
+        验证套利机会的语义合理性 (Priority 2)
+
+        检查价格关系是否符合逻辑直觉：
+        - 对于 IMPLIES_AB: 如果 P(A) = 0.9, P(B) = 0.1，这不太合理
+          （因为 A→B 要求 P(B) >= P(A)）
+        - 对于 EQUIVALENT: 价格应该接近，不应该差异巨大
+
+        Args:
+            implying: 蕴含市场（A）
+            implied: 被蕴含市场（B）
+            relation_type: 关系类型
+
+        Returns:
+            (is_valid, message)
+        """
+        p_a = implying.yes_price
+        p_b = implied.yes_price
+
+        if relation_type == 'IMPLIES_AB' or relation_type == 'IMPLIES_BA':
+            # 蕴含关系：P(B) 应该 >= P(A)
+            # 但我们检测的是 P(B) < P(A) 的情况
+            price_gap = p_a - p_b
+
+            # 如果价格差异过大（>50%），可能是误判
+            if price_gap > 0.5:
+                return False, (
+                    f"蕴含关系价格差异过大: P(A)={p_a:.3f}, P(B)={p_b:.3f}, "
+                    f"差距={price_gap:.1%}。这不太可能是真正的蕴含关系。"
+                )
+
+            # 如果 P(A) 极低但 P(B) 极高，也值得怀疑
+            if p_a < 0.1 and p_b > 0.9:
+                return False, (
+                    f"蕴含关系价格极端: P(A)={p_a:.3f} (极低), P(B)={p_b:.3f} (极高)。"
+                    f"请检查是否误判为蕴含关系。"
+                )
+
+        elif relation_type == 'EQUIVALENT':
+            # 等价关系：价格应该接近
+            price_diff = abs(p_a - p_b)
+
+            if price_diff > 0.2:  # 20% 差异
+                return False, (
+                    f"等价市场价格差异过大: P(A)={p_a:.3f}, P(B)={p_b:.3f}, "
+                    f"差异={price_diff:.1%}。等价市场应该有相似的价格。"
+                )
+
+        return True, "语义验证通过"
 
     def _check_equivalent(self, market_a: Market, market_b: Market,
                           analysis: Dict) -> Optional[ArbitrageOpportunity]:

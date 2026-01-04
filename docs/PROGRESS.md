@@ -17,16 +17,22 @@
 
 ## 当前状态
 
-**当前阶段**: Phase 2.5 - 验证架构增强
+**当前阶段**: Phase 2.5 - T6/T7 区间与阈值套利实现 + 合成套利整合
 
-**最后更新**: 2026-01-03
+**最后更新**: 2026-01-03 (续3)
 
 **当前焦点**:
-- ✅ 完成 Phase 2 验证层集成修复（Priority 1）
-- 🔄 测试已知假阳性案例
-- ⏳ 待完成 Priority 2/3 修复（语义验证、双模型验证）
+- ✅ 项目整理完成（冗余清理、圣经精简、准则更新）
+- ✅ T6.1 区间完备集 Prompt 模板
+- ✅ T6.2 区间重叠/遗漏检测器
+- 🔄 T7.1 阈值市场识别器（进行中，整合合成套利数据结构）
+- ⏳ T7.2 蕴含链构建器（待开始）
+- ⏳ 合成套利组件（T7完成后实现）
 
 **版本历史**:
+- v1.7 (2026-01-03): 项目整理、新准则、合成套利计划
+- v1.6 (2026-01-03): T6/T7 区间与阈值套利开发
+- v1.5.1 (2026-01-03): Phase 2 验证层集成修复完成
 - v1.5 (2026-01-03): Phase 2 验证层集成修复
 - v1.4 (2026-01-03): 三大实战陷阱修复
 - v1.3 (2026-01-02): 战略重审与共识更新
@@ -88,51 +94,145 @@
 
 > 按时间倒序记录每次工作的进展
 
+### 2026-01-03 (续3)
+
+- ✅ **项目整理与准则更新** (v1.7)
+
+  **冗余清理**:
+  - 删除 `local_scanner.py`（已被v2替代）
+  - 删除 `progress_tracker.py`（功能重复于PROGRESS.md）
+  - 删除 `nul`、`arbitrage_report.json`
+  - 清理 `output/` 历史扫描结果
+  - 创建 `.gitignore` 规范化
+
+  **新增开发准则**:
+  - 准则6: **实证优先** - 先验证真实套利机会存在，再设计识别算法
+  - 准则7: **策略迭代** - 发现新套利策略时及时更新到项目圣经
+
+  **项目圣经精简**:
+  - 从72KB精简到64KB
+  - 删除冗余代码示例，保留核心算法和套利策略
+  - 更新扩展计划，加入合成套利
+
+  **合成套利规划**:
+  - 确认用户发现的BTC价格区间套利案例
+  - 方案：在T7.1中设计 `ThresholdMarket`/`IntervalMarket` 数据结构
+  - T7完成后添加：组合生成器、等价性匹配器
+
+### 2026-01-03 (续2)
+
+- ✅ **Phase 2.5 启动: T6/T7 区间与阈值套利开发** (v1.6)
+  - **背景**: 用户发现当前系统遗漏了「区间市场 + 阈值市场」的混合套利机会
+  - **战略调整**: 系统性梳理所有组合套利类型，优先实现 T6 和 T7
+
+  - **T6.1: 区间完备集 Prompt 模板** ✅ (prompts.py:525-719)
+    - 添加 `INTERVAL_EXHAUSTIVE_PROMPT` - 区间完备集验证
+      - 验证区间互斥性（无重叠）
+      - 验证区间完备性（无遗漏）
+      - 边界值处理规则
+    - 添加 `THRESHOLD_HIERARCHY_PROMPT` - 阈值层级验证
+      - 提取阈值数值
+      - 构建蕴含链
+      - 验证价格约束
+
+  - **T6.2: 区间重叠/遗漏检测器** ✅ (validators.py:100-1042)
+    - 新增 `IntervalData` 数据类
+      - `min_val`, `max_val` - 区间边界
+      - `includes_min`, `includes_max` - 边界包含标志
+      - `overlaps_with()` - 重叠检测
+      - `gap_to()` - 间隙计算
+    - 新增 `MathValidator` 方法:
+      - `validate_interval_overlaps()` - 互斥性检查
+      - `validate_interval_gaps()` - 完备性检查
+      - `validate_interval_exhaustive_set()` - 综合验证（含利润计算）
+      - `_calculate_coverage()` - 覆盖率计算
+
+  - **测试文件**: 创建 `test_interval_validation.py`
+    - 测试1: 区间重叠检测 ✅
+    - 测试2: 区间遗漏检测 ✅
+    - 测试3: 完备集完整验证 🔄
+    - 测试4: 边界情况 ✅
+
+  - **影响文件**:
+    - `prompts.py` - 新增 2 个 Prompt 模板
+    - `validators.py` - 新增 IntervalData + 4 个验证方法
+    - `test_interval_validation.py` - 新建测试文件
+
+  - **下一步**:
+    - T7.1: 实现阈值市场识别器
+    - T7.2: 实现蕴含链构建器和违规检测
+    - 完成 T6 测试验证
+
 ### 2026-01-03 (续)
 
-- ✅ **Phase 2 验证层集成修复** (v1.5)
-  - **问题**: 扫描器发现假阳性套利机会（Gold市场案例）
+- ✅ **Phase 2 验证层集成修复完成** (v1.5.1)
+  - **问题回顾**: 扫描器发现假阳性套利机会（Gold市场案例）
     - LLM的 reasoning 字段说 "MUTUAL_EXCLUSIVE"，但 relationship 字段却是 "IMPLIES_AB"
     - 系统未检测到矛盾，继续执行套利计算
   - **根本原因**:
     - 验证层（validators.py, dual_verification.py）存在但未集成
     - LLM输出未进行一致性检查
     - 无数据有效性验证
-  - **Priority 1 修复**（已完成）:
-    - 添加 `_validate_llm_response_consistency()` 方法
+  - **Priority 1 修复**（已完成并测试）:
+    - ✅ 添加 `_validate_llm_response_consistency()` 方法
       - 检测 reasoning vs relationship 矛盾（支持中英文关键词）
       - 发现矛盾时自动降级为 INDEPENDENT，置信度设为 0.0
-    - 集成 MathValidator 到 ArbitrageDetector
+    - ✅ 集成 MathValidator 到 ArbitrageDetector
       - 导入 validators 模块
       - 在 _check_implication() 中调用 validate_implication()
       - 添加详细验证日志
-    - 添加数据有效性检查 `_validate_market_data()`
+    - ✅ 添加数据有效性检查 `_validate_market_data()`
       - 过滤 0.0 价格
       - 验证价格范围（0-1）
       - 检查流动性、必需字段
-  - **人工验证环节**（已完成）:
-    - 新增 `_generate_polymarket_links()` 方法生成市场链接
-    - 更新 `_print_summary()` 显示：
-      - 🔗 可点击的 Polymarket 链接
-      - ⚠️  人工验证清单（逻辑关系、结算规则、价格确认等）
+  - **Priority 2 修复**（已完成并测试）:
+    - ✅ 实现套利语义验证 `_validate_arbitrage_semantics()`
+      - 检测蕴含关系价格差异过大（>50%）
+      - 检测等价市场价格差异过大（>20%）
+      - 检测极端价格组合
+    - ✅ 集成时间一致性验证
+      - 调用 MathValidator.validate_time_consistency()
+      - 验证蕴含关系的结算时间顺序
+      - 支持 24 小时时间差阈值
+      - 转换 Market 对象为 MarketData 对象
+    - ✅ 增强日志和调试信息
+      - 所有验证步骤都有详细的日志输出
+      - 使用 ✅ ❌ ⚠️ 标记不同级别的消息
+  - **Priority 3 修复**（可选，未完成）:
+    - ⏳ 双模型验证（DualModelVerifier）
+      - dual_verification.py 已存在但未集成
+      - 需要配置开关和成本控制逻辑
+      - 建议作为高级功能后续实现
+  - **测试状态**:
+    - ✅ 创建 `test_false_positive_fix.py` 测试脚本
+    - ✅ Priority 1 测试: 2/2 通过
+      - LLM 一致性检查 ✅
+      - Gold 市场假阳性 ✅
+    - ✅ 创建 `test_priority2_fixes.py` 测试脚本
+    - ✅ Priority 2 测试: 3/3 通过
+      - 时间一致性验证 ✅
+      - 语义验证 ✅
+      - 等价市场语义验证 ✅
   - **影响文件**:
-    - `local_scanner_v2.py` - LLMAnalyzer、ArbitrageScanner 类修改
-    - `PHASE2_FIX_PLAN.md` - 新建详细修复文档（5000+ 字）
-  - **测试状态**: 待测试已知假阳性案例
+    - `local_scanner_v2.py` - LLMAnalyzer、ArbitrageDetector 类修改
+      - 新增 `_validate_llm_response_consistency()` 方法
+      - 新增 `_validate_arbitrage_semantics()` 方法
+      - 集成 MathValidator 和时间一致性验证
+      - 修复 ValidationReport 对象访问方式
+    - `test_false_positive_fix.py` - Priority 1 测试脚本（新建）
+    - `test_priority2_fixes.py` - Priority 2 测试脚本（新建）
+    - `PHASE2_FIX_PLAN.md` - 详细修复文档（5000+ 字）
+    - `docs/PROGRESS.md` - 本文档更新
+  - **测试结果**:
+    - ✅ Priority 1 测试: 2/2 通过
+    - ✅ Priority 2 测试: 3/3 通过
+    - 总计: 5/5 测试通过 🎉
+  - **下一步**:
+    - 运行完整扫描验证修复效果
+    - 考虑是否需要实现 Priority 3（双模型验证）
+    - 开始 Phase 2.6: 向量相似度引入
 
-- 📋 **详细修复文档**
-  - 创建 `PHASE2_FIX_PLAN.md` 包含：
-    - 问题分析和根本原因定位
-    - 三阶段修复策略（Priority 1/2/3）
-    - 完整代码示例和测试用例
-    - 配置变更和 API 参考变更
-
-- 🎯 **下一步**:
-  - 创建单元测试
-  - 测试已知假阳性案例（Gold市场）
-  - 完成 Priority 2/3 修复（语义验证、双模型验证）
-
-### 2026-01-03
+### 2026-01-03 (上午)
 
 - ✅ **三大实战陷阱修复** (v1.4)
   - **陷阱1: Bid/Ask vs Last Price**

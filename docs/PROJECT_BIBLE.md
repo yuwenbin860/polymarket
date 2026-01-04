@@ -186,6 +186,42 @@
 - 探索多模型协作、交叉验证
 - 记录LLM表现，用于持续改进
 
+## 2.6 实证优先 (Evidence-First Approach)
+
+**原则**：先验证真实套利机会存在，再设计识别算法。
+
+**正确流程**：
+```
+1. 人工发现真实案例 → 2. 验证确实是套利 → 3. 设计识别算法 → 4. 实现并测试
+```
+
+**错误流程**：
+```
+1. 设计理论模型 → 2. 实现算法 → 3. 希望能找到套利（可能找不到）
+```
+
+**执行要点**：
+- 每一种新套利类型，必须先有至少1个真实案例
+- 人工验证该案例确实存在套利空间后，再投入开发
+- 避免"闭门造车"——实践出真知
+
+## 2.7 策略迭代 (Strategy Evolution)
+
+**原则**：项目进行中发现新的套利策略，需及时提出并更新到圣经。
+
+**执行流程**：
+```
+1. 发现新策略/模式 → 记录到创意池（第15章）
+2. 讨论验证可行性 → 人工测试至少1个真实案例
+3. 验证通过 → 正式更新到套利策略章节（第4章）
+4. 规划实现 → 添加到开发路线图（第10章）
+```
+
+**执行要点**：
+- 新发现不要遗忘，立即记录到创意池
+- 经验证的策略及时"晋升"到正式章节
+- 保持项目圣经作为"活文档"，持续演进
+
 ---
 
 # 3. 战略共识
@@ -742,62 +778,14 @@ Kalshi:     NO  = $0.48
 | NFR-004-1 | LLM API月成本 | < $30 |
 | NFR-004-2 | 服务器成本 | 本地运行，$0 |
 
-## 5.3 用户故事
+## 5.3 用户故事（精简版）
 
-### US-001: 首次使用
-
-```
-作为一个新用户
-我想要快速验证系统是否能在我的环境运行
-以便我确定是否继续投入时间学习
-
-验收标准:
-- 运行setup.sh后，系统提示成功
-- 运行MVP脚本，看到模拟数据扫描结果
-- 整个过程<5分钟
-```
-
-### US-002: 日常扫描
-
-```
-作为一个日常使用者
-我想要每天运行一次扫描并查看机会
-以便我不错过潜在的套利机会
-
-验收标准:
-- 一条命令启动扫描
-- 扫描完成后输出清晰的机会列表
-- 每个机会标注利润率和风险点
-- 报告保存到文件供后续参考
-```
-
-### US-003: 发现机会后执行
-
-```
-作为一个发现了套利机会的用户
-我想要知道具体如何执行这个套利
-以便我能够捕获利润
-
-验收标准:
-- 系统提供具体的买入指令
-- 标明每个市场的当前价格
-- 提供直接链接到Polymarket
-- 列出需要人工确认的检查项
-```
-
-### US-004: 切换LLM提供商
-
-```
-作为一个想要控制成本的用户
-我想要能够灵活切换不同的LLM提供商
-以便我能够在成本和效果之间找到平衡
-
-验收标准:
-- 支持通过环境变量切换提供商
-- 支持通过配置文件切换提供商
-- 切换后无需修改代码
-- 提供各提供商的成本对比
-```
+| ID | 场景 | 核心验收标准 |
+|----|------|-------------|
+| US-001 | 首次使用 | 5分钟内完成环境验证，看到模拟扫描结果 |
+| US-002 | 日常扫描 | 一条命令扫描，输出机会列表和利润率 |
+| US-003 | 执行套利 | 提供买入指令、价格、Polymarket链接 |
+| US-004 | 切换LLM | 通过配置切换提供商，无需改代码 |
 
 ---
 
@@ -847,197 +835,29 @@ Kalshi:     NO  = $0.48
 
 ## 6.2 核心组件设计
 
-### 6.2.1 DataFetcher - 数据获取器
+### 6.2.1-6.2.4 核心组件概览
 
-**职责**：从外部数据源获取市场数据
-
-```python
-class DataFetcher:
-    """数据获取器接口"""
-    
-    def get_markets(self, limit: int = 100) -> List[Market]:
-        """获取市场列表"""
-        pass
-    
-    def get_market_by_id(self, market_id: str) -> Optional[Market]:
-        """获取单个市场详情"""
-        pass
-    
-    def get_events(self, limit: int = 50) -> List[Event]:
-        """获取事件列表"""
-        pass
-    
-    def get_markets_by_event(self, event_id: str) -> List[Market]:
-        """获取事件下所有市场"""
-        pass
-    
-    def subscribe_price_updates(self, market_ids: List[str], callback):
-        """订阅价格更新（WebSocket）"""
-        pass
-```
-
-**实现**：
-- `PolymarketFetcher`: Polymarket Gamma API
-- `KalshiFetcher`: Kalshi API（Phase 3）
-- `MockFetcher`: 模拟数据（测试用）
-
-### 6.2.2 SimilarityFilter - 相似度筛选器
-
-**职责**：找出可能存在逻辑关系的市场对
-
-```python
-class SimilarityFilter:
-    """相似度筛选器接口"""
-    
-    def find_similar_pairs(
-        self, 
-        markets: List[Market],
-        threshold: float = 0.3
-    ) -> List[Tuple[Market, Market, float]]:
-        """
-        找出相似的市场对
-        返回: [(market_a, market_b, similarity_score), ...]
-        """
-        pass
-    
-    def get_embedding(self, text: str) -> np.ndarray:
-        """获取文本向量表示"""
-        pass
-```
-
-**实现**：
-- `KeywordSimilarityFilter`: 关键词Jaccard相似度（Phase 1）
-- `EmbeddingSimilarityFilter`: 向量相似度 + Chroma（Phase 2）
-
-### 6.2.3 LLMAnalyzer - LLM分析器（多提供商支持）
-
-**职责**：分析两个市场之间的逻辑关系
-
-```python
-from llm_providers import BaseLLMClient, create_llm_client
-
-class LLMAnalyzer:
-    """LLM分析器 - 支持多种提供商"""
-    
-    def __init__(self, config: Config):
-        # 根据配置创建对应的LLM客户端
-        self.client: BaseLLMClient = create_llm_client(
-            provider=config.llm.provider,
-            model=config.llm.model,
-            api_key=config.llm.api_key,
-            api_base=config.llm.api_base,
-        )
-    
-    def analyze_pair(
-        self, 
-        market_a: Market, 
-        market_b: Market
-    ) -> RelationshipAnalysis:
-        """分析两个市场的逻辑关系"""
-        prompt = self._build_prompt(market_a, market_b)
-        response = self.client.chat(prompt)
-        return self._parse_response(response.content)
-    
-    def batch_analyze(
-        self,
-        pairs: List[Tuple[Market, Market]]
-    ) -> List[RelationshipAnalysis]:
-        """批量分析"""
-        pass
-    
-    def close(self):
-        """释放LLM客户端资源"""
-        self.client.close()
-```
+| 组件 | 职责 | 主要方法 | 实现 |
+|------|------|----------|------|
+| **DataFetcher** | 获取市场数据 | `get_markets()`, `get_events()` | PolymarketFetcher, MockFetcher |
+| **SimilarityFilter** | 筛选相似市场对 | `find_similar_pairs()` | Jaccard (P1), 向量 (P2) |
+| **LLMAnalyzer** | 分析逻辑关系 | `analyze_pair()`, `batch_analyze()` | 多LLM提供商 |
+| **ArbitrageDetector** | 检测套利机会 | `check_exhaustive_set()`, `check_implication()`, `check_equivalent()` | 规则+LLM混合 |
 
 **支持的LLM提供商**：
 
-| 提供商 | 说明 | 适用场景 |
-|--------|------|----------|
-| OpenAI | GPT-4系列 | 高精度需求 |
-| Anthropic | Claude系列 | 复杂推理 |
-| DeepSeek | 国产高性价比 | 日常使用（推荐） |
-| 阿里云 | 通义千问 | 国内网络 |
-| 智谱 | GLM-4 | 国内网络 |
-| Ollama | 本地模型 | 离线/免费（推荐） |
-| OpenAI兼容 | vLLM/OneAPI等 | 自建服务 |
+| 提供商 | 适用场景 |
+|--------|----------|
+| DeepSeek | 日常使用（推荐，低成本） |
+| OpenAI | 高精度需求 |
+| Ollama | 离线/免费 |
+| 阿里云/智谱 | 国内网络 |
 
-### 6.2.4 ArbitrageDetector - 套利检测器
-
-**职责**：根据逻辑关系和价格检测套利机会
-
-```python
-class ArbitrageDetector:
-    """套利检测器"""
-    
-    def check_pair(self, market_a: Market, market_b: Market,
-                   analysis: RelationshipAnalysis) -> Optional[ArbitrageOpportunity]:
-        """检查市场对是否存在套利"""
-        pass
-    
-    def check_exhaustive_set(
-        self, 
-        markets: List[Market]
-    ) -> Optional[ArbitrageOpportunity]:
-        """检测完备集套利"""
-        pass
-    
-    def check_implication(
-        self,
-        market_a: Market,
-        market_b: Market,
-        analysis: RelationshipAnalysis
-    ) -> Optional[ArbitrageOpportunity]:
-        """检测包含关系套利"""
-        pass
-    
-    def check_equivalent(
-        self,
-        market_a: Market,
-        market_b: Market,
-        analysis: RelationshipAnalysis
-    ) -> Optional[ArbitrageOpportunity]:
-        """检测等价市场套利"""
-        pass
-    
-    def check_cross_platform(
-        self,
-        poly_market: Market,
-        kalshi_market: Market
-    ) -> Optional[ArbitrageOpportunity]:
-        """检测跨平台套利"""
-        pass
-```
+> 详细接口定义见源代码: `local_scanner_v2.py`, `llm_providers.py`
 
 ### 6.2.5 ArbitrageScanner - 主编排器
 
-**职责**：协调各组件完成完整扫描流程
-
-```python
-class ArbitrageScanner:
-    """主扫描器"""
-    
-    def __init__(
-        self,
-        fetcher: DataFetcher,
-        filter: SimilarityFilter,
-        analyzer: LLMAnalyzer,
-        detector: ArbitrageDetector
-    ):
-        pass
-    
-    def scan(self) -> List[ArbitrageOpportunity]:
-        """执行完整扫描"""
-        pass
-    
-    def scan_event(self, event_id: str) -> List[ArbitrageOpportunity]:
-        """扫描单个事件"""
-        pass
-    
-    def continuous_scan(self, interval_seconds: int = 3600):
-        """持续扫描模式"""
-        pass
-```
+协调各组件完成完整扫描流程。主要方法：`scan()`, `scan_event()`, `continuous_scan()`
 
 ## 6.3 数据流设计
 
@@ -1196,144 +1016,26 @@ class Config:
 
 # 7. 数据模型设计
 
-## 7.1 核心实体
+## 7.1 核心实体概览
 
-### Market - 市场
+| 实体 | 说明 | 核心字段 |
+|------|------|----------|
+| **Market** | 预测市场 | id, question, yes_price, no_price, event_id, end_date |
+| **Event** | 事件（含多市场） | id, title, markets[], category |
+| **RelationType** | 逻辑关系枚举 | IMPLIES_AB, IMPLIES_BA, EQUIVALENT, MUTUAL_EXCLUSIVE, EXHAUSTIVE, UNRELATED |
+| **RelationshipAnalysis** | LLM分析结果 | relationship, confidence, reasoning, edge_cases |
+| **ArbitrageOpportunity** | 套利机会 | type, markets[], profit_pct, action, needs_review |
 
-```python
-@dataclass
-class Market:
-    """预测市场"""
-    
-    # 标识
-    id: str                      # 市场ID
-    condition_id: str            # 条件ID（用于交易）
-    
-    # 基本信息
-    question: str                # 市场问题
-    description: str             # 详细描述
-    outcomes: List[str]          # 可能的结果 ["Yes", "No"]
-    
-    # 价格信息
-    yes_price: float             # YES当前价格 (0-1)
-    no_price: float              # NO当前价格 (0-1)
-    
-    # 流动性信息
-    volume: float                # 总交易量 (USDC)
-    liquidity: float             # 当前流动性 (USDC)
-    
-    # 时间信息
-    end_date: str                # 结算日期
-    created_at: str              # 创建时间
-    
-    # 关联信息
-    event_id: str                # 所属事件ID
-    event_title: str             # 事件标题
-    
-    # 结算信息
-    resolution_source: str       # 结算数据来源
-    resolution_rules: str        # 结算规则
-    
-    # 状态
-    is_active: bool = True       # 是否活跃
-    is_closed: bool = False      # 是否已关闭
-    outcome: Optional[str] = None  # 结算结果
-```
+### RelationType 详解
 
-### Event - 事件
+| 类型 | 符号 | 说明 | 套利条件 |
+|------|------|------|----------|
+| IMPLIES_AB | A → B | A发生则B必发生 | P(B) < P(A) |
+| IMPLIES_BA | B → A | B发生则A必发生 | P(A) < P(B) |
+| EQUIVALENT | A ≡ B | 完全等价 | |P(A) - P(B)| > 3% |
+| EXHAUSTIVE | A+B+...=Ω | 完备集 | ΣP < 0.98 |
 
-```python
-@dataclass
-class Event:
-    """事件（包含多个相关市场）"""
-    
-    id: str                      # 事件ID/slug
-    title: str                   # 事件标题
-    description: str             # 事件描述
-    markets: List[Market]        # 关联市场
-    end_date: str                # 结束日期
-    category: str                # 分类（politics/sports/crypto等）
-    total_volume: float          # 总交易量
-```
-
-### RelationType - 逻辑关系类型
-
-```python
-class RelationType(Enum):
-    """逻辑关系类型"""
-    IMPLIES_AB = "implies_ab"          # A → B
-    IMPLIES_BA = "implies_ba"          # B → A
-    EQUIVALENT = "equivalent"          # A ≡ B
-    MUTUAL_EXCLUSIVE = "mutual_exclusive"  # A ⊕ B
-    EXHAUSTIVE = "exhaustive"          # A + B + ... = Ω
-    UNRELATED = "unrelated"            # 无关
-```
-
-### RelationshipAnalysis - 关系分析结果
-
-```python
-@dataclass
-class RelationshipAnalysis:
-    """LLM分析结果"""
-    
-    # 关系判断
-    relationship: RelationType
-    confidence: float            # 0-1
-    
-    # 推理过程
-    reasoning: str               # 分析理由
-    probability_constraint: str  # 概率约束，如 "P(B) >= P(A)"
-    
-    # 验证信息
-    current_prices_valid: bool   # 当前定价是否符合逻辑
-    arbitrage_exists: bool       # 是否存在套利
-    
-    # 风险信息
-    edge_cases: List[str]        # 边界情况
-    resolution_compatible: bool  # 结算规则是否兼容
-    resolution_notes: str        # 结算规则说明
-    
-    # 元信息
-    analyzed_at: str             # 分析时间
-    model_used: str              # 使用的模型
-```
-
-### ArbitrageOpportunity - 套利机会
-
-```python
-@dataclass
-class ArbitrageOpportunity:
-    """套利机会"""
-    
-    # 标识
-    id: str                      # 机会ID
-    type: str                    # 类型（exhaustive/implication/equivalent/cross_platform）
-    
-    # 市场信息
-    markets: List[Dict]          # 涉及的市场 [{id, question, yes_price}, ...]
-    relationship: str            # 逻辑关系
-    
-    # 财务信息
-    total_cost: float            # 总成本
-    guaranteed_return: float     # 保证回报
-    profit: float                # 利润
-    profit_pct: float            # 利润率
-    
-    # 执行信息
-    action: str                  # 具体操作步骤
-    
-    # 分析信息
-    confidence: float            # LLM置信度
-    reasoning: str               # 分析理由
-    edge_cases: List[str]        # 边界情况
-    
-    # 复核信息
-    needs_review: List[str]      # 需要人工复核的项目
-    
-    # 元信息
-    discovered_at: str           # 发现时间
-    status: str = "pending"      # pending/verified/executed/expired
-```
+> 详细数据结构定义见源代码: `local_scanner_v2.py`
 
 ## 7.2 持久化设计
 
@@ -1911,45 +1613,13 @@ numpy>=1.24.0                 # 数值计算
 
 ## 11.1 测试层次
 
-```
-┌─────────────────────────────────────┐
-│          端到端测试 (E2E)           │  ← 完整流程验证
-├─────────────────────────────────────┤
-│          集成测试                    │  ← 组件交互验证
-├─────────────────────────────────────┤
-│          单元测试                    │  ← 函数逻辑验证
-└─────────────────────────────────────┘
-```
+| 层次 | 验证内容 | 示例 |
+|------|----------|------|
+| 单元测试 | 函数逻辑 | 相似度计算、套利检测逻辑 |
+| 集成测试 | 组件交互 | LLM分析 + 套利检测联动 |
+| E2E测试 | 完整流程 | 数据获取 → 分析 → 输出报告 |
 
-## 11.2 单元测试示例
-
-```python
-# tests/test_similarity.py
-
-def test_jaccard_similarity_identical():
-    """相同文本相似度为1"""
-    text = "Will Trump win the election?"
-    assert jaccard_similarity(text, text) == 1.0
-
-def test_jaccard_similarity_different():
-    """完全不同文本相似度为0"""
-    text_a = "Will Trump win?"
-    text_b = "Lakers championship odds"
-    assert jaccard_similarity(text_a, text_b) < 0.1
-
-# tests/test_arbitrage_detector.py
-
-def test_exhaustive_arbitrage_exists():
-    """完备集总和<1时检测到套利"""
-    markets = [
-        Market(id="1", question="A", yes_price=0.30, ...),
-        Market(id="2", question="B", yes_price=0.30, ...),
-        Market(id="3", question="C", yes_price=0.30, ...),
-    ]
-    opp = detect_exhaustive_arbitrage(markets, min_profit_pct=2.0)
-    assert opp is not None
-    assert opp.profit_pct > 2.0
-```
+> 测试文件位于 `tests/` 目录
 
 ---
 
@@ -2008,51 +1678,45 @@ MIN_LIQUIDITY_RATIO = 0.10      # 仓位不超过市场流动性的10%
 
 # 13. 运维与监控
 
-## 13.1 部署架构
+## 13.1 部署方式
 
-### Phase 1-3: 本地运行
+| 阶段 | 方式 | 说明 |
+|------|------|------|
+| Phase 1-3 | 本地运行 | 手动或crontab定时扫描 |
+| Phase 4+ | 服务器部署 | 持续监控模式 |
 
-```
-本地机器
-├── Python环境
-├── 扫描脚本
-├── 配置文件
-└── 输出目录
-    ├── scans/
-    ├── opportunities/
-    └── logs/
-```
-
-## 13.2 定时任务
-
-```bash
-# crontab配置
-
-# 每小时扫描
-0 * * * * cd /path/to/project && python local_scanner_v2.py >> logs/scan.log 2>&1
-
-# 每天汇总报告
-0 20 * * * cd /path/to/project && python generate_daily_report.py
-```
+> 输出目录：`output/` 定时任务：每小时扫描
 
 ---
 
 # 14. 扩展计划
 
-## 14.1 更多平台
+## 14.1 新套利类型
+
+| 类型 | 说明 | 状态 |
+|------|------|------|
+| **合成套利** | 区间/阈值市场组合等价于单一市场的价差 | 🔄 T7整合中 |
+| 时间套利 | 同一事件不同时间点市场价差 | ⏳ 待规划 |
+| 跨平台套利 | Polymarket vs Myriad等去中心化平台 | ⏳ 待评估 |
+
+### 合成套利示例
+```
+市场 A: "BTC > $100k"              YES = $0.65
+市场 B3: "BTC $100k-$110k"         YES = $0.12
+市场 B4: "BTC > $110k"             YES = $0.08
+                                   ─────────
+合成 (B3 + B4) ≡ A                 合计 = $0.20
+
+套利空间: $0.65 - $0.20 = $0.45
+```
+
+## 14.2 平台扩展（非美国用户）
 
 | 平台 | 说明 | 优先级 |
 |------|------|--------|
-| Kalshi | 美国合规预测市场 | P1 |
-| PredictIt | 学术预测市场 | P2 |
-| Betfair | 传统博彩交易所 | P3 |
-
-## 14.2 更多策略
-
-| 类型 | 说明 | 优先级 |
-|------|------|--------|
-| 时间套利 | 同一事件不同时间点市场价差 | P2 |
-| 相关性套利 | 历史相关性高的事件价格偏离 | P3 |
+| **Myriad** | 去中心化，BNB Chain | P1 |
+| Drift BET | 去中心化，Solana | P2 |
+| ~~Kalshi/PredictIt~~ | 需美国身份 | 不可用 |
 
 ---
 

@@ -174,6 +174,18 @@ Config loading priority: `--config` argument > `config.json` > environment varia
 - 持续优化Prompt，提高关系识别准确率
 - 探索多模型协作、验证等高级用法
 
+### 6. 实证优先 (Evidence-First Approach)
+- **先验证真实套利机会存在，再设计识别算法**
+- 正确流程：人工发现案例 → 验证是套利 → 设计算法 → 实现测试
+- 每种新套利类型，必须先有至少1个真实案例
+- 避免"闭门造车"——实践出真知
+
+### 7. 策略迭代 (Strategy Evolution)
+- **发现新套利策略时，及时提出并更新到项目圣经**
+- 新发现先记录到创意池（PROJECT_BIBLE第15章）
+- 人工验证可行性后，正式更新到套利策略章节（第4章）
+- 保持项目圣经作为"活文档"，持续演进
+
 ## Project Guidance
 
 **`docs/PROJECT_BIBLE.md` is the authoritative guide** for all project work. It contains:
