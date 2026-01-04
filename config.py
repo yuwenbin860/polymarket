@@ -38,21 +38,42 @@ class ScanSettings:
     """扫描配置"""
     # 获取市场数量
     market_limit: int = 200
-    
+
     # 相似度阈值
     similarity_threshold: float = 0.3
-    
+
     # 最小利润百分比
     min_profit_pct: float = 2.0
-    
+
     # 最小流动性（USDC）
     min_liquidity: float = 10000
-    
+
     # 最小LLM置信度
     min_confidence: float = 0.8
-    
+
     # 每次扫描最大LLM调用次数
     max_llm_calls: int = 30
+
+    # 🆕 向量化相关配置
+    # 是否启用语义聚类（向量化模式）
+    use_semantic_clustering: bool = True
+
+    # 聚类相似度阈值 (0.0-1.0)
+    semantic_threshold: float = 0.85
+
+    # Embedding模型名称
+    embedding_model: str = "BAAI/bge-large-zh-v1.5"
+
+    # 🆕 缓存相关配置
+    # 是否启用市场数据缓存
+    enable_cache: bool = True
+
+    # 缓存有效期（秒）
+    cache_ttl: int = 3600
+
+    # 🆕 领域相关配置
+    # 扫描的默认市场领域
+    scan_domain: str = "crypto"
 
 
 @dataclass
@@ -95,6 +116,11 @@ class Config:
                 min_profit_pct=float(os.getenv("MIN_PROFIT_PCT", "2.0")),
                 min_liquidity=float(os.getenv("MIN_LIQUIDITY", "10000")),
                 min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.8")),
+                use_semantic_clustering=os.getenv("USE_SEMANTIC_CLUSTERING", "true").lower() == "true",
+                semantic_threshold=float(os.getenv("SEMANTIC_THRESHOLD", "0.85")),
+                enable_cache=os.getenv("ENABLE_CACHE", "true").lower() == "true",
+                cache_ttl=int(os.getenv("CACHE_TTL", "3600")),
+                scan_domain=os.getenv("SCAN_DOMAIN", "crypto"),
             ),
             output=OutputSettings(
                 output_dir=os.getenv("OUTPUT_DIR", "./output"),
@@ -164,7 +190,13 @@ DEFAULT_CONFIG_TEMPLATE = """{
     "min_profit_pct": 2.0,
     "min_liquidity": 10000,
     "min_confidence": 0.8,
-    "max_llm_calls": 30
+    "max_llm_calls": 30,
+    "use_semantic_clustering": true,
+    "semantic_threshold": 0.85,
+    "embedding_model": "BAAI/bge-large-zh-v1.5",
+    "enable_cache": true,
+    "cache_ttl": 3600,
+    "scan_domain": "crypto"
   },
   "output": {
     "output_dir": "./output",

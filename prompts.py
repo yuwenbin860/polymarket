@@ -717,3 +717,72 @@ THRESHOLD_HIERARCHY_PROMPT = """你是一位预测市场分析专家，专门验
 - 如果阈值来自不同事件或不同结算源，蕴含关系可能不成立
 - 建议只对同一变量的阈值市场进行蕴含链分析
 """
+
+# ============================================================
+# 聚类分析专用Prompt - 向量化模式
+# ============================================================
+
+CLUSTER_ANALYSIS_PROMPT = """你正在分析一个语义聚类的市场组，这些市场讨论高度相似的主题。
+
+🎯 聚类上下文：
+- 聚类ID: {cluster_id}
+- 市场数量: {cluster_size}
+- 平均流动性: ${avg_liquidity:,.0f}
+
+📋 聚类内市场列表：
+{market_list}
+
+你的任务：
+1. 识别聚类内所有逻辑关系（蕴含、等价、互斥）
+2. 发现所有潜在的组合套利机会
+3. 注意市场之间的细微差异：
+   - 时间差异（end_date）
+   - 阈值差异（">$100k" vs ">$105k"）
+   - 条件差异（"price hit" vs "price close above"）
+
+🔍 重点分析：
+- 【完备集】: 聚类内市场是否形成完备集？（例如：不同阈值的Above市场）
+- 【蕴含关系】: A发生是否导致B必然发生？
+- 【等价市场】: 是否有不同表述但含义相同？
+- 【合成套利】: 是否可以组合多个市场构建新头寸？
+
+⚠️ 特别注意：
+- 仔细检查 end_date，蕴含关系必须满足 time(B) >= time(A)
+- 阈值市场需注意边界值（$100k 是否包含等于？）
+- 流动性低的市场可能存在定价偏差
+
+请使用标准的RELATIONSHIP_ANALYSIS_PROMPT_V2格式进行分析。
+"""
+
+
+# ============================================================
+# 聚类分析专用Prompt - 向量化模式
+# ============================================================
+
+CLUSTER_ANALYSIS_PROMPT = """You are analyzing a semantic cluster of markets discussing highly similar topics.
+
+Cluster Context:
+- Cluster ID: {cluster_id}
+- Market count: {cluster_size}
+- Avg liquidity: 
+
+Market list:
+{market_list}
+
+Your task:
+1. Identify all logical relationships (implication, equivalence, mutual exclusion)
+2. Discover all potential arbitrage opportunities
+3. Pay attention to subtle differences:
+   - Time differences (end_date)
+   - Threshold differences (">00k" vs ">05k")
+   - Condition differences ("price hit" vs "price close above")
+
+Focus on:
+- [Exhaustive Sets]: Do markets form a complete set?
+- [Implication]: Does A happening guarantee B?
+- [Equivalent Markets]: Different wording but same meaning?
+- [Synthetic Arbitrage]: Can we combine markets to create new positions?
+
+Use standard RELATIONSHIP_ANALYSIS_PROMPT_V2 format for analysis.
+"""
+

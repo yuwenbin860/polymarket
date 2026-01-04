@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(D:/work/polymarket/.venv/Scripts/python.exe:*)",
+      "Bash(set PYTHONIOENCODING=utf-8:*)",
+      "Bash(tasklist:*)",
+      "Bash(findstr:*)",
+      "Bash(D:workpolymarket.venvScriptspython.exe test_api_connection.py)",
+      "Bash(PYTHONIOENCODING=utf-8 \"D:/work/polymarket/.venv/Scripts/python.exe\":*)",
+      "Bash(ls:*)",
+      "mcp__web-search-prime__webSearchPrime",
+      "WebFetch(domain:coincodex.com)",
+      "Bash(\"D:/work/polymarket/.venv/Scripts/pip.exe\" install numpy sentence-transformers)",
+      "Bash(pip install:*)",
+      "Bash(cd:*)",
+      "Bash(if not exist docs mkdir docs)",
+      "Bash(if not exist \"D:\\\\work\\\\polymarket\\\\tests\" mkdir tests)",
+      "Bash(wc:*)",
+      "Bash(find \"D:\\\\work\\\\polymarket\" -maxdepth 1 -type f \\\\\\( -name \"*.py\" -o -name \"*.md\" \\\\\\) -exec sh -c 'echo \"\"$\\(wc -l < \"\"$1\"\"\\) lines: $1\"\"' _ {} ;)",
+      "Bash(grep:*)",
+      "Bash(\"D:/work/polymarket/.venv/Scripts/pip.exe\" install numpy)",
+      "Bash(\"D:\\\\work\\\\polymarket\\\\.venv\\\\Scripts\\\\pip.exe\" install:*)",
+      "Bash(\"D:/work/polymarket/.venv/Scripts/pip\" install numpy)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}

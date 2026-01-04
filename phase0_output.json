@@ -1,0 +1,149 @@
+{
+  "timestamp": "2025-12-29T22:08:14.391935",
+  "markets_count": 20,
+  "events_count": 10,
+  "event_groups": {},
+  "opportunities": [],
+  "raw_markets": [
+    {
+      "id": "693502",
+      "question": "Will Malaysia recognize Israel by June 30?",
+      "yes_price": 0.35,
+      "volume": 99.998283,
+      "event_id": ""
+    },
+    {
+      "id": "701571",
+      "question": "Will Solana reach $200 by December 31, 2026?",
+      "yes_price": 0.385,
+      "volume": 99.996863,
+      "event_id": ""
+    },
+    {
+      "id": "948960",
+      "question": "Will the December 2025 unemployment rate be 4.5%?",
+      "yes_price": 0.345,
+      "volume": 999.777776,
+      "event_id": ""
+    },
+    {
+      "id": "517311",
+      "question": "Will Trump deport 250,000-500,000 people?",
+      "yes_price": 0.9425,
+      "volume": 999070.742347,
+      "event_id": ""
+    },
+    {
+      "id": "914677",
+      "question": "Will there be at least 2150 measles cases in the U.S. in 2025?",
+      "yes_price": 0.0115,
+      "volume": 9987.903456,
+      "event_id": ""
+    },
+    {
+      "id": "645756",
+      "question": "Will John Tavares win the 2025–2026 NHL Maurice 'Rocket' Richard Trophy?",
+      "yes_price": 0.041,
+      "volume": 99.87065,
+      "event_id": ""
+    },
+    {
+      "id": "614574",
+      "question": "Will Train Dreams win Best Adapted Screenplay at the 98th Academy Awards?",
+      "yes_price": 0.0565,
+      "volume": 9982.658649,
+      "event_id": ""
+    },
+    {
+      "id": "618506",
+      "question": "Will Trump and Putin meet next in United States?",
+      "yes_price": 0.06,
+      "volume": 9982.419837,
+      "event_id": ""
+    },
+    {
+      "id": "903267",
+      "question": "Will Canada win the second most medals in the 2026 Winter Olympics?",
+      "yes_price": 0.095,
+      "volume": 9.980983,
+      "event_id": ""
+    },
+    {
+      "id": "701840",
+      "question": "Will Zcash reach $1000 by December 31, 2026?",
+      "yes_price": 0.345,
+      "volume": 9973.20885,
+      "event_id": ""
+    },
+    {
+      "id": "516877",
+      "question": "Will Ethereum hit $6,000 by December 31?",
+      "yes_price": 0.0015,
+      "volume": 9972006.37729,
+      "event_id": ""
+    },
+    {
+      "id": "1029867",
+      "question": "Will Trump say \"Christmas\" this week? (December 29 - January 4)",
+      "yes_price": 0.485,
+      "volume": 9.970794,
+      "event_id": ""
+    },
+    {
+      "id": "676423",
+      "question": "Will Mike McDaniel be the next NFL Head Coach fired?",
+      "yes_price": 0.155,
+      "volume": 99.6768,
+      "event_id": ""
+    },
+    {
+      "id": "897536",
+      "question": "Will Superman win Best Visual Effects at the 2026 Critics Choice Awards?",
+      "yes_price": 0.072,
+      "volume": 99.66,
+      "event_id": ""
+    },
+    {
+      "id": "839441",
+      "question": "Will Iran win Group G in the 2026 FIFA World Cup?",
+      "yes_price": 0.125,
+      "volume": 996.598465,
+      "event_id": ""
+    },
+    {
+      "id": "797058",
+      "question": "Odds of Newsom Dem Pres Nominee over 50% by December 31?",
+      "yes_price": 0.003,
+      "volume": 996.21258,
+      "event_id": ""
+    },
+    {
+      "id": "1046090",
+      "question": "Will the highest temperature in Seattle be between 44-45°F on December 30?",
+      "yes_price": 0.365,
+      "volume": 99.62,
+      "event_id": ""
+    },
+    {
+      "id": "643732",
+      "question": "Will Donovan Mitchell win the 2025–2026 NBA Clutch Player of the Year?",
+      "yes_price": 0.0145,
+      "volume": 9960.677845,
+      "event_id": ""
+    },
+    {
+      "id": "645709",
+      "question": "Will Jack Hughes win the 2025–2026 NHL Maurice 'Rocket' Richard Trophy?",
+      "yes_price": 0.0205,
+      "volume": 99.6025,
+      "event_id": ""
+    },
+    {
+      "id": "521964",
+      "question": "Will Elon cut the budget by at least 5% in 2025?",
+      "yes_price": 0.005,
+      "volume": 99586.391831,
+      "event_id": ""
+    }
+  ]
+}

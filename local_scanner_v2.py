@@ -52,6 +52,11 @@ from prompts import (
 # ✅ 新增：导入验证层
 from validators import MathValidator
 
+# ✅ 新增：导入语义聚类模块
+from semantic_cluster import SemanticClusterer
+
+import logging
+
 
 # ============================================================
 # 数据结构
@@ -301,6 +306,254 @@ class PolymarketClient:
                     print(f"  已处理 {i + 1}/{len(markets)} 个市场")
 
         return markets
+
+    def fetch_crypto_markets(
+        self,
+        min_liquidity: float = 1000,
+        search_queries: Optional[List[str]] = None
+    ) -> List[Market]:
+        """
+        获取所有加密货币相关市场（多关键词组合策略）
+
+        策略：
+        1. 使用多个关键词搜索（Bitcoin, BTC, Ethereum等）
+        2. 合并去重
+        3. 按流动性排序
+
+        Args:
+            min_liquidity: 最小流动性过滤
+            search_queries: 搜索关键词列表（默认使用加密货币关键词）
+
+        Returns:
+            去重后的加密货币市场列表
+        """
+        if search_queries is None:
+            search_queries = [
+                "Bitcoin", "BTC", "bitcoin", "btc",
+                "Ethereum", "ETH", "ethereum", "eth",
+                "crypto", "cryptocurrency", "Crypto"
+            ]
+
+        all_markets = []
+        seen_ids = set()
+
+        logging.info(f"🔍 使用 {len(search_queries)} 个关键词搜索加密货币市场...")
+
+        for query in search_queries:
+            # 使用关键词搜索市场
+            # 注意：Gamma API可能不支持直接的关键词搜索参数
+            # 这里我们获取大量市场，然后通过客户端过滤
+            markets_batch = self.get_markets(
+                limit=200,  # 每次获取200个
+                active=True,
+                min_liquidity=min_liquidity
+            )
+
+            # 客户端过滤：关键词匹配
+            query_lower = query.lower()
+            filtered = [
+                m for m in markets_batch
+                if (query_lower in m.question.lower() or
+                    query_lower in m.description.lower() or
+                    query_lower in m.event_title.lower())
+            ]
+
+            # 去重
+            for m in filtered:
+                if m.id not in seen_ids:
+                    all_markets.append(m)
+                    seen_ids.add(m.id)
+
+            logging.info(f"  关键词 '{query}': 找到 {len(filtered)} 个市场")
+
+        # 按流动性排序（降序）
+        all_markets.sort(key=lambda m: m.liquidity, reverse=True)
+
+        logging.info(f"✅ 总共找到 {len(all_markets)} 个加密货币市场（去重后）")
+
+        return all_markets
+
+
+# ============================================================
+# 市场领域分类器
+# ============================================================
+
+class MarketDomainClassifier:
+    """
+    市场领域分类器
+
+    根据市场问题、描述、事件标题判断市场所属领域
+    """
+
+    CRYPTO_KEYWORDS = [
+        'bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'cryptocurrency',
+        'solana', 'sol', 'cardano', 'ada', 'polkadot', 'dot',
+        'dogecoin', 'doge', 'chainlink', 'link', 'ripple', 'xrp',
+        'polygon', 'matic', 'avalanche', 'avax', 'binance', 'bnb'
+    ]
+
+    POLITICS_KEYWORDS = [
+        'election', 'congress', 'senate', 'president', 'trump', 'biden',
+        'republican', 'democrat', 'vote', 'ballot', 'policy'
+    ]
+
+    SPORTS_KEYWORDS = [
+        'nba', 'nfl', 'mlb', 'world cup', 'super bowl', 'championship',
+        'game', 'team', 'player', 'score', 'match', 'tournament'
+    ]
+
+    def classify(self, market: Market) -> str:
+        """
+        判断市场所属领域
+
+        Args:
+            market: Market 对象
+
+        Returns:
+            领域标识: 'crypto', 'politics', 'sports', 'other'
+        """
+        # 合并所有文本字段进行判断
+        text = (
+            f"{market.question} {market.description} "
+            f"{market.event_title}".lower()
+        )
+
+        # 加密货币
+        if any(kw in text for kw in self.CRYPTO_KEYWORDS):
+            return 'crypto'
+
+        # 政治
+        if any(kw in text for kw in self.POLITICS_KEYWORDS):
+            return 'politics'
+
+        # 体育
+        if any(kw in text for kw in self.SPORTS_KEYWORDS):
+            return 'sports'
+
+        return 'other'
+
+
+# ============================================================
+# 市场数据缓存
+# ============================================================
+
+class MarketCache:
+    """
+    市场数据缓存管理器
+
+    避免重复API调用，加速数据加载
+    """
+
+    def __init__(self, cache_dir: str = "./cache", cache_ttl: int = 3600):
+        """
+        Args:
+            cache_dir: 缓存目录
+            cache_ttl: 缓存有效期（秒），默认1小时
+        """
+        self.cache_dir = cache_dir
+        self.cache_ttl = cache_ttl
+
+        # 确保缓存目录存在
+        os.makedirs(cache_dir, exist_ok=True)
+
+    def _get_cache_file(self, domain: str) -> str:
+        """获取缓存文件路径"""
+        return os.path.join(self.cache_dir, f"{domain}_markets.json")
+
+    def _is_cache_valid(self, cache_file: str) -> bool:
+        """检查缓存是否有效"""
+        if not os.path.exists(cache_file):
+            return False
+
+        # 检查文件修改时间
+        file_mtime = os.path.getmtime(cache_file)
+        current_time = datetime.now().timestamp()
+        age = current_time - file_mtime
+
+        return age < self.cache_ttl
+
+    def _load_cache(self, cache_file: str) -> List[Market]:
+        """从缓存文件加载市场数据"""
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            markets = []
+            for item in data:
+                try:
+                    market = Market(**item)
+                    markets.append(market)
+                except Exception as e:
+                    logging.warning(f"缓存数据解析失败: {e}")
+                    continue
+
+            return markets
+
+        except Exception as e:
+            logging.warning(f"缓存加载失败: {e}")
+            return []
+
+    def _save_cache(self, cache_file: str, markets: List[Market]):
+        """保存市场数据到缓存文件"""
+        try:
+            data = [asdict(m) for m in markets]
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            logging.info(f"💾 已保存缓存: {cache_file}")
+
+        except Exception as e:
+            logging.warning(f"缓存保存失败: {e}")
+
+    def load_or_fetch(self, domain: str, fetcher) -> List[Market]:
+        """
+        加载缓存或获取新数据
+
+        Args:
+            domain: 领域标识（'crypto', 'politics'等）
+            fetcher: 数据获取函数（返回 List[Market]）
+
+        Returns:
+            市场列表
+        """
+        cache_file = self._get_cache_file(domain)
+
+        # 尝试从缓存加载
+        if self._is_cache_valid(cache_file):
+            logging.info(f"✅ 从缓存加载 {domain} 市场数据")
+            markets = self._load_cache(cache_file)
+            if markets:
+                return markets
+
+        # 缓存无效或不存在，重新获取
+        logging.info(f"🌐 从API获取 {domain} 市场数据")
+        markets = fetcher()
+
+        # 保存到缓存
+        if markets:
+            self._save_cache(cache_file, markets)
+
+        return markets
+
+    def clear_cache(self, domain: Optional[str] = None):
+        """
+        清除缓存
+
+        Args:
+            domain: 领域标识，None表示清除所有缓存
+        """
+        if domain:
+            cache_file = self._get_cache_file(domain)
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+                logging.info(f"🗑️ 已清除 {domain} 缓存")
+        else:
+            # 清除所有缓存
+            for filename in os.listdir(self.cache_dir):
+                if filename.endswith('_markets.json'):
+                    file_path = os.path.join(self.cache_dir, filename)
+                    os.remove(file_path)
+            logging.info(f"🗑️ 已清除所有缓存")
 
 
 # ============================================================
@@ -1209,16 +1462,50 @@ class SimilarityFilter:
 # ============================================================
 
 class ArbitrageScanner:
-    """主扫描器"""
-    
-    def __init__(self, config: AppConfig, profile_name: str = None, model_override: str = None):
+    """
+    主扫描器 - 向量化驱动版本
+
+    支持两种模式：
+    1. 向量化模式（新）：按领域获取市场 → 语义聚类 → 聚类内全自动分析
+    2. 传统模式（兼容）：关键词搜索 → Jaccard相似度 → LLM分析
+    """
+
+    def __init__(
+        self,
+        config: AppConfig,
+        profile_name: str = None,
+        model_override: str = None,
+        use_semantic: bool = True
+    ):
+        """
+        Args:
+            config: 配置对象
+            profile_name: LLM配置名称
+            model_override: 模型覆盖
+            use_semantic: 是否启用向量化模式（默认True）
+        """
         self.config = config
         self.profile_name = profile_name
         self.model_override = model_override
+        self.use_semantic = use_semantic and hasattr(config.scan, 'use_semantic_clustering') and config.scan.use_semantic_clustering
+
+        # 基础组件
         self.client = PolymarketClient()
         self.analyzer = LLMAnalyzer(config, profile_name=profile_name, model_override=model_override)
         self.detector = ArbitrageDetector(config)
-        self.filter = SimilarityFilter(config.scan.similarity_threshold)
+
+        # 🆕 向量化组件
+        if self.use_semantic:
+            self.semantic_clusterer = SemanticClusterer()
+            self.market_cache = MarketCache(
+                cache_dir=config.output.cache_dir,
+                cache_ttl=getattr(config.scan, 'cache_ttl', 3600)
+            )
+            self.domain_classifier = MarketDomainClassifier()
+            logging.info("✅ 向量化模式已启用")
+        else:
+            self.filter = SimilarityFilter(config.scan.similarity_threshold)
+            logging.info("⚠️ 传统模式（关键词搜索）")
     
     def scan(self) -> List[ArbitrageOpportunity]:
         """执行完整扫描"""
@@ -1292,7 +1579,193 @@ class ArbitrageScanner:
         self._print_summary(opportunities)
         
         return opportunities
-    
+
+    def scan_semantic(
+        self,
+        domain: str = "crypto",
+        semantic_threshold: float = 0.85
+    ) -> List[ArbitrageOpportunity]:
+        """
+        向量化驱动的套利扫描（新流程）
+
+        流程：
+        1. 获取领域内所有市场（带缓存）
+        2. 批量向量化
+        3. 语义聚类
+        4. 全自动聚类内套利分析
+        5. 生成报告
+
+        Args:
+            domain: 市场领域 ("crypto", "politics", "sports", "other")
+            semantic_threshold: 聚类相似度阈值 (0.0-1.0)
+
+        Returns:
+            套利机会列表
+        """
+        logging.info(f"🚀 开始向量化套利扫描 - 领域: {domain}")
+
+        # Step 1: 获取领域内所有市场（带缓存）
+        logging.info("📥 Step 1: 获取市场数据...")
+        all_markets = self._fetch_domain_markets(domain)
+
+        if not all_markets:
+            logging.warning("❌ 未获取到市场数据")
+            return []
+
+        logging.info(f"✅ 获取到 {len(all_markets)} 个市场")
+
+        # Step 2: 批量向量化
+        logging.info(f"🧮 Step 2: 向量化 {len(all_markets)} 个市场...")
+        questions = [m.question for m in all_markets]
+        embeddings = self.semantic_clusterer.get_embeddings(questions)
+        logging.info(f"✅ 向量化完成")
+
+        # Step 3: 语义聚类
+        logging.info(f"🔗 Step 3: 语义聚类 (threshold={semantic_threshold})...")
+        clusters = self.semantic_clusterer.cluster_markets(
+            all_markets,
+            threshold=semantic_threshold,
+            embeddings=embeddings
+        )
+        logging.info(f"✅ 生成 {len(clusters)} 个语义聚类")
+
+        # 打印聚类摘要
+        for i, cluster in enumerate(clusters):
+            if len(cluster) > 1:
+                logging.info(f"  聚类 {i+1}: {len(cluster)} 个市场")
+                if self.config.output.detailed_log and len(cluster) <= 5:
+                    for j, m in enumerate(cluster[:3]):
+                        logging.info(f"    {j+1}. {m.question[:50]}...")
+
+        # Step 4: 全自动聚类内套利分析
+        logging.info("🔍 Step 4: 聚类内套利分析...")
+        opportunities = []
+        llm_call_count = 0
+        max_llm_calls = self.config.scan.max_llm_calls
+
+        for i, cluster in enumerate(clusters):
+            if len(cluster) < 2:
+                continue
+
+            logging.info(f"  📦 聚类 {i+1}/{len(clusters)} ({len(cluster)} 个市场)")
+
+            # 4.1 聚类内完备集检测
+            opps = self.detector.check_exhaustive_set(cluster)
+            if opps:
+                opportunities.extend(opps)
+                for opp in opps:
+                    logging.info(f"    🎯 完备集套利! 利润={opp.profit_pct:.2f}%")
+
+            # 4.2 聚类内全对LLM分析
+            cluster_opps = self._analyze_cluster_fully(
+                cluster,
+                cluster_id=i,
+                max_llm_calls=max_llm_calls - llm_call_count
+            )
+            opportunities.extend(cluster_opps)
+            llm_call_count += len(cluster) * (len(cluster) - 1) // 2  # 估算
+
+            if llm_call_count >= max_llm_calls:
+                logging.warning(f"⚠️ 达到LLM调用限制 ({max_llm_calls})")
+                break
+
+        # Step 5: 生成报告
+        logging.info("📊 Step 5: 生成报告...")
+        self._save_report(opportunities, domain=domain)
+        self._print_summary(opportunities)
+
+        logging.info(f"✨ 扫描完成: 发现 {len(opportunities)} 个套利机会")
+
+        return opportunities
+
+    def _fetch_domain_markets(self, domain: str) -> List[Market]:
+        """
+        获取指定领域的所有市场（带缓存）
+
+        Args:
+            domain: 领域标识 ("crypto", "politics", "sports", "other")
+
+        Returns:
+            市场列表
+        """
+        if domain == "crypto":
+            # 加密货币市场：使用多关键词策略
+            fetcher = lambda: self.client.fetch_crypto_markets(
+                min_liquidity=self.config.scan.min_liquidity
+            )
+        else:
+            # 其他领域：获取通用市场并过滤
+            def fetcher():
+                all_markets = self.client.get_markets(
+                    limit=500,
+                    min_liquidity=self.config.scan.min_liquidity
+                )
+                # 按领域过滤
+                return [
+                    m for m in all_markets
+                    if self.domain_classifier.classify(m) == domain
+                ]
+
+        return self.market_cache.load_or_fetch(domain, fetcher)
+
+    def _analyze_cluster_fully(
+        self,
+        cluster: List[Market],
+        cluster_id: int,
+        max_llm_calls: int = 100
+    ) -> List[ArbitrageOpportunity]:
+        """
+        全自动聚类内分析
+
+        分析聚类内所有 C(n,2) 个市场对
+
+        Args:
+            cluster: 聚类内的市场列表
+            cluster_id: 聚类ID
+            max_llm_calls: 最大LLM调用次数
+
+        Returns:
+            套利机会列表
+        """
+        opportunities = []
+        n = len(cluster)
+        llm_count = 0
+
+        # 按流动性排序（优先分析高流动性市场）
+        cluster_sorted = sorted(cluster, key=lambda m: m.liquidity, reverse=True)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                # 检查LLM调用限制
+                if llm_count >= max_llm_calls:
+                    logging.warning(f"    ⚠️ 达到LLM调用限制 ({max_llm_calls})")
+                    return opportunities
+
+                m1, m2 = cluster_sorted[i], cluster_sorted[j]
+
+                # LLM关系分析
+                analysis = self.analyzer.analyze(m1, m2)
+                llm_count += 1
+
+                rel = analysis.get("relationship", "UNRELATED")
+                conf = analysis.get("confidence", 0)
+
+                # 如果有逻辑关系，检测套利
+                if rel != "UNRELATED" and rel != "unrelated":
+                    if self.config.output.detailed_log:
+                        logging.info(
+                            f"    分析 {llm_count}: <{rel}> conf={conf:.2f} "
+                            f"{m1.question[:25]}... vs {m2.question[:25]}..."
+                        )
+
+                    opp = self.detector.check_pair(m1, m2, analysis)
+                    if opp:
+                        opportunities.append(opp)
+                        logging.info(f"    🎯 发现套利! 利润={opp.profit_pct:.2f}%")
+
+        return opportunities
+
+
     def _generate_polymarket_links(self, markets: List[Dict]) -> List[str]:
         """
         生成 Polymarket 市场链接
@@ -1348,17 +1821,28 @@ class ArbitrageScanner:
 ╚═══════════════════════════════════════════════════════════════╝
         """)
     
-    def _save_report(self, opportunities: List[ArbitrageOpportunity]):
-        """保存报告"""
+    def _save_report(
+        self,
+        opportunities: List[ArbitrageOpportunity],
+        domain: str = "default"
+    ):
+        """
+        保存报告
+
+        Args:
+            opportunities: 套利机会列表
+            domain: 市场领域（用于文件名）
+        """
         os.makedirs(self.config.output.output_dir, exist_ok=True)
-        
+
         output_file = os.path.join(
             self.config.output.output_dir,
-            f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            f"scan_{domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         )
-        
+
         report = {
             "scan_time": datetime.now().isoformat(),
+            "domain": domain,
             "config": {
                 "llm_provider": self.config.llm.provider,
                 "min_profit_pct": self.config.scan.min_profit_pct,
@@ -1368,10 +1852,11 @@ class ArbitrageScanner:
             "opportunities_count": len(opportunities),
             "opportunities": [asdict(opp) for opp in opportunities]
         }
-        
+
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
-        
+
+        logging.info(f"✅ 报告已保存到 {output_file}")
         print(f"      ✅ 报告已保存到 {output_file}")
     
     def _print_summary(self, opportunities: List[ArbitrageOpportunity]):
@@ -1483,7 +1968,27 @@ def main():
         action="store_true",
         help="列出所有可用的LLM配置"
     )
-    
+
+    # 🆕 向量化模式相关参数
+    parser.add_argument(
+        "--semantic",
+        action="store_true",
+        help="启用向量化模式（语义聚类）"
+    )
+    parser.add_argument(
+        "--domain", "-d",
+        type=str,
+        default="crypto",
+        choices=["crypto", "politics", "sports", "other"],
+        help="市场领域 (默认: crypto)"
+    )
+    parser.add_argument(
+        "--threshold", "-t",
+        type=float,
+        default=0.85,
+        help="语义聚类相似度阈值 (默认: 0.85)"
+    )
+
     args = parser.parse_args()
     
     # 列出配置
@@ -1506,12 +2011,21 @@ def main():
     scanner = ArbitrageScanner(
         config,
         profile_name=args.profile,
-        model_override=args.model
+        model_override=args.model,
+        use_semantic=args.semantic  # 🆕 传递向量化模式标志
     )
-    
+
     try:
-        # 执行扫描
-        opportunities = scanner.scan()
+        # 🆕 根据模式选择扫描方法
+        if args.semantic:
+            logging.info(f"🚀 启动向量化模式 - 领域: {args.domain}, 阈值: {args.threshold}")
+            opportunities = scanner.scan_semantic(
+                domain=args.domain,
+                semantic_threshold=args.threshold
+            )
+        else:
+            logging.info("⚠️ 传统模式（关键词搜索）")
+            opportunities = scanner.scan()
         
         print("\n" + "=" * 65)
         print("扫描完成！")
