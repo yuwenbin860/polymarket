@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 语义聚类模块
 ============
@@ -18,12 +19,16 @@
     clusters = clusterer.cluster_markets(markets, query="Bitcoin January")
 """
 
+import sys
+import io
 import json
 import numpy as np
 import requests
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
+
+# UTF-8编码说明：所有输出使用ASCII字符，无需特殊编码处理
 
 
 @dataclass
@@ -158,6 +163,10 @@ class SemanticClusterer:
                        similarity_threshold: float = 0.75) -> List[List[Dict]]:
         """将市场按语义相似度聚类
 
+        ✅ Rules分析优先：
+        - 向量化时结合question + event_description
+        - 这样可以根据resolution rules进行更准确的聚类
+
         使用简单的层次聚类：
         1. 计算所有市场的pairwise相似度
         2. 将相似度 > threshold 的市场归入同一类
@@ -178,10 +187,27 @@ class SemanticClusterer:
             markets = markets[:500]
             n = 500
 
-        # 获取embeddings
-        questions = [m.get('question', '') for m in markets]
-        print(f"Getting embeddings for {n} markets...")
-        embeddings = self.get_embeddings(questions)
+        # ✅ 新增: 获取embeddings时包含description信息
+        # 支持Market对象和字典两种类型
+        texts = []
+        for m in markets:
+            if hasattr(m, 'question'):  # Market对象
+                # 优先使用event_description（包含rules）
+                desc = getattr(m, 'full_description', None)
+                if desc is None:
+                    desc = getattr(m, 'event_description', '') or getattr(m, 'market_description', '') or getattr(m, 'description', '')
+                # 结合question和description进行向量化
+                question = m.question
+                texts.append(f"{question}\n\nRules: {desc[:500]}")  # 限制description长度
+            else:  # 字典
+                desc = (m.get('event_description', '') or
+                       m.get('market_description', '') or
+                       m.get('description', ''))
+                question = m.get('question', '')
+                texts.append(f"{question}\n\nRules: {desc[:500]}")
+
+        print(f"Getting embeddings for {n} markets (with rules info)...")
+        embeddings = self.get_embeddings(texts)
 
         # 计算相似度矩阵
         print("Computing similarity matrix...")

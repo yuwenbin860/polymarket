@@ -10,6 +10,9 @@
 4. **多LLM支持** - 支持OpenAI、Claude、DeepSeek、通义、GLM、Ollama等
 5. **真实订单簿价格** - 使用CLOB API获取best_bid/best_ask，而非最后成交价
 6. **三层验证架构** - 数学验证 + LLM找碴验证 + 双模型交叉验证
+7. **🏷️ Tag分类获取** - 按crypto/politics/sports等标签精准获取市场
+8. **📜 Rules分析优先** - 获取并分析每个市场的结算规则
+9. **🔢 区间套利检测** - 检测价格区间的互补套利机会
 
 ## 📁 项目结构
 
@@ -17,6 +20,9 @@
 polymarket_arb/
 ├── PROJECT_BIBLE.md         # 📖 项目完整文档（必读）
 ├── local_scanner_v2.py      # 主程序（支持多LLM + 订单簿价格）
+├── tag_manager.py           # 🏷️ Tag管理模块
+├── interval_parser.py       # 🔢 区间解析器
+├── semantic_cluster.py      # 🧠 语义聚类模块
 ├── llm_providers.py         # LLM提供商抽象层
 ├── llm_config.py            # LLM配置管理器
 ├── prompts.py               # Prompt工程模块（含时间验证）
@@ -27,6 +33,7 @@ polymarket_arb/
 ├── config.py                # 配置管理
 ├── config.example.json      # 配置文件示例
 ├── test_prompts.py          # Prompt测试脚本
+├── test_new_features.py     # 🧪 新功能验证测试
 ├── polymarket_arb_mvp.py    # MVP版本（模拟数据）
 ├── requirements.txt         # 依赖列表
 └── README.md                # 本文件
@@ -84,6 +91,61 @@ python local_scanner_v2.py  # 自动检测
 python local_scanner_v2.py
 ```
 
+### 5. 命令行参数完整列表
+
+#### LLM配置参数
+
+| 参数 | 简写 | 说明 | 示例 |
+|------|------|------|------|
+| `--profile` | `-p` | 使用预设LLM配置 | `--profile siliconflow` |
+| `--model` | `-m` | 覆盖默认模型 | `--model Qwen/Qwen2.5-72B-Instruct` |
+| `--config` | `-c` | 指定配置文件路径 | `--config custom.json` |
+| `--list-profiles` | - | 列出所有可用配置 | `--list-profiles` |
+
+#### 扫描参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--min-profit` | 最小利润百分比 | 2.0 |
+| `--market-limit` | 获取市场数量 | 200 |
+
+#### 向量化模式参数（语义聚类）
+
+| 参数 | 简写 | 说明 | 默认值 |
+|------|------|------|--------|
+| `--semantic` | - | 启用向量化模式 | False |
+| `--domain` | `-d` | 市场领域 | crypto |
+| `--threshold` | `-t` | 语义聚类相似度阈值 (0.0-1.0) | 0.85 |
+
+#### 使用示例
+
+```bash
+# 基础扫描（使用自动检测的LLM配置）
+python local_scanner_v2.py
+
+# 使用指定LLM配置
+python local_scanner_v2.py --profile siliconflow
+python local_scanner_v2.py -p deepseek
+
+# 切换模型
+python local_scanner_v2.py --profile siliconflow --model deepseek-ai/DeepSeek-V3
+
+# 自定义扫描参数
+python local_scanner_v2.py --min-profit 3.0 --market-limit 500
+
+# 向量化模式 - 加密货币市场
+python local_scanner_v2.py --semantic --domain crypto
+
+# 向量化模式 - 政治市场，自定义阈值
+python local_scanner_v2.py --semantic --domain politics --threshold 0.80
+
+# 组合使用
+python local_scanner_v2.py --profile ollama --semantic -d sports -t 0.90
+
+# 列出所有可用配置
+python local_scanner_v2.py --list-profiles
+```
+
 ## 🤖 支持的LLM提供商
 
 | 提供商 | 环境变量 | 成本 | 推荐场景 |
@@ -136,6 +198,164 @@ python test_prompts.py --profile deepseek
 
 # 只运行第一个测试
 python test_prompts.py --test 0
+```
+
+## 🏷️ 按Tag分类获取市场
+
+系统现在支持直接按分类（如crypto、politics、sports）精准获取市场，无需关键词匹配。
+
+### 使用TagManager
+
+```python
+from tag_manager import TagManager
+
+manager = TagManager()
+
+# 获取所有可用tags
+tags = manager.get_all_tags()
+
+# 按slug获取tag
+crypto_tag = manager.get_tag("crypto")  # id = "21"
+print(f"Tag: {crypto_tag.label}, ID: {crypto_tag.id}")
+```
+
+### 使用PolymarketClient获取分类市场
+
+```python
+from local_scanner_v2 import PolymarketClient
+
+client = PolymarketClient()
+
+# 按tag slug获取markets（推荐方式）
+markets = client.get_markets_by_tag_slug('crypto', active=True, limit=100)
+
+# 按tag_id获取markets
+markets = client.get_markets_by_tag(tag_id="21", active=True, limit=100)
+```
+
+### 常用Tags
+
+| Slug | Tag ID | 分类 |
+|------|--------|------|
+| `crypto` | 21 | 加密货币 |
+| `politics` | 2 | 政治 |
+| `sports` | 1 | 体育 |
+| `technology` | 22 | 科技 |
+| `business` | 23 | 商业 |
+| `world` | 24 | 国际 |
+
+### 新方式 vs 旧方式
+
+**旧方式（关键词匹配）**:
+- ❌ 需要多次API调用
+- ❌ 客户端过滤，可能遗漏相关市场
+- ❌ 不包含完整event信息
+
+**新方式（Tag过滤）**:
+- ✅ 单次API调用
+- ✅ 服务端过滤，结果更准确
+- ✅ 包含完整rules和tags信息
+
+## 📜 Rules分析优先
+
+系统现在会获取并分析每个市场的结算规则（resolution rules），在进行语义分析前先理解规则。
+
+### Rules信息来源
+
+```python
+markets = client.get_markets_by_tag_slug('crypto')
+
+for m in markets:
+    # event_description: Event级别的description，包含完整判定规则
+    rules = m.event_description
+
+    # market_description: Market级别的description
+    market_desc = m.market_description
+
+    # full_description: 自动选择最完整的描述
+    full_desc = m.full_description
+
+    # tags: 事件分类标签
+    tags = [t['label'] for t in m.tags]
+
+    print(f"Question: {m.question}")
+    print(f"Rules: {rules[:200]}...")
+    print(f"Tags: {tags}")
+```
+
+### Why Rules Matter
+
+1. **结算来源差异** - 不同的数据源可能导致同一问题的结果不同
+2. **时间一致性** - 结算日期差异会影响蕴含关系的有效性
+3. **边界处理** - "above"是否包含等于影响区间套利判断
+
+### LLM分析时自动包含Rules
+
+```python
+# prompts.py已更新，LLM分析时会自动使用full_description
+# 这意味着LLM会同时看到question和rules
+```
+
+## 🔢 区间套利检测
+
+系统支持区间套利机会检测，当两个区间的并集覆盖所有可能值且互斥时存在套利。
+
+### 什么是区间套利？
+
+当两个互补的区间市场总价低于$1时，存在无风险套利机会。
+
+### 真实案例：Solana Jan 4
+
+```
+区间A: [0, 130)  (完备集子市场之一) → YES价格 = 4.6c
+区间B: [130, ∞)  (阈值市场)         → YES价格 = 94.8c
+
+套利策略: 买A的YES + 买B的YES = 4.6 + 94.8 = 99.4c
+保证回报: $1.00
+利润: 0.6c (0.6%)
+```
+
+### 使用IntervalParser
+
+```python
+from interval_parser import IntervalParser
+
+parser = IntervalParser()
+
+# 解析区间
+interval = parser.parse("Will BTC be above $100k in 2025?")
+# 返回: Interval(type=ABOVE, lower=100000, upper=inf, unit="USD")
+
+# 比较区间关系
+relation = parser.compare_intervals(interval_a, interval_b)
+# 返回: A_COVERS_B, B_COVERS_A, OVERLAP, MUTUAL_EXCLUSIVE, UNRELATED
+
+# 检测套利
+arbitrage = parser.find_interval_arbitrage(market_a, market_b)
+```
+
+### 支持的区间类型
+
+| 类型 | 示例 | 含义 |
+|------|------|------|
+| `ABOVE` | "above $100k" | 价格 > 阈值 |
+| `BELOW` | "below $50" | 价格 < 阈值 |
+| `RANGE` | "between $100 and $150" | 价格在区间内 |
+
+## 🧪 验证新功能
+
+运行验证测试脚本确保所有功能正常：
+
+```bash
+# 运行完整测试套件
+python test_new_features.py
+
+# 测试内容：
+# 1. TagManager - Tag管理和获取
+# 2. Market结构 - event_description, tags字段
+# 3. IntervalParser - 区间解析和关系判断
+# 4. Solana场景 - 真实区间套利案例
+# 5. 集成测试 - 端到端数据流程
 ```
 
 ## 📚 详细文档

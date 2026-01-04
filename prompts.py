@@ -237,8 +237,26 @@ def format_analysis_prompt(
     market_b: Dict,
     config: PromptConfig = None
 ) -> str:
-    """格式化分析Prompt"""
+    """
+    格式化分析Prompt
+
+    ✅ Rules分析优先：
+    - 优先使用event_description（包含完整的resolution rules）
+    - 如果没有event_description，则使用market_description
+    - 将rules信息传递给LLM进行兼容性分析
+    """
     template = get_analysis_prompt(config)
+
+    # ✅ 新增: 提取rules信息
+    def get_full_description(market: Dict) -> str:
+        """获取完整的描述信息（优先event_description）"""
+        event_desc = market.get("event_description", "") or ""
+        market_desc = market.get("market_description", "") or ""
+        legacy_desc = market.get("description", "") or ""
+
+        # 优先级: event_description > market_description > description
+        full_desc = event_desc or market_desc or legacy_desc
+        return full_desc[:800]  # 增加长度限制以容纳更多rules信息
 
     # 根据版本选择格式化参数
     if config and config.version == "lite":
@@ -249,16 +267,20 @@ def format_analysis_prompt(
             price_b=market_b.get("yes_price", 0.5),
         )
     else:
+        # ✅ 使用full_description获取完整的rules信息
+        desc_a = get_full_description(market_a)
+        desc_b = get_full_description(market_b)
+
         return template.format(
             question_a=market_a.get("question", ""),
-            description_a=(market_a.get("description", "") or "")[:500],
+            description_a=desc_a,
             price_a=market_a.get("yes_price", 0.5),
             prob_a=market_a.get("yes_price", 0.5) * 100,
             end_date_a=market_a.get("end_date", "未指定"),
             event_id_a=market_a.get("event_id", "未指定"),
             source_a=market_a.get("resolution_source", "未指定"),
             question_b=market_b.get("question", ""),
-            description_b=(market_b.get("description", "") or "")[:500],
+            description_b=desc_b,
             price_b=market_b.get("yes_price", 0.5),
             prob_b=market_b.get("yes_price", 0.5) * 100,
             end_date_b=market_b.get("end_date", "未指定"),
@@ -756,15 +778,17 @@ CLUSTER_ANALYSIS_PROMPT = """你正在分析一个语义聚类的市场组，这
 
 
 # ============================================================
-# 聚类分析专用Prompt - 向量化模式
+# 聚类分析专用Prompt - 向量化模式 (英文版备用)
 # ============================================================
+# 注意：已移除重复定义，使用Line 725的中文版本
+# 如需英文版，请单独调用此模板
 
-CLUSTER_ANALYSIS_PROMPT = """You are analyzing a semantic cluster of markets discussing highly similar topics.
+CLUSTER_ANALYSIS_PROMPT_EN = """You are analyzing a semantic cluster of markets discussing highly similar topics.
 
 Cluster Context:
 - Cluster ID: {cluster_id}
 - Market count: {cluster_size}
-- Avg liquidity: 
+- Avg liquidity: ${avg_liquidity:,.0f}
 
 Market list:
 {market_list}
@@ -774,7 +798,7 @@ Your task:
 2. Discover all potential arbitrage opportunities
 3. Pay attention to subtle differences:
    - Time differences (end_date)
-   - Threshold differences (">00k" vs ">05k")
+   - Threshold differences (">$100k" vs ">$105k")
    - Condition differences ("price hit" vs "price close above")
 
 Focus on:

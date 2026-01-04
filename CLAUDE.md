@@ -186,6 +186,27 @@ Config loading priority: `--config` argument > `config.json` > environment varia
 - 人工验证可行性后，正式更新到套利策略章节（第4章）
 - 保持项目圣经作为"活文档"，持续演进
 
+### 8. Rules分析优先 (Rules-First Analysis)
+- **在进行任何语义分析或向量化分析之前，必须先读取并理解Event的description字段**
+- Event的description包含完整的resolution rules（判定规则、数据源、特殊条件等）
+- 这些rules决定了市场的真正含义，忽略rules会导致错误分析和套利失败
+- 实现要求：
+  1. 使用`PolymarketClient.get_markets_by_tag()`获取包含完整event_description的市场数据
+  2. LLM分析时传入`event_description`字段
+  3. 向量化时结合question + description进行embedding
+  4. 检查rules兼容性（结算来源、日期、边界处理）
+
+**示例**：
+```python
+# 获取包含rules的市场数据
+markets = client.get_markets_by_tag_slug("crypto")
+
+# 访问rules信息
+for m in markets:
+    rules = m.full_description  # 优先使用event_description
+    # 将rules传递给LLM和向量化系统
+```
+
 ## Project Guidance
 
 **`docs/PROJECT_BIBLE.md` is the authoritative guide** for all project work. It contains:

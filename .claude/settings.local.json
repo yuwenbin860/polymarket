@@ -23,7 +23,17 @@
       "Bash(\"D:\\\\work\\\\polymarket\\\\.venv\\\\Scripts\\\\pip.exe\" install:*)",
       "Bash(\"D:/work/polymarket/.venv/Scripts/pip\" install numpy)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(chcp:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(tee:*)",
+      "Bash(D:workpolymarket.venvScriptspython.exe local_scanner_v2.py --semantic --domain crypto --threshold 0.85)",
+      "Bash(.venvScriptspython.exe local_scanner_v2.py --semantic --domain crypto --threshold 0.85)",
+      "Bash(cat:*)",
+      "mcp__web-reader__webReader",
+      "Bash(curl:*)",
+      "Bash(git -C D:workpolymarket status)",
+      "Bash(git -C D:\\\\work\\\\polymarket log:*)"
     ]
   }
 }

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Polymarket 组合套利系统 - 本地完整版 v2
 ========================================
@@ -33,9 +34,16 @@ import requests
 import json
 import os
 import sys
+import io
 import argparse
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict, Tuple
+
+# ============================================================
+# UTF-8编码配置 - 已通过emoji→ASCII替换解决编码问题
+# ============================================================
+# 注意：由于io.TextIOWrapper会导致stderr关闭问题，
+# 我们采用更简单的方案：所有emoji已替换为ASCII字符
 from datetime import datetime
 from enum import Enum
 
@@ -70,13 +78,18 @@ class RelationType(Enum):
     EXHAUSTIVE = "exhaustive"
     UNRELATED = "unrelated"
 
+    # ✅ 新增: 区间关系类型
+    INTERVAL_COVERS = "interval_covers"      # A的区间覆盖B（B是A的子集）
+    INTERVAL_SUBSET = "interval_subset"      # A是B的子集
+    INTERVAL_OVERLAP = "interval_overlap"    # 区间重叠
+
 
 @dataclass
 class Market:
     id: str
     condition_id: str
     question: str
-    description: str
+    description: str              # Market-level description (legacy, may be empty)
     yes_price: float              # 中间价/参考价 (展示用)
     no_price: float               # 1 - yes_price (展示用)
     volume: float
@@ -92,8 +105,24 @@ class Market:
     spread: float = 0.0           # 价差 = ask - bid
     token_id: str = ""            # CLOB token ID (用于获取订单簿)
 
+    # ✅ 新增: Rules分析相关字段
+    event_description: str = ""   # Event的description (包含resolution rules!)
+    market_description: str = ""  # Market自己的description
+    tags: List[Dict] = None       # Event的tags (用于分类过滤)
+
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
+
     def __repr__(self):
         return f"Market('{self.question[:50]}...', YES=${self.yes_price:.2f}, spread={self.spread:.3f})"
+
+    @property
+    def full_description(self) -> str:
+        """获取完整的描述信息（优先使用event_description）"""
+        if self.event_description:
+            return self.event_description
+        return self.market_description or self.description
 
     @property
     def effective_buy_price(self) -> float:
@@ -170,8 +199,17 @@ class PolymarketClient:
             print(f"API请求失败: {e}")
             return []
     
-    def _parse_market(self, data: Dict) -> Optional[Market]:
-        """解析市场数据"""
+    def _parse_market(self, data: Dict, event_data: Dict = None) -> Optional[Market]:
+        """
+        解析市场数据
+
+        Args:
+            data: Market API返回的数据
+            event_data: Event API返回的数据（如果从events端点获取）
+
+        Returns:
+            Market对象或None
+        """
         try:
             outcome_prices = data.get('outcomePrices', '["0.5","0.5"]')
             if isinstance(outcome_prices, str):
@@ -199,11 +237,24 @@ class PolymarketClient:
             # YES token 是第一个
             yes_token_id = token_ids[0] if token_ids else ""
 
+            # ✅ 新增: 提取Event级别的description和tags
+            event_description = ""
+            tags = []
+            if event_data:
+                event_description = event_data.get('description', '')
+                tags = event_data.get('tags', [])
+
+            # ✅ 新增: Market自己的description
+            market_description = data.get('description', '')
+
+            # 兼容旧的description字段
+            description = market_description or event_description
+
             return Market(
                 id=data.get('id', ''),
                 condition_id=data.get('conditionId', ''),
                 question=data.get('question', ''),
-                description=data.get('description', ''),
+                description=description,
                 yes_price=yes_price,
                 no_price=1 - yes_price,
                 volume=float(data.get('volume', 0) or 0),
@@ -213,7 +264,10 @@ class PolymarketClient:
                 event_title=data.get('groupItemTitle', '') or data.get('eventSlug', '') or '',
                 resolution_source=data.get('resolutionSource', ''),
                 outcomes=outcomes,
-                token_id=yes_token_id
+                token_id=yes_token_id,
+                event_description=event_description,
+                market_description=market_description,
+                tags=tags
             )
         except Exception:
             return None
@@ -281,6 +335,129 @@ class PolymarketClient:
         market.spread = orderbook["spread"]
 
         return market
+
+    # ============================================================
+    # ✅ 新增: 按Tag获取Events和Markets
+    # ============================================================
+
+    def get_events_by_tag(
+        self,
+        tag_id: str,
+        active: bool = True,
+        limit: int = 100
+    ) -> List[Dict]:
+        """
+        按tag_id获取events
+
+        Args:
+            tag_id: Tag ID (e.g., "21" for crypto)
+            active: 是否只返回活跃事件
+            limit: 返回数量限制
+
+        Returns:
+            Event字典列表
+        """
+        try:
+            params = {
+                "tag_id": tag_id,
+                "limit": limit
+            }
+            if active is not None:
+                params["active"] = str(active).lower()
+
+            url = f"{self.base_url}/events"
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            print(f"获取events失败 (tag_id={tag_id}): {e}")
+            return []
+
+    def get_markets_by_tag(
+        self,
+        tag_id: str,
+        active: bool = True,
+        limit: int = 100,
+        min_liquidity: float = 0
+    ) -> List[Market]:
+        """
+        按tag_id获取所有相关markets
+
+        这是从events端点获取的，因此每个market都会包含
+        event_description和tags信息。
+
+        Args:
+            tag_id: Tag ID (e.g., "21" for crypto)
+            active: 是否只返回活跃市场
+            limit: 返回数量限制
+            min_liquidity: 最小流动性过滤
+
+        Returns:
+            Market列表（包含event_description和tags）
+        """
+        markets = []
+
+        events = self.get_events_by_tag(tag_id, active=active, limit=limit)
+
+        for event in events:
+            event_data = {
+                "id": event.get("id"),
+                "title": event.get("title"),
+                "description": event.get("description", ""),
+                "tags": event.get("tags", []),
+                "resolutionSource": event.get("resolutionSource", "")
+            }
+
+            for market_data in event.get("markets", []):
+                market = self._parse_market(market_data, event_data)
+                if market:
+                    # 流动性过滤
+                    if min_liquidity > 0 and market.liquidity < min_liquidity:
+                        continue
+                    markets.append(market)
+
+        return markets
+
+    def get_markets_by_tag_slug(
+        self,
+        slug: str,
+        active: bool = True,
+        limit: int = 100,
+        min_liquidity: float = 0
+    ) -> List[Market]:
+        """
+        按tag slug获取所有相关markets（便捷方法）
+
+        Args:
+            slug: Tag slug (e.g., "crypto", "politics")
+            active: 是否只返回活跃市场
+            limit: 返回数量限制
+            min_liquidity: 最小流动性过滤
+
+        Returns:
+            Market列表
+        """
+        # 首先获取tag_id
+        try:
+            url = f"{self.base_url}/tags/slug/{slug}"
+            response = self.session.get(url, timeout=10)
+            if response.status_code != 200:
+                print(f"Tag not found: {slug}")
+                return []
+            tag_data = response.json()
+            tag_id = tag_data.get("id")
+            if not tag_id:
+                print(f"Tag ID not found for: {slug}")
+                return []
+        except Exception as e:
+            print(f"Error fetching tag {slug}: {e}")
+            return []
+
+        return self.get_markets_by_tag(tag_id, active=active, limit=limit, min_liquidity=min_liquidity)
+
+    # ============================================================
+    # 原有方法
+    # ============================================================
 
     def get_markets_with_orderbook(self, limit: int = 100, active: bool = True,
                                    min_liquidity: float = 0, fetch_orderbook: bool = True) -> List[Market]:
@@ -369,7 +546,7 @@ class PolymarketClient:
         # 按流动性排序（降序）
         all_markets.sort(key=lambda m: m.liquidity, reverse=True)
 
-        logging.info(f"✅ 总共找到 {len(all_markets)} 个加密货币市场（去重后）")
+        logging.info(f"[OK] 总共找到 {len(all_markets)} 个加密货币市场（去重后）")
 
         return all_markets
 
@@ -520,7 +697,7 @@ class MarketCache:
 
         # 尝试从缓存加载
         if self._is_cache_valid(cache_file):
-            logging.info(f"✅ 从缓存加载 {domain} 市场数据")
+            logging.info(f"[CACHE] 从缓存加载 {domain} 市场数据")
             markets = self._load_cache(cache_file)
             if markets:
                 return markets
@@ -630,11 +807,11 @@ class LLMAnalyzer:
                 self._init_from_auto_detect(model_override)
 
         except ValueError as e:
-            print(f"⚠️ LLM初始化失败: {e}")
+            print(f"[WARNING] LLM初始化失败: {e}")
             print("   将使用规则匹配替代LLM分析")
             self.use_llm = False
         except Exception as e:
-            print(f"⚠️ LLM初始化异常: {e}")
+            print(f"[WARNING] LLM初始化异常: {e}")
             self.use_llm = False
 
     def _init_from_profile(self, profile_name: str, model_override: str = None):
@@ -658,7 +835,7 @@ class LLMAnalyzer:
         )
         self.profile_name = profile_name
         self.model_name = model
-        print(f"✅ LLM已初始化 (--profile): {profile_name} / {model}")
+        print(f"[OK] LLM已初始化 (--profile): {profile_name} / {model}")
 
     def _init_from_config(self, config: AppConfig, model_override: str = None):
         """从config.json初始化"""
@@ -690,7 +867,7 @@ class LLMAnalyzer:
             temperature=config.llm.temperature,
         )
         self.model_name = self.client.config.model
-        print(f"✅ LLM已初始化 (config.json): {provider} / {self.client.config.model}")
+        print(f"[OK] LLM已初始化 (config.json): {provider} / {self.client.config.model}")
 
     def _init_from_auto_detect(self, model_override: str = None):
         """自动检测可用的LLM配置"""
@@ -716,7 +893,7 @@ class LLMAnalyzer:
         )
         self.profile_name = profile.name
         self.model_name = model
-        print(f"✅ LLM已初始化 (自动检测): {profile.name} / {model}")
+        print(f"[OK] LLM已初始化 (自动检测): {profile.name} / {model}")
     
     def analyze(self, market_a: Market, market_b: Market) -> Dict:
         """分析两个市场的逻辑关系"""
@@ -796,7 +973,7 @@ class LLMAnalyzer:
         is_consistent, consistency_error = self._validate_llm_response_consistency(temp_result)
 
         if not is_consistent:
-            print(f"    ⚠️ LLM输出一致性检查失败: {consistency_error}")
+            print(f"    [WARNING] LLM输出一致性检查失败: {consistency_error}")
             print(f"       降级为 INDEPENDENT 以防止假套利")
             # 降级为 INDEPENDENT
             relationship = "INDEPENDENT"
@@ -807,10 +984,10 @@ class LLMAnalyzer:
         inconsistency_detected = False
 
         if relationship == "IMPLIES_AB" and "IMPLIES_BA" in reasoning_upper:
-            print(f"    ⚠️ LLM响应不一致: relationship={relationship}, 但reasoning提到IMPLIES_BA")
+            print(f"    [WARNING] LLM响应不一致: relationship={relationship}, 但reasoning提到IMPLIES_BA")
             inconsistency_detected = True
         elif relationship == "IMPLIES_BA" and "IMPLIES_AB" in reasoning_upper and "IMPLIES_BA" not in reasoning_upper:
-            print(f"    ⚠️ LLM响应不一致: relationship={relationship}, 但reasoning提到IMPLIES_AB")
+            print(f"    [WARNING] LLM响应不一致: relationship={relationship}, 但reasoning提到IMPLIES_AB")
             inconsistency_detected = True
 
         # 如果检测到不一致，降低置信度
@@ -981,16 +1158,97 @@ class LLMAnalyzer:
 
 class ArbitrageDetector:
     """套利机会检测器"""
-    
-    def __init__(self, config: AppConfig):
+
+    def __init__(self, config: AppConfig, llm_analyzer: 'LLMAnalyzer' = None):
         self.min_profit_pct = config.scan.min_profit_pct
         self.min_confidence = config.scan.min_confidence
 
         # ✅ 新增：初始化数学验证器
         self.math_validator = MathValidator()
-        print(f"✅ MathValidator 已初始化")
-    
-    def check_pair(self, market_a: Market, market_b: Market, 
+        print(f"[OK] MathValidator 已初始化")
+
+        # ✅ 新增：LLM 分析器引用（用于完备集验证）
+        self.llm_analyzer = llm_analyzer
+
+    def verify_exhaustive_set_with_llm(self, markets: List[Market]) -> Dict:
+        """
+        使用 LLM 验证市场组是否构成完备集
+
+        Args:
+            markets: 待验证的市场列表
+
+        Returns:
+            验证结果字典：
+            {
+                "is_valid": bool,
+                "is_mutually_exclusive": bool,
+                "is_complete": bool,
+                "missing_options": [],
+                "overlap_risks": [],
+                "confidence": float,
+                "reasoning": str
+            }
+        """
+        if not self.llm_analyzer or not self.llm_analyzer.use_llm:
+            # 没有 LLM，返回默认通过（依赖规则验证）
+            return {
+                "is_valid": True,
+                "confidence": 0.5,
+                "reasoning": "未配置LLM，跳过语义验证"
+            }
+
+        # 构建验证 Prompt
+        from prompts import format_exhaustive_prompt
+
+        event_title = markets[0].event_title or markets[0].event_id or "未知事件"
+        markets_dict = [
+            {"question": m.question, "yes_price": m.yes_price}
+            for m in markets
+        ]
+        total_price = sum(m.yes_price for m in markets)
+
+        prompt = format_exhaustive_prompt(event_title, markets_dict, total_price)
+
+        try:
+            response = self.llm_analyzer.client.chat(prompt)
+            content = response.content
+
+            # 提取 JSON
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+
+            result = json.loads(content.strip())
+
+            # 标准化结果
+            return {
+                "is_valid": result.get("is_valid_exhaustive_set", False),
+                "is_mutually_exclusive": result.get("is_mutually_exclusive", False),
+                "is_complete": result.get("is_complete", False),
+                "missing_options": result.get("missing_options", []),
+                "overlap_risks": result.get("overlap_risks", []),
+                "confidence": result.get("confidence", 0.5),
+                "reasoning": result.get("reasoning", ""),
+                "arbitrage_safe": result.get("arbitrage_safe", False)
+            }
+
+        except json.JSONDecodeError as e:
+            print(f"    [WARNING] LLM完备集验证JSON解析失败: {e}")
+            return {
+                "is_valid": False,
+                "confidence": 0.0,
+                "reasoning": f"JSON解析失败: {e}"
+            }
+        except Exception as e:
+            print(f"    [WARNING] LLM完备集验证失败: {e}")
+            return {
+                "is_valid": False,
+                "confidence": 0.0,
+                "reasoning": f"验证失败: {e}"
+            }
+
+    def check_pair(self, market_a: Market, market_b: Market,
                    analysis: Dict) -> Optional[ArbitrageOpportunity]:
         """检查市场对是否存在套利"""
         rel = analysis.get("relationship", "UNRELATED")
@@ -1009,9 +1267,25 @@ class ArbitrageDetector:
         if len(markets) < 2:
             return None
 
+        # =====================================
+        # 关键验证：Event ID 一致性检查
+        # =====================================
+        # 真正的完备集必须来自同一个 event_id
+        # 例如：同一个选举的不同候选人，或同一资产的不同价格区间
+        event_ids = set(m.event_id for m in markets if m.event_id)
+        if len(event_ids) > 1:
+            print(f"    [SKIP] 完备集检测：event_id 不一致 ({len(event_ids)} 个不同的 event_id)")
+            return None  # 不同 event 的市场不可能构成完备集
+
+        # 如果没有 event_id，需要通过 LLM 验证
+        if len(event_ids) == 0:
+            print(f"    [SKIP] 完备集检测：缺少 event_id，无法验证完备集")
+            return None
+
         # 验证1: 检查结算来源一致性
         sources = set(m.resolution_source for m in markets if m.resolution_source)
         if len(sources) > 1:
+            print(f"    [SKIP] 完备集检测：结算来源不一致 ({sources})")
             return None  # 结算来源不一致，可能不是真正的完备集
 
         # 验证2: 检查结算日期一致性（已在 _group_by_event 中处理，这里再次确认）
@@ -1021,6 +1295,7 @@ class ArbitrageDetector:
                 date_part = m.end_date.split('T')[0] if 'T' in m.end_date else m.end_date
                 dates.add(date_part)
         if len(dates) > 1:
+            print(f"    [SKIP] 完备集检测：结算日期不一致 ({dates})")
             return None  # 结算日期不一致
 
         # 陷阱1修复: 使用真实的 best_ask 计算成本
@@ -1036,7 +1311,23 @@ class ArbitrageDetector:
             if real_profit_pct < self.min_profit_pct:
                 return None
 
-            # 验证3: 利润率合理性检查
+            # =====================================
+            # 验证3: LLM 完备集语义验证
+            # =====================================
+            print(f"    [LLM] 验证完备集语义...")
+            llm_verification = self.verify_exhaustive_set_with_llm(markets)
+
+            if not llm_verification.get("is_valid", False):
+                print(f"    [SKIP] LLM验证失败: {llm_verification.get('reasoning', '未知原因')}")
+                if llm_verification.get("missing_options"):
+                    print(f"       遗漏选项: {llm_verification.get('missing_options')}")
+                if llm_verification.get("overlap_risks"):
+                    print(f"       重叠风险: {llm_verification.get('overlap_risks')}")
+                return None
+
+            print(f"    [OK] LLM验证通过 (置信度: {llm_verification.get('confidence', 0):.0%})")
+
+            # 验证4: 利润率合理性检查
             needs_extra_review = []
             if real_profit_pct > 100:
                 needs_extra_review.append("!! 利润率超过100%，请重点验证数据准确性")
@@ -1083,32 +1374,47 @@ class ArbitrageDetector:
 
         # ✅ 新增：LLM 输出一致性检查
         if not analysis.get("is_consistent", True):
-            print(f"    ⚠️ LLM 输出不一致，跳过套利检测")
+            print(f"    [WARNING] LLM 输出不一致，跳过套利检测")
             print(f"       错误: {analysis.get('consistency_error', 'Unknown')}")
             return None
 
         # ✅ 新增：数据有效性检查
         if not self._validate_market_data(implying, implied):
-            print(f"    ❌ 数据有效性检查失败，跳过套利检测")
+            print(f"    [ERROR] 数据有效性检查失败，跳过套利检测")
             return None
 
         # ✅ 新增：调用 MathValidator 验证数学约束
         relation_type = analysis.get("relationship", "")
-        reasoning = analysis.get("reasoning", "")
 
-        validation_result = self.math_validator.validate_implication(
-            market_a=implying.__dict__,
-            market_b=implied.__dict__,
-            relation_type=relation_type,
-            reasoning=reasoning
+        # 将Market对象转换为MarketData
+        from validators import MarketData
+        implying_data = MarketData(
+            id=implying.id,
+            question=implying.question,
+            yes_price=implying.yes_price,
+            no_price=implying.no_price,
+            liquidity=implying.liquidity
+        )
+        implied_data = MarketData(
+            id=implied.id,
+            question=implied.question,
+            yes_price=implied.yes_price,
+            no_price=implied.no_price,
+            liquidity=implied.liquidity
         )
 
-        if not validation_result['is_valid']:
-            print(f"    ❌ 数学验证失败: {validation_result['message']}")
-            print(f"       验证详情: {validation_result.get('details', {})}")
+        validation_result = self.math_validator.validate_implication(
+            market_a=implying_data,
+            market_b=implied_data,
+            relation=relation_type  # 注意参数名是 relation 不是 relation_type
+        )
+
+        if validation_result.result.value != 'PASSED':
+            print(f"    [ERROR] 数学验证失败: {validation_result.reason}")
+            print(f"       验证详情: {validation_result.details}")
             return None
         else:
-            print(f"    ✅ 数学验证通过: {validation_result['message']}")
+            print(f"    [OK] 数学验证通过: {validation_result.reason}")
 
         # ✅ Priority 2: 时间一致性验证
         if relation_type in ['IMPLIES_AB', 'IMPLIES_BA']:
@@ -1144,15 +1450,15 @@ class ArbitrageDetector:
 
             # 使用 .result.value 获取字符串值
             if time_validation.result.value == 'FAILED':
-                print(f"    ❌ 时间一致性验证失败: {time_validation.reason}")
+                print(f"    [ERROR] 时间一致性验证失败: {time_validation.reason}")
                 print(f"       结算时间: {implying.end_date} vs {implied.end_date}")
                 return None
             elif time_validation.result.value == 'NEEDS_REVIEW':
-                print(f"    ⚠️  时间一致性验证: {time_validation.reason}")
+                print(f"    [WARNING] 时间一致性验证: {time_validation.reason}")
                 # 时间不一致的蕴含关系通常是误判，但仍返回 None
                 return None
             else:
-                print(f"    ✅ 时间一致性验证通过: {time_validation.reason}")
+                print(f"    [OK] 时间一致性验证通过: {time_validation.reason}")
 
         # ✅ Priority 2: 语义验证
         is_semantically_valid, semantic_msg = self._validate_arbitrage_semantics(
@@ -1162,14 +1468,14 @@ class ArbitrageDetector:
         )
 
         if not is_semantically_valid:
-            print(f"    ⚠️  语义验证失败: {semantic_msg}")
+            print(f"    [WARNING] 语义验证失败: {semantic_msg}")
             print(f"       建议: 人工复核此机会")
             # 语义验证失败时，降低置信度但不直接拒绝
             confidence = analysis.get("confidence", 0.8) * 0.7
             analysis["confidence"] = confidence
             analysis["semantic_warning"] = semantic_msg
         else:
-            print(f"    ✅ 语义验证通过: {semantic_msg}")
+            print(f"    [OK] 语义验证通过: {semantic_msg}")
 
         # 检查 LLM 响应是否存在不一致（原有逻辑，保留作为双重检查）
         if analysis.get("inconsistency_detected", False):
@@ -1260,33 +1566,33 @@ class ArbitrageDetector:
         for market, name in [(market_a, 'A'), (market_b, 'B')]:
             # YES 价格检查
             if market.yes_price == 0.0 or market.yes_price is None:
-                print(f"    ❌ 市场 {name} YES 价格无效: {market.yes_price}")
+                print(f"    [ERROR] 市场 {name} YES 价格无效: {market.yes_price}")
                 return False
 
             if not (0.0 <= market.yes_price <= 1.0):
-                print(f"    ❌ 市场 {name} YES 价格超出范围: {market.yes_price}")
+                print(f"    [ERROR] 市场 {name} YES 价格超出范围: {market.yes_price}")
                 return False
 
             # NO 价格检查
             if market.no_price == 0.0 or market.no_price is None:
-                print(f"    ❌ 市场 {name} NO 价格无效: {market.no_price}")
+                print(f"    [ERROR] 市场 {name} NO 价格无效: {market.no_price}")
                 return False
 
             if not (0.0 <= market.no_price <= 1.0):
-                print(f"    ❌ 市场 {name} NO 价格超出范围: {market.no_price}")
+                print(f"    [ERROR] 市场 {name} NO 价格超出范围: {market.no_price}")
                 return False
 
             # 流动性检查
             if market.liquidity <= 0:
-                print(f"    ❌ 市场 {name} 流动性为 0: {market.liquidity}")
+                print(f"    [ERROR] 市场 {name} 流动性为 0: {market.liquidity}")
                 return False
 
             # Question 检查
             if not market.question or market.question.strip() == '':
-                print(f"    ❌ 市场 {name} question 为空")
+                print(f"    [ERROR] 市场 {name} question 为空")
                 return False
 
-        print(f"    ✅ 数据有效性检查通过")
+        print(f"    [OK] 数据有效性检查通过")
         return True
 
     def _validate_arbitrage_semantics(
@@ -1408,6 +1714,123 @@ class ArbitrageDetector:
             timestamp=datetime.now().isoformat()
         )
 
+    # ============================================================
+    # ✅ 新增: 区间套利检测
+    # ============================================================
+
+    def check_interval_arbitrage(
+        self,
+        market_a: Market,
+        market_b: Market,
+        interval_analysis: Dict = None
+    ) -> Optional[ArbitrageOpportunity]:
+        """
+        检测区间套利机会
+
+        Solana区间套利示例：
+            - 市场A: "Solana price on Jan 4?" (完备集事件)
+              - 子市场A1: "< 130" → YES = 4.6c
+            - 市场B: "Solana above 130 on Jan 4?"
+              - YES = 94.8c, NO = 5.2c
+            - 套利: 买A1的YES + 买B的YES = 4.6 + 94.8 = 99.4c → 保证回报$1
+
+        套利逻辑：
+            - 如果区间A和区间B形成覆盖关系（如A是[0,130]，B是[130,∞)）
+            - 买A的YES + 买B的YES，无论结果如何，至少一个会赢
+            - 成本 = P(A) + P(B)，如果 < 1，则存在套利
+
+        Args:
+            market_a: 市场A
+            market_b: 市场B
+            interval_analysis: 预先计算的区间分析结果（可选）
+
+        Returns:
+            套利机会或None
+        """
+        # 导入区间解析器
+        from interval_parser import IntervalParser, IntervalRelation
+
+        parser = IntervalParser()
+
+        # 解析区间
+        interval_a = parser.parse(
+            market_a.question,
+            market_a.full_description  # 使用full_description获取rules
+        )
+        interval_b = parser.parse(
+            market_b.question,
+            market_b.full_description
+        )
+
+        if not interval_a or not interval_b:
+            return None
+
+        # 比较区间关系
+        relation = parser.compare_intervals(interval_a, interval_b)
+
+        # 只处理覆盖关系（互补区间）
+        if relation not in [
+            IntervalRelation.A_COVERS_B,
+            IntervalRelation.B_COVERS_A
+        ]:
+            return None
+
+        # 检查套利条件：
+        # 对于互补区间（如A=[0,130], B=[130,∞)），买A的YES + 买B的YES
+        # 成本 = P(A) + P(B)，如果 < 1，则存在套利
+
+        price_a = market_a.effective_buy_price
+        price_b = market_b.effective_buy_price
+        total_cost = price_a + price_b
+
+        if total_cost >= 0.98:  # 允许2%的滑点
+            return None
+
+        profit = 1.0 - total_cost
+        profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
+
+        if profit_pct < self.min_profit_pct:
+            return None
+
+        # 确定哪个市场是覆盖区间，哪个是被覆盖区间
+        if relation == IntervalRelation.A_COVERS_B:
+            covering, covered = market_a, market_b
+            covering_interval, covered_interval = interval_a, interval_b
+        else:
+            covering, covered = market_b, market_a
+            covering_interval, covered_interval = interval_b, interval_a
+
+        # 生成套利机会
+        return ArbitrageOpportunity(
+            id=f"interval_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            type="INTERVAL_ARBITRAGE",
+            markets=[
+                {"id": market_a.id, "question": market_a.question, "yes_price": market_a.yes_price,
+                 "interval": str(interval_a), "best_ask": market_a.best_ask},
+                {"id": market_b.id, "question": market_b.question, "yes_price": market_b.yes_price,
+                 "interval": str(interval_b), "best_ask": market_b.best_ask}
+            ],
+            relationship="interval_complementary",
+            confidence=0.80,
+            total_cost=total_cost,
+            guaranteed_return=1.0,
+            profit=profit,
+            profit_pct=profit_pct,
+            action=f"买 '{market_a.question[:50]}...' YES @ ${price_a:.3f}\n"
+                   f"买 '{market_b.question[:50]}...' YES @ ${price_b:.3f}",
+            reasoning=f"区间互补套利：{covering_interval} 和 {covered_interval} 形成互补区间",
+            edge_cases=[
+                "检查边界值处理（恰好等于阈值时如何结算）",
+                "确认两个市场的结算规则一致",
+                "确认结算时间相同"
+            ],
+            needs_review=[
+                "验证区间边界不会导致两者同时为YES或NO",
+                f"中间价利润: {((1.0 - (market_a.yes_price + market_b.yes_price)) / (market_a.yes_price + market_b.yes_price) * 100):.1f}% vs 实际利润: {profit_pct:.1f}%",
+            ],
+            timestamp=datetime.now().isoformat()
+        )
+
 
 # ============================================================
 # 相似度筛选器
@@ -1492,7 +1915,8 @@ class ArbitrageScanner:
         # 基础组件
         self.client = PolymarketClient()
         self.analyzer = LLMAnalyzer(config, profile_name=profile_name, model_override=model_override)
-        self.detector = ArbitrageDetector(config)
+        # ✅ 传入 LLM 分析器，用于完备集语义验证
+        self.detector = ArbitrageDetector(config, llm_analyzer=self.analyzer)
 
         # 🆕 向量化组件
         if self.use_semantic:
@@ -1539,7 +1963,7 @@ class ArbitrageScanner:
                 opp = self.detector.check_exhaustive_set(group)
                 if opp:
                     opportunities.append(opp)
-                    print(f"        🎯 发现套利! 利润={opp.profit_pct:.2f}%")
+                    print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
         
         # Step 3: 分析相似市场对
         print("\n[3/4] 分析逻辑关系...")
@@ -1571,7 +1995,7 @@ class ArbitrageScanner:
             opp = self.detector.check_pair(m1, m2, analysis)
             if opp:
                 opportunities.append(opp)
-                print(f"        🎯 发现套利! 利润={opp.profit_pct:.2f}%")
+                print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
         
         # Step 4: 生成报告
         print("\n[4/4] 生成报告...")
@@ -1602,32 +2026,31 @@ class ArbitrageScanner:
         Returns:
             套利机会列表
         """
-        logging.info(f"🚀 开始向量化套利扫描 - 领域: {domain}")
+        logging.info(f"[START] 开始向量化套利扫描 - 领域: {domain}")
 
         # Step 1: 获取领域内所有市场（带缓存）
-        logging.info("📥 Step 1: 获取市场数据...")
+        logging.info("[Step 1] 获取市场数据...")
         all_markets = self._fetch_domain_markets(domain)
 
         if not all_markets:
-            logging.warning("❌ 未获取到市场数据")
+            logging.warning("[ERROR] 未获取到市场数据")
             return []
 
-        logging.info(f"✅ 获取到 {len(all_markets)} 个市场")
+        logging.info(f"[OK] 获取到 {len(all_markets)} 个市场")
 
         # Step 2: 批量向量化
-        logging.info(f"🧮 Step 2: 向量化 {len(all_markets)} 个市场...")
+        logging.info(f"[Step 2] 向量化 {len(all_markets)} 个市场...")
         questions = [m.question for m in all_markets]
         embeddings = self.semantic_clusterer.get_embeddings(questions)
-        logging.info(f"✅ 向量化完成")
+        logging.info(f"[OK] 向量化完成")
 
         # Step 3: 语义聚类
-        logging.info(f"🔗 Step 3: 语义聚类 (threshold={semantic_threshold})...")
+        logging.info(f"[Step 3] 语义聚类 (threshold={semantic_threshold})...")
         clusters = self.semantic_clusterer.cluster_markets(
             all_markets,
-            threshold=semantic_threshold,
-            embeddings=embeddings
+            similarity_threshold=semantic_threshold
         )
-        logging.info(f"✅ 生成 {len(clusters)} 个语义聚类")
+        logging.info(f"[OK] 生成 {len(clusters)} 个语义聚类")
 
         # 打印聚类摘要
         for i, cluster in enumerate(clusters):
@@ -1650,11 +2073,29 @@ class ArbitrageScanner:
             logging.info(f"  📦 聚类 {i+1}/{len(clusters)} ({len(cluster)} 个市场)")
 
             # 4.1 聚类内完备集检测
-            opps = self.detector.check_exhaustive_set(cluster)
-            if opps:
-                opportunities.extend(opps)
-                for opp in opps:
-                    logging.info(f"    🎯 完备集套利! 利润={opp.profit_pct:.2f}%")
+            # =====================================
+            # 关键改进：先按 event_id 分组，只对同一 event 的市场检测完备集
+            # 语义聚类只是基于文本相似度，不代表逻辑上的完备集
+            # =====================================
+            event_groups = {}
+            for m in cluster:
+                if m.event_id:
+                    event_groups.setdefault(m.event_id, []).append(m)
+
+            # 对每个 event 组单独检测完备集
+            for event_id, event_markets in event_groups.items():
+                if len(event_markets) >= 2:
+                    logging.info(f"    检测完备集: event_id={event_id[:30]}... ({len(event_markets)} 个市场)")
+                    opps = self.detector.check_exhaustive_set(event_markets)
+                    if opps:
+                        # 确保opps是列表
+                        if isinstance(opps, list):
+                            opportunities.extend(opps)
+                            for opp in opps:
+                                logging.info(f"    [ARBITRAGE] 完备集套利! 利润={opp.profit_pct:.2f}%")
+                        else:
+                            opportunities.append(opps)  # 单个对象
+                            logging.info(f"    [ARBITRAGE] 完备集套利! 利润={opps.profit_pct:.2f}%")
 
             # 4.2 聚类内全对LLM分析
             cluster_opps = self._analyze_cluster_fully(
@@ -1662,19 +2103,23 @@ class ArbitrageScanner:
                 cluster_id=i,
                 max_llm_calls=max_llm_calls - llm_call_count
             )
-            opportunities.extend(cluster_opps)
+            if cluster_opps:  # 确保cluster_opps是列表
+                if isinstance(cluster_opps, list):
+                    opportunities.extend(cluster_opps)
+                else:
+                    opportunities.append(cluster_opps)  # 如果是单个对象，添加它
             llm_call_count += len(cluster) * (len(cluster) - 1) // 2  # 估算
 
             if llm_call_count >= max_llm_calls:
-                logging.warning(f"⚠️ 达到LLM调用限制 ({max_llm_calls})")
+                logging.warning(f"[WARNING] 达到LLM调用限制 ({max_llm_calls})")
                 break
 
         # Step 5: 生成报告
-        logging.info("📊 Step 5: 生成报告...")
+        logging.info("[Step 5] 生成报告...")
         self._save_report(opportunities, domain=domain)
         self._print_summary(opportunities)
 
-        logging.info(f"✨ 扫描完成: 发现 {len(opportunities)} 个套利机会")
+        logging.info(f"[DONE] 扫描完成: 发现 {len(opportunities)} 个套利机会")
 
         return opportunities
 
@@ -1761,7 +2206,7 @@ class ArbitrageScanner:
                     opp = self.detector.check_pair(m1, m2, analysis)
                     if opp:
                         opportunities.append(opp)
-                        logging.info(f"    🎯 发现套利! 利润={opp.profit_pct:.2f}%")
+                        logging.info(f"    [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
 
         return opportunities
 
@@ -1856,8 +2301,8 @@ class ArbitrageScanner:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
-        logging.info(f"✅ 报告已保存到 {output_file}")
-        print(f"      ✅ 报告已保存到 {output_file}")
+        logging.info(f"[OK] 报告已保存到 {output_file}")
+        print(f"      [OK] 报告已保存到 {output_file}")
     
     def _print_summary(self, opportunities: List[ArbitrageOpportunity]):
         """打印摘要"""
@@ -1870,7 +2315,7 @@ class ArbitrageScanner:
             print("这很正常——好机会不是时时都有\n")
             return
 
-        print(f"\n🎯 发现 {len(opportunities)} 个潜在套利机会:\n")
+        print(f"\n[RESULT] 发现 {len(opportunities)} 个潜在套利机会:\n")
 
         for i, opp in enumerate(opportunities, 1):
             print(f"{'─' * 60}")
@@ -1892,22 +2337,22 @@ class ArbitrageScanner:
                 print(f"     {link}")
 
             # ✅ 新增：人工验证清单
-            print(f"\n⚠️  人工验证清单:")
-            print(f"  ☐ 验证逻辑关系是否正确: {opp.type}")
-            print(f"  ☐ 检查结算规则是否兼容")
+            print(f"\n[WARNING] 人工验证清单:")
+            print(f"  [ ] 验证逻辑关系是否正确: {opp.type}")
+            print(f"  [ ] 检查结算规则是否兼容")
 
             # 如果有两个市场，显示结算时间对比
             if len(opp.markets) >= 2:
                 market_1 = opp.markets[0]
                 market_2 = opp.markets[1]
-                print(f"  ☐ 在 Polymarket 上确认当前价格")
-                print(f"  ☐ 检查流动性: ${market_1.get('yes_price', 0):.2f} vs ${market_2.get('yes_price', 0):.2f}")
-            print(f"  ☐ 检查是否有特殊规则（如提前结算）")
-            print(f"  ☐ 验证 LLM 分析的合理性")
+                print(f"  [ ] 在 Polymarket 上确认当前价格")
+                print(f"  [ ] 检查流动性: ${market_1.get('yes_price', 0):.2f} vs ${market_2.get('yes_price', 0):.2f}")
+            print(f"  [ ] 检查是否有特殊规则（如提前结算）")
+            print(f"  [ ] 验证 LLM 分析的合理性")
 
             # 原有的 needs_review 内容
             if opp.needs_review:
-                print(f"\n📋 额外注意事项:")
+                print(f"\n[NOTE] 额外注意事项:")
                 for item in opp.needs_review:
                     print(f"  • {item}")
 
@@ -2018,7 +2463,7 @@ def main():
     try:
         # 🆕 根据模式选择扫描方法
         if args.semantic:
-            logging.info(f"🚀 启动向量化模式 - 领域: {args.domain}, 阈值: {args.threshold}")
+            logging.info(f"[START] 启动向量化模式 - 领域: {args.domain}, 阈值: {args.threshold}")
             opportunities = scanner.scan_semantic(
                 domain=args.domain,
                 semantic_threshold=args.threshold
