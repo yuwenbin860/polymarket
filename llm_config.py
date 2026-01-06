@@ -195,6 +195,24 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
             "meta-llama/llama-3.1-70b-instruct",
         ]
     ),
+
+    # ModelScope - 阿里云模型托管平台
+    "modelscope": LLMProfile(
+        name="modelscope",
+        provider="modelscope",
+        api_base="https://api-inference.modelscope.cn/v1",
+        api_key_env="MODELSCOPE_API_KEY",
+        model="Qwen/Qwen2.5-72B-Instruct",
+        description="ModelScope - 阿里云模型托管平台",
+        models_available=[
+            "Qwen/Qwen2.5-72B-Instruct",
+            "Qwen/Qwen2.5-32B-Instruct",
+            "Qwen/Qwen2.5-14B-Instruct",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "deepseek-ai/DeepSeek-V3",
+            "deepseek-ai/DeepSeek-R1",
+        ]
+    ),
 }
 
 
@@ -257,13 +275,13 @@ class LLMConfigManager:
     def detect_profile(self) -> Optional[LLMProfile]:
         """自动检测可用的配置"""
         # 优先级顺序
-        priority = ["siliconflow", "deepseek", "aliyun", "zhipu", "openai", "anthropic", "ollama"]
-        
+        priority = ["siliconflow", "deepseek", "modelscope", "aliyun", "zhipu", "openai", "anthropic", "ollama"]
+
         for name in priority:
             profile = self.profiles.get(name)
             if profile and profile.is_configured():
                 return profile
-        
+
         return None
     
     def get_active_profile(self) -> Optional[LLMProfile]:
@@ -291,22 +309,47 @@ class LLMConfigManager:
 # ============================================================
 
 def print_profiles_table(profiles: List[LLMProfile], show_status: bool = True):
-    """打印配置表格"""
+    """打印配置表格
+
+    Args:
+        profiles: 要显示的配置列表
+        show_status: 是否显示配置状态
+    """
     print("\n" + "=" * 80)
     print("可用的LLM配置")
     print("=" * 80)
-    
+
     for p in profiles:
-        status = "✅" if p.is_configured() else "❌"
+        if p.is_configured():
+            status_icon = "[OK]"
+            status_text = "已配置"
+        else:
+            status_icon = "[--]"
+            status_text = f"未配置 (需要设置 {p.api_key_env})"
+
         if not show_status:
-            status = "  "
-        
-        print(f"\n{status} [{p.name}]")
+            status_icon = "    "
+
+        print(f"\n{status_icon} [{p.name}]")
         print(f"   描述: {p.description}")
         print(f"   默认模型: {p.model}")
-        print(f"   API Key环境变量: {p.api_key_env or '(不需要)'}")
+        if show_status:
+            print(f"   状态: {status_text}")
         if p.models_available:
-            print(f"   可用模型: {', '.join(p.models_available[:4])}{'...' if len(p.models_available) > 4 else ''}")
+            models_str = ', '.join(p.models_available[:4])
+            if len(p.models_available) > 4:
+                models_str += '...'
+            print(f"   可用模型: {models_str}")
+
+    # 汇总统计
+    configured = [p for p in profiles if p.is_configured()]
+    print("\n" + "-" * 80)
+    print(f"汇总: {len(configured)}/{len(profiles)} 个配置已就绪")
+    if configured:
+        ready_names = ', '.join(p.name for p in configured)
+        print(f"可用配置: {ready_names}")
+    else:
+        print("⚠️  没有已配置的profile，请设置对应的API Key环境变量")
 
 
 def test_profile(profile: LLMProfile) -> bool:

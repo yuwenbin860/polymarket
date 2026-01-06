@@ -52,7 +52,7 @@ class ScanSettings:
     min_confidence: float = 0.8
 
     # 每次扫描最大LLM调用次数
-    max_llm_calls: int = 30
+    max_llm_calls: int = 300
 
     # 🆕 向量化相关配置
     # 是否启用语义聚类（向量化模式）
@@ -98,7 +98,11 @@ class Config:
     llm: LLMSettings = field(default_factory=LLMSettings)
     scan: ScanSettings = field(default_factory=ScanSettings)
     output: OutputSettings = field(default_factory=OutputSettings)
-    
+
+    # 🆕 多LLM配置支持
+    llm_profiles: Dict[str, Any] = field(default_factory=dict)  # 多个LLM配置
+    active_profile: str = ""  # 当前激活的profile名称
+
     @classmethod
     def from_env(cls) -> "Config":
         """从环境变量加载配置"""
@@ -134,11 +138,31 @@ class Config:
         """从JSON文件加载配置"""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
+
+        def _filter_comments(d: dict) -> dict:
+            """过滤掉以 _ 开头的注释字段"""
+            return {k: v for k, v in d.items() if not k.startswith('_')}
+
+        def _filter_for_llm_settings(d: dict) -> dict:
+            """过滤掉 LLMSettings 不支持的字段（如 embedding_model）"""
+            allowed = {'provider', 'model', 'api_key', 'api_base', 'max_tokens', 'temperature', 'timeout'}
+            return {k: v for k, v in d.items() if k in allowed}
+
+        # 获取 llm_profiles 和 active_profile
+        llm_profiles = data.get("llm_profiles", {})
+        active_profile = data.get("active_profile", "")
+
+        # 从 active_profile 加载 llm 配置（不再支持独立的 llm 字段）
+        llm_data = {}
+        if active_profile and active_profile in llm_profiles:
+            llm_data = llm_profiles[active_profile]
+
         return cls(
-            llm=LLMSettings(**data.get("llm", {})),
-            scan=ScanSettings(**data.get("scan", {})),
-            output=OutputSettings(**data.get("output", {})),
+            llm=LLMSettings(**_filter_for_llm_settings(llm_data)) if llm_data else LLMSettings(),
+            scan=ScanSettings(**_filter_comments(data.get("scan", {}))),
+            output=OutputSettings(**_filter_comments(data.get("output", {}))),
+            llm_profiles=llm_profiles,
+            active_profile=active_profile,
         )
     
     def to_file(self, path: str):
@@ -150,7 +174,39 @@ class Config:
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-    
+
+    def get_llm_profile(self, profile_name: Optional[str] = None) -> LLMSettings:
+        """
+        获取指定profile的LLM配置
+
+        优先级：
+        1. 指定的profile_name（如果存在于llm_profiles中）
+        2. active_profile指定的配置
+        3. llm字段（向后兼容）
+
+        Args:
+            profile_name: profile名称，留空则使用active_profile
+
+        Returns:
+            LLMSettings配置对象
+        """
+        name = profile_name or self.active_profile
+
+        if name and name in self.llm_profiles:
+            profile_data = self.llm_profiles[name]
+            return LLMSettings(
+                provider=profile_data.get("provider", "openai"),
+                model=profile_data.get("model", ""),
+                api_key=profile_data.get("api_key", ""),
+                api_base=profile_data.get("api_base", ""),
+                max_tokens=profile_data.get("max_tokens", 2000),
+                temperature=profile_data.get("temperature", 0.7),
+                timeout=profile_data.get("timeout", 60),
+            )
+
+        # 回退到llm字段（向后兼容）
+        return self.llm
+
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
         """

@@ -49,7 +49,14 @@ pip install requests httpx
 
 ### 2. 配置LLM（三种方式任选）
 
-**方式A: 使用 --profile 预设配置（推荐）**
+**方式A: 使用 config.json（推荐）**
+```bash
+cp config.example.json config.json
+# 编辑 config.json 填入 api_key，修改 active_profile 切换LLM
+python local_scanner_v2.py
+```
+
+**方式B: 使用 --profile 预设配置**
 ```bash
 # 设置API Key
 export DEEPSEEK_API_KEY="sk-..."
@@ -57,17 +64,10 @@ export DEEPSEEK_API_KEY="sk-..."
 # 使用预设配置运行
 python local_scanner_v2.py --profile deepseek
 python local_scanner_v2.py --profile siliconflow
-python local_scanner_v2.py --profile ollama
+python local_scanner_v2.py --profile modelscope
 
 # 查看所有可用配置
-python llm_config.py --list
-```
-
-**方式B: 使用 config.json**
-```bash
-cp config.example.json config.json
-# 编辑 config.json 填入 provider 和 api_key
-python local_scanner_v2.py
+python local_scanner_v2.py --list-profiles
 ```
 
 **方式C: 使用环境变量**
@@ -80,9 +80,9 @@ python local_scanner_v2.py  # 自动检测
 
 ```
 1. --profile 参数      (最高优先级)
-2. config.json 配置
+2. config.json 的 active_profile
 3. 环境变量自动检测
-4. 规则匹配模式        (最低优先级，不使用LLM)
+4. 默认值              (最低优先级)
 ```
 
 ### 4. 运行扫描
@@ -113,15 +113,18 @@ python local_scanner_v2.py
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|
-| `--semantic` | - | 启用向量化模式 | False |
+| `--no-semantic` | - | 禁用向量化模式 | False |
 | `--domain` | `-d` | 市场领域 | crypto |
 | `--threshold` | `-t` | 语义聚类相似度阈值 (0.0-1.0) | 0.85 |
 
 #### 使用示例
 
 ```bash
-# 基础扫描（使用自动检测的LLM配置）
+# 基础扫描（向量化模式默认启用）
 python local_scanner_v2.py
+
+# 禁用向量化模式，使用传统搜索
+python local_scanner_v2.py --no-semantic
 
 # 使用指定LLM配置
 python local_scanner_v2.py --profile siliconflow
@@ -133,14 +136,11 @@ python local_scanner_v2.py --profile siliconflow --model deepseek-ai/DeepSeek-V3
 # 自定义扫描参数
 python local_scanner_v2.py --min-profit 3.0 --market-limit 500
 
-# 向量化模式 - 加密货币市场
-python local_scanner_v2.py --semantic --domain crypto
-
-# 向量化模式 - 政治市场，自定义阈值
-python local_scanner_v2.py --semantic --domain politics --threshold 0.80
+# 自定义领域和阈值
+python local_scanner_v2.py --domain politics --threshold 0.80
 
 # 组合使用
-python local_scanner_v2.py --profile ollama --semantic -d sports -t 0.90
+python local_scanner_v2.py --profile ollama -d sports -t 0.90
 
 # 列出所有可用配置
 python local_scanner_v2.py --list-profiles
@@ -152,6 +152,7 @@ python local_scanner_v2.py --list-profiles
 |--------|----------|------|----------|
 | **SiliconFlow** | `SILICONFLOW_API_KEY` | **低** | **国内聚合平台，速度快** |
 | **DeepSeek** | `DEEPSEEK_API_KEY` | **低** | **日常使用** |
+| **ModelScope** | `MODELSCOPE_API_KEY` | **低** | **阿里云托管平台** |
 | OpenAI | `OPENAI_API_KEY` | 中 | 高精度需求 |
 | Claude | `ANTHROPIC_API_KEY` | 中 | 复杂推理 |
 | 阿里云 | `DASHSCOPE_API_KEY` | 低 | 国内网络 |
@@ -169,23 +170,48 @@ cp config.example.json config.json
 
 ```json
 {
-  "llm": {
-    "provider": "deepseek",
-    "model": "deepseek-chat",
-    "api_key": "sk-your-api-key",
-    "api_base": "https://api.deepseek.com/v1"
+  "llm_profiles": {
+    "siliconflow": {
+      "provider": "openai_compatible",
+      "api_base": "https://api.siliconflow.cn/v1",
+      "api_key": "sk-your-api-key",
+      "model": "deepseek-ai/DeepSeek-V3",
+      "embedding_model": "BAAI/bge-large-zh-v1.5"
+    },
+    "modelscope": {
+      "provider": "modelscope",
+      "api_base": "https://api-inference.modelscope.cn/v1",
+      "api_key": "ms-your-api-key",
+      "model": "Qwen/Qwen2.5-72B-Instruct",
+      "embedding_model": "Qwen/Qwen3-Embedding-8B"
+    },
+    "deepseek": {
+      "provider": "openai_compatible",
+      "api_base": "https://api.deepseek.com/v1",
+      "api_key": "sk-your-api-key",
+      "model": "deepseek-chat",
+      "embedding_model": "BAAI/bge-large-zh-v1.5"
+    }
   },
+  "active_profile": "siliconflow",
   "scan": {
     "min_profit_pct": 2.0,
-    "min_liquidity": 10000
+    "min_liquidity": 10000,
+    "semantic_threshold": 0.85
   }
 }
 ```
 
 ```bash
-# 3. 运行（会自动读取config.json）
+# 3. 运行（会自动读取 config.json 的 active_profile）
 python local_scanner_v2.py
+
+# 4. 切换LLM：修改 active_profile 字段即可
 ```
+
+**配置说明**:
+- `active_profile`: 指定使用的配置名称（如 "siliconflow"、"modelscope"、"deepseek"）
+- `embedding_model`: 向量化模式使用的embedding模型（每个profile独立配置）
 
 ## 🧪 测试Prompt效果
 

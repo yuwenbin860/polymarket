@@ -1,33 +1,75 @@
 {
   "_comment": "复制此文件为 config.json 并修改配置",
-  "_llm_providers": {
-    "_说明": "以下是各provider的配置示例，取消注释你需要的配置",
-    "deepseek": {
-      "provider": "deepseek",
-      "model": "deepseek-chat",
-      "api_base": "https://api.deepseek.com/v1"
-    },
+  "_说明": {
+    "_llm_profiles": "可配置多个LLM，通过 active_profile 切换使用",
+    "_api_key": "api_key 可以直接填写，也可以留空通过环境变量设置（更安全）",
+    "_切换配置": "修改 active_profile 字段即可切换不同的LLM配置"
+  },
+  "llm_profiles": {
     "siliconflow": {
+      "_description": "SiliconFlow - 国内聚合平台，推荐使用",
       "provider": "openai_compatible",
+      "api_base": "https://api.siliconflow.cn/v1",
+      "api_key": "",
+      "model": "deepseek-ai/DeepSeek-V3",
+      "embedding_model": "BAAI/bge-large-zh-v1.5"
+    },
+    "deepseek": {
+      "_description": "DeepSeek官方API",
+      "provider": "openai_compatible",
+      "api_base": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "model": "deepseek-chat",
+      "embedding_model": "BAAI/bge-large-zh-v1.5"
+    },
+    "modelscope": {
+      "_description": "ModelScope - 阿里云模型托管平台",
+      "provider": "modelscope",
+      "api_base": "https://api-inference.modelscope.cn/v1",
+      "api_key": "",
       "model": "Qwen/Qwen2.5-72B-Instruct",
-      "api_base": "https://api.siliconflow.cn/v1"
+      "embedding_model": "Qwen/Qwen3-Embedding-8B"
     },
     "aliyun": {
-      "provider": "aliyun",
+      "_description": "阿里云通义千问",
+      "provider": "openai_compatible",
+      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key": "",
       "model": "qwen-plus",
-      "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      "embedding_model": "text-embedding-v3"
+    },
+    "zhipu": {
+      "_description": "智谱AI GLM系列",
+      "provider": "openai_compatible",
+      "api_base": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key": "",
+      "model": "glm-4-plus",
+      "embedding_model": "BAAI/bge-large-zh-v1.5"
     },
     "openai": {
+      "_description": "OpenAI GPT系列",
       "provider": "openai",
+      "api_base": "https://api.openai.com/v1",
+      "api_key": "",
       "model": "gpt-4o",
-      "api_base": "https://api.openai.com/v1"
+      "embedding_model": "text-embedding-3-small"
+    },
+    "anthropic": {
+      "_description": "Anthropic Claude系列",
+      "provider": "anthropic",
+      "api_base": "https://api.anthropic.com",
+      "api_key": "",
+      "model": "claude-sonnet-4-20250514",
+      "embedding_model": "BAAI/bge-large-zh-v1.5"
     }
   },
+  "active_profile": "siliconflow",
   "llm": {
-    "provider": "deepseek",
-    "model": "deepseek-chat",
+    "_comment": "保留此字段用于向后兼容，新项目建议使用 llm_profiles + active_profile",
+    "provider": "openai_compatible",
+    "api_base": "https://api.siliconflow.cn/v1",
     "api_key": "",
-    "api_base": "https://api.deepseek.com/v1",
+    "model": "deepseek-ai/DeepSeek-V3",
     "max_tokens": 2000,
     "temperature": 0.7,
     "timeout": 60
@@ -38,7 +80,13 @@
     "min_profit_pct": 2.0,
     "min_liquidity": 10000,
     "min_confidence": 0.8,
-    "max_llm_calls": 30
+    "max_llm_calls": 30,
+    "use_semantic_clustering": true,
+    "semantic_threshold": 0.85,
+    "embedding_model": "BAAI/bge-large-zh-v1.5",
+    "enable_cache": true,
+    "cache_ttl": 3600,
+    "scan_domain": "crypto"
   },
   "output": {
     "output_dir": "./output",

@@ -458,6 +458,170 @@ class MathValidator:
 
         return report
 
+    def _extract_threshold_info(self, question: str) -> Optional[Dict]:
+        """
+        从市场问题中提取价格阈值信息
+
+        Returns:
+            Dict with keys:
+            - type: "up" (上涨阈值) 或 "down" (下跌阈值)
+            - value: 阈值数值
+            如果不是阈值类市场，返回 None
+        """
+        import re
+
+        # 上涨模式: above, hit, reach, exceed, 突破, 超过
+        # 支持 k/K (千), M (百万) 后缀
+        up_patterns = [
+            r'(?:above|hit|reach|exceed|突破|超过)\s*\$?([\d,]+(?:\.\d+)?[kKmM]?)',
+            r'\$?([\d,]+(?:\.\d+)?[kKmM]?)\s*(?:and above|or higher)',
+            r'(?:price|value)\s*(?:>|>=|above)\s*\$?([\d,]+(?:\.\d+)?[kKmM]?)',
+        ]
+
+        # 下跌模式: dip, below, fall, drop, 跌到, 跌破, 跌至
+        down_patterns = [
+            r'(?:dip|below|fall|drop|跌到|跌破|跌至)\s*(?:to\s*)?\$?([\d,]+(?:\.\d+)?[kKmM]?)',
+            r'\$?([\d,]+(?:\.\d+)?[kKmM]?)\s*(?:and below|or lower)',
+            r'(?:price|value)\s*(?:<|<=|below)\s*\$?([\d,]+(?:\.\d+)?[kKmM]?)',
+        ]
+
+        def parse_value(val_str: str) -> float:
+            """解析数值字符串，支持 k/K (千), M (百万) 后缀"""
+            val_str = val_str.replace(',', '')
+            multiplier = 1
+            if val_str.lower().endswith('k'):
+                multiplier = 1000
+                val_str = val_str[:-1]
+            elif val_str.lower().endswith('m'):
+                multiplier = 1000000
+                val_str = val_str[:-1]
+            return float(val_str) * multiplier
+
+        for pattern in up_patterns:
+            match = re.search(pattern, question, re.IGNORECASE)
+            if match:
+                try:
+                    value = parse_value(match.group(1))
+                    return {"type": "up", "value": value}
+                except (ValueError, IndexError):
+                    continue
+
+        for pattern in down_patterns:
+            match = re.search(pattern, question, re.IGNORECASE)
+            if match:
+                try:
+                    value = parse_value(match.group(1))
+                    return {"type": "down", "value": value}
+                except (ValueError, IndexError):
+                    continue
+
+        return None
+
+    def validate_threshold_implication(
+        self,
+        market_a: MarketData,
+        market_b: MarketData,
+        llm_relation: str
+    ) -> ValidationReport:
+        """
+        验证价格阈值类市场的蕴含方向是否正确
+
+        规则:
+        - 上涨阈值 (above/hit/突破): 更高阈值 → 更低阈值 (A蕴含B当A>B)
+        - 下跌阈值 (dip/below/跌到): 更低阈值 → 更高阈值 (A蕴含B当A<B)
+
+        Args:
+            market_a: 市场A数据
+            market_b: 市场B数据
+            llm_relation: LLM判断的关系类型 ("IMPLIES_AB" 或 "IMPLIES_BA")
+
+        Returns:
+            ValidationReport with result indicating if direction is correct
+        """
+        report = ValidationReport(
+            result=ValidationResult.PASSED,
+            reason="",
+            details={}
+        )
+
+        # 只验证蕴含关系
+        if llm_relation not in ["IMPLIES_AB", "IMPLIES_BA"]:
+            report.reason = "非蕴含关系，跳过阈值方向验证"
+            return report
+
+        # 提取阈值信息
+        info_a = self._extract_threshold_info(market_a.question)
+        info_b = self._extract_threshold_info(market_b.question)
+
+        # 如果不是阈值类市场，跳过验证
+        if not info_a or not info_b:
+            report.reason = "非阈值类市场，跳过阈值方向验证"
+            report.checks_passed.append("threshold_skip_non_threshold")
+            return report
+
+        # 阈值类型必须一致
+        if info_a["type"] != info_b["type"]:
+            report.result = ValidationResult.NEEDS_REVIEW
+            report.reason = f"阈值类型不一致 (A={info_a['type']}, B={info_b['type']})，需人工验证"
+            report.warnings.append("阈值方向类型不一致可能导致蕴含关系判断错误")
+            return report
+
+        val_a = info_a["value"]
+        val_b = info_b["value"]
+        threshold_type = info_a["type"]
+
+        # 计算正确的蕴含方向
+        if threshold_type == "up":
+            # 上涨阈值: 更高阈值 → 更低阈值
+            # 例如: $150k → $100k (达到150k必然达到100k)
+            if val_a > val_b:
+                correct_relation = "IMPLIES_AB"  # A蕴含B
+            elif val_a < val_b:
+                correct_relation = "IMPLIES_BA"  # B蕴含A
+            else:
+                correct_relation = "EQUIVALENT"  # 相等则等价
+        else:  # threshold_type == "down"
+            # 下跌阈值: 更低阈值 → 更高阈值
+            # 例如: $50 → $100 (跌到50必然跌过100)
+            if val_a < val_b:
+                correct_relation = "IMPLIES_AB"  # A蕴含B
+            elif val_a > val_b:
+                correct_relation = "IMPLIES_BA"  # B蕴含A
+            else:
+                correct_relation = "EQUIVALENT"  # 相等则等价
+
+        # 记录详情
+        report.details = {
+            "threshold_type": threshold_type,
+            "value_a": val_a,
+            "value_b": val_b,
+            "llm_relation": llm_relation,
+            "correct_relation": correct_relation,
+            "market_a": market_a.question[:80],
+            "market_b": market_b.question[:80]
+        }
+
+        # 验证LLM判断是否正确
+        if correct_relation == "EQUIVALENT":
+            report.result = ValidationResult.NEEDS_REVIEW
+            report.reason = f"阈值相等 (${val_a} = ${val_b})，应为等价关系而非蕴含关系"
+            report.warnings.append("阈值相等的市场应该是EQUIVALENT关系")
+        elif llm_relation == correct_relation:
+            report.result = ValidationResult.PASSED
+            report.reason = f"阈值蕴含方向正确: {llm_relation} ({threshold_type}阈值 ${val_a} vs ${val_b})"
+            report.checks_passed.append("threshold_direction_correct")
+        else:
+            report.result = ValidationResult.FAILED
+            report.reason = (
+                f"阈值蕴含方向错误! LLM判断: {llm_relation}, 正确应为: {correct_relation}\n"
+                f"  - 阈值类型: {threshold_type} (上涨=更高→更低, 下跌=更低→更高)\n"
+                f"  - 市场A阈值: ${val_a}\n"
+                f"  - 市场B阈值: ${val_b}"
+            )
+            report.checks_failed.append("threshold_direction_wrong")
+
+        return report
+
     def validate_exhaustive_set(
         self,
         markets: List[MarketData],
@@ -1089,138 +1253,3 @@ class MathValidator:
 
 # === 便捷函数 ===
 
-def validate_opportunity(
-    opportunity_type: str,
-    markets: List[Dict],
-    relation: str = None,
-    **kwargs
-) -> ValidationReport:
-    """
-    验证套利机会的便捷函数
-
-    Args:
-        opportunity_type: "implication", "exhaustive", "equivalent"
-        markets: 市场数据列表
-        relation: 关系类型（仅用于 implication）
-
-    Returns:
-        ValidationReport
-    """
-    validator = MathValidator(**kwargs)
-
-    # 转换市场数据
-    market_objects = [
-        MarketData(
-            id=m.get("id", ""),
-            question=m.get("question", ""),
-            yes_price=m.get("yes_price", 0.0),
-            no_price=m.get("no_price", 0.0),
-            liquidity=m.get("liquidity", 0.0),
-            volume=m.get("volume", 0.0)
-        )
-        for m in markets
-    ]
-
-    if opportunity_type == "implication":
-        if len(market_objects) < 2 or not relation:
-            return ValidationReport(
-                result=ValidationResult.FAILED,
-                reason="包含关系验证需要两个市场和关系类型"
-            )
-        return validator.validate_implication(
-            market_objects[0], market_objects[1], relation
-        )
-
-    elif opportunity_type == "exhaustive":
-        return validator.validate_exhaustive_set(market_objects)
-
-    elif opportunity_type == "equivalent":
-        if len(market_objects) < 2:
-            return ValidationReport(
-                result=ValidationResult.FAILED,
-                reason="等价市场验证需要两个市场"
-            )
-        return validator.validate_equivalent(market_objects[0], market_objects[1])
-
-    else:
-        return ValidationReport(
-            result=ValidationResult.FAILED,
-            reason=f"未知的机会类型: {opportunity_type}"
-        )
-
-
-if __name__ == "__main__":
-    # 测试示例
-    print("=" * 60)
-    print("数学验证层测试")
-    print("=" * 60)
-
-    validator = MathValidator(min_profit_pct=2.0)
-
-    # 测试1: 包含关系套利
-    print("\n--- 测试1: 包含关系套利 ---")
-    market_a = MarketData(
-        id="1",
-        question="Will Trump win the 2024 election?",
-        yes_price=0.55,
-        no_price=0.45,
-        liquidity=100000
-    )
-    market_b = MarketData(
-        id="2",
-        question="Will Republicans win the 2024 election?",
-        yes_price=0.50,  # 违反逻辑！应该 >= 0.55
-        no_price=0.50,
-        liquidity=80000
-    )
-
-    report = validator.validate_implication(market_a, market_b, "IMPLIES_AB")
-    print(f"结果: {report.result.value}")
-    print(f"原因: {report.reason}")
-    print(f"毛利润率: {report.profit_pct:.2f}%")
-    print(f"检查通过: {report.checks_passed}")
-    print(f"警告: {report.warnings}")
-
-    # 测试2: 完备集套利
-    print("\n--- 测试2: 完备集套利 ---")
-    markets = [
-        MarketData(id="1", question="Candidate A wins", yes_price=0.35, no_price=0.65, liquidity=50000),
-        MarketData(id="2", question="Candidate B wins", yes_price=0.30, no_price=0.70, liquidity=50000),
-        MarketData(id="3", question="Candidate C wins", yes_price=0.15, no_price=0.85, liquidity=30000),
-        MarketData(id="4", question="Other candidates win", yes_price=0.15, no_price=0.85, liquidity=20000),
-    ]
-
-    report = validator.validate_exhaustive_set(markets)
-    print(f"结果: {report.result.value}")
-    print(f"原因: {report.reason}")
-    print(f"价格总和: {report.details.get('total_yes_price', 0):.4f}")
-    print(f"毛利润率: {report.profit_pct:.2f}%")
-
-    # 测试3: 等价市场套利
-    print("\n--- 测试3: 等价市场套利 ---")
-    market_a = MarketData(
-        id="1",
-        question="Will BTC hit $100k in 2024?",
-        yes_price=0.52,
-        no_price=0.48,
-        liquidity=200000
-    )
-    market_b = MarketData(
-        id="2",
-        question="Bitcoin reaches $100,000 this year?",
-        yes_price=0.48,  # 价差 4%
-        no_price=0.52,
-        liquidity=150000
-    )
-
-    report = validator.validate_equivalent(market_a, market_b)
-    print(f"结果: {report.result.value}")
-    print(f"原因: {report.reason}")
-    print(f"价差: {report.details.get('spread_pct', 0):.2f}%")
-    print(f"毛利润率: {report.profit_pct:.2f}%")
-
-    # 生成验证清单
-    print("\n--- 人工验证清单 ---")
-    checklist = validator.generate_checklist(report)
-    for item in checklist:
-        print(item)

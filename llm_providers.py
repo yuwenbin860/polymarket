@@ -29,10 +29,15 @@ LLM提供商抽象层
 import os
 import json
 import httpx
+import logging
+import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 from enum import Enum
+
+# 获取logger
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -49,6 +54,7 @@ class LLMProvider(Enum):
     DEEPSEEK = "deepseek"
     OLLAMA = "ollama"          # 本地Ollama
     OPENAI_COMPATIBLE = "openai_compatible"  # OpenAI兼容接口
+    MODELSCOPE = "modelscope"  # ModelScope - 阿里云模型托管平台
 
 
 @dataclass
@@ -88,6 +94,7 @@ DEFAULT_MODELS = {
     LLMProvider.DEEPSEEK: "deepseek-chat",
     LLMProvider.OLLAMA: "llama3.1:8b",
     LLMProvider.OPENAI_COMPATIBLE: "gpt-4o",
+    LLMProvider.MODELSCOPE: "Qwen/Qwen2.5-72B-Instruct",
 }
 
 API_BASES = {
@@ -98,6 +105,7 @@ API_BASES = {
     LLMProvider.ZHIPU: "https://open.bigmodel.cn/api/paas/v4",
     LLMProvider.DEEPSEEK: "https://api.deepseek.com/v1",
     LLMProvider.OLLAMA: "http://localhost:11434",
+    LLMProvider.MODELSCOPE: "https://api-inference.modelscope.cn/v1",
 }
 
 # 环境变量名映射
@@ -109,6 +117,7 @@ ENV_API_KEYS = {
     LLMProvider.ZHIPU: "ZHIPU_API_KEY",
     LLMProvider.DEEPSEEK: "DEEPSEEK_API_KEY",
     LLMProvider.OPENAI_COMPATIBLE: "LLM_API_KEY",
+    LLMProvider.MODELSCOPE: "MODELSCOPE_API_KEY",
 }
 
 
@@ -544,36 +553,90 @@ class OpenAICompatibleClient(BaseLLMClient):
         super().__init__(config)
         self.api_base = config.api_base or os.getenv("LLM_API_BASE", "http://localhost:8000/v1")
         self.api_key = config.api_key or os.getenv(ENV_API_KEYS[LLMProvider.OPENAI_COMPATIBLE], "sk-no-key-required")
-    
+
     def _make_request(self, messages: List[Dict], **kwargs) -> LLMResponse:
-        """发送请求"""
+        """发送请求（含详细错误记录）"""
+        url = f"{self.api_base}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        
+
         payload = {
             "model": self.config.model,
             "messages": messages,
             "max_tokens": kwargs.get("max_tokens", self.config.max_tokens),
             "temperature": kwargs.get("temperature", self.config.temperature),
         }
-        
-        response = self.http_client.post(
-            f"{self.api_base}/chat/completions",
-            headers=headers,
-            json=payload
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        return LLMResponse(
-            content=data["choices"][0]["message"]["content"],
-            model=data.get("model", self.config.model),
-            usage=data.get("usage"),
-            raw_response=data
-        )
-    
+
+        # 提取prompt摘要用于错误日志
+        prompt_summary = ""
+        if messages:
+            last_msg = messages[-1].get("content", "")
+            prompt_summary = last_msg[:100] + "..." if len(last_msg) > 100 else last_msg
+
+        try:
+            response = self.http_client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            return LLMResponse(
+                content=data["choices"][0]["message"]["content"],
+                model=data.get("model", self.config.model),
+                usage=data.get("usage"),
+                raw_response=data
+            )
+
+        except httpx.TimeoutException as e:
+            error_msg = (
+                f"LLM请求超时\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  超时设置: {self.config.timeout}秒\n"
+                f"  Prompt摘要: {prompt_summary}"
+            )
+            logger.error(error_msg)
+            raise
+
+        except httpx.HTTPStatusError as e:
+            error_msg = (
+                f"LLM请求HTTP错误\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  状态码: {e.response.status_code}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  响应内容: {e.response.text[:500] if e.response.text else 'N/A'}\n"
+                f"  Prompt摘要: {prompt_summary}"
+            )
+            logger.error(error_msg)
+            raise
+
+        except httpx.RequestError as e:
+            error_msg = (
+                f"LLM请求网络错误\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {str(e)}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  Prompt摘要: {prompt_summary}"
+            )
+            logger.error(error_msg)
+            raise
+
+        except Exception as e:
+            error_msg = (
+                f"LLM请求未知错误\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {str(e)}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  Prompt摘要: {prompt_summary}\n"
+                f"  堆栈跟踪:\n{traceback.format_exc()}"
+            )
+            logger.error(error_msg)
+            raise
+
     def chat(self, message: str, system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
         messages = []
         if system_prompt:
@@ -581,7 +644,129 @@ class OpenAICompatibleClient(BaseLLMClient):
         messages.append({"role": "user", "content": message})
         return self._make_request(messages, **kwargs)
     
-    def chat_with_history(self, messages: List[Dict[str, str]], 
+    def chat_with_history(self, messages: List[Dict[str, str]],
+                          system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
+        full_messages = []
+        if system_prompt:
+            full_messages.append({"role": "system", "content": system_prompt})
+        full_messages.extend(messages)
+        return self._make_request(full_messages, **kwargs)
+
+
+# ============================================================
+# ModelScope客户端
+# ============================================================
+
+class ModelScopeClient(BaseLLMClient):
+    """
+    ModelScope API客户端
+    阿里云模型托管平台，支持多种开源模型
+
+    文档: https://api-inference.modelscope.cn/docs
+    """
+
+    def __init__(self, config: LLMConfig):
+        super().__init__(config)
+        self.api_base = config.api_base or API_BASES[LLMProvider.MODELSCOPE]
+        self.api_key = config.api_key or os.getenv(ENV_API_KEYS[LLMProvider.MODELSCOPE])
+
+        if not self.api_key:
+            raise ValueError(
+                "ModelScope API key not found. "
+                "Please set MODELSCOPE_API_KEY environment variable or pass api_key parameter."
+            )
+
+    def _make_request(self, messages: List[Dict], **kwargs) -> LLMResponse:
+        """发送请求到ModelScope API"""
+        url = f"{self.api_base}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": kwargs.get("max_tokens", self.config.max_tokens),
+            "temperature": kwargs.get("temperature", self.config.temperature),
+        }
+
+        # 提取prompt摘要用于错误日志
+        prompt_summary = ""
+        if messages:
+            last_msg = messages[-1].get("content", "")
+            prompt_summary = last_msg[:100] + "..." if len(last_msg) > 100 else last_msg
+
+        try:
+            response = self.http_client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            return LLMResponse(
+                content=data["choices"][0]["message"]["content"],
+                model=data.get("model", self.config.model),
+                usage=data.get("usage"),
+                raw_response=data
+            )
+
+        except httpx.TimeoutException as e:
+            error_msg = (
+                f"ModelScope请求超时\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  超时设置: {self.config.timeout}秒\n"
+                f"  Prompt摘要: {prompt_summary}"
+            )
+            logger.error(error_msg)
+            raise
+
+        except httpx.HTTPStatusError as e:
+            error_msg = (
+                f"ModelScope请求HTTP错误\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  状态码: {e.response.status_code}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  响应内容: {e.response.text[:500] if e.response.text else 'N/A'}\n"
+                f"  Prompt摘要: {prompt_summary}"
+            )
+            logger.error(error_msg)
+            raise
+
+        except httpx.RequestError as e:
+            error_msg = (
+                f"ModelScope请求网络错误\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {str(e)}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  Prompt摘要: {prompt_summary}"
+            )
+            logger.error(error_msg)
+            raise
+
+        except Exception as e:
+            error_msg = (
+                f"ModelScope请求未知错误\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {str(e)}\n"
+                f"  请求URL: {url}\n"
+                f"  请求模型: {self.config.model}\n"
+                f"  Prompt摘要: {prompt_summary}\n"
+                f"  堆栈跟踪:\n{traceback.format_exc()}"
+            )
+            logger.error(error_msg)
+            raise
+
+    def chat(self, message: str, system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": message})
+        return self._make_request(messages, **kwargs)
+
+    def chat_with_history(self, messages: List[Dict[str, str]],
                           system_prompt: Optional[str] = None, **kwargs) -> LLMResponse:
         full_messages = []
         if system_prompt:
@@ -603,6 +788,7 @@ CLIENT_MAP = {
     LLMProvider.DEEPSEEK: DeepSeekClient,
     LLMProvider.OLLAMA: OllamaClient,
     LLMProvider.OPENAI_COMPATIBLE: OpenAICompatibleClient,
+    LLMProvider.MODELSCOPE: ModelScopeClient,
 }
 
 
@@ -686,20 +872,21 @@ def create_llm_client(
 
 def _detect_provider() -> str:
     """根据环境变量自动检测提供商"""
-    
+
     # 按优先级检测
     detection_order = [
         (ENV_API_KEYS[LLMProvider.OPENAI], "openai"),
         (ENV_API_KEYS[LLMProvider.ANTHROPIC], "anthropic"),
         (ENV_API_KEYS[LLMProvider.DEEPSEEK], "deepseek"),
+        (ENV_API_KEYS[LLMProvider.MODELSCOPE], "modelscope"),
         (ENV_API_KEYS[LLMProvider.ALIYUN], "aliyun"),
         (ENV_API_KEYS[LLMProvider.ZHIPU], "zhipu"),
     ]
-    
+
     for env_var, provider in detection_order:
         if os.getenv(env_var):
             return provider
-    
+
     # 检查是否有Ollama在运行
     try:
         import httpx
@@ -708,16 +895,17 @@ def _detect_provider() -> str:
             return "ollama"
     except:
         pass
-    
+
     # 检查通用LLM配置
     if os.getenv("LLM_API_BASE"):
         return "openai_compatible"
-    
+
     raise ValueError(
         "No LLM provider detected. Please set one of the following environment variables:\n"
         "  - OPENAI_API_KEY (for OpenAI)\n"
         "  - ANTHROPIC_API_KEY (for Claude)\n"
         "  - DEEPSEEK_API_KEY (for DeepSeek)\n"
+        "  - MODELSCOPE_API_KEY (for ModelScope)\n"
         "  - DASHSCOPE_API_KEY (for Aliyun/Qwen)\n"
         "  - ZHIPU_API_KEY (for Zhipu/GLM)\n"
         "  - Or start Ollama locally\n"
@@ -776,26 +964,3 @@ def quick_chat(message: str,
 # 测试代码
 # ============================================================
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("LLM提供商测试")
-    print("=" * 60)
-    
-    print("\n可用的提供商:")
-    for p in list_available_providers():
-        info = get_provider_info(p)
-        print(f"  - {p}: {info['default_model']} (env: {info['env_var']})")
-    
-    print("\n尝试自动检测提供商...")
-    try:
-        client = create_llm_client()
-        print(f"✅ 检测到: {client.config.provider.value}, 模型: {client.config.model}")
-        
-        print("\n发送测试消息...")
-        response = client.chat("你好，请用一句话介绍自己")
-        print(f"回复: {response.content}")
-        
-    except ValueError as e:
-        print(f"❌ {e}")
-    except Exception as e:
-        print(f"❌ 请求失败: {e}")

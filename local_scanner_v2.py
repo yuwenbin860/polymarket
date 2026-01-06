@@ -34,9 +34,9 @@ import requests
 import json
 import os
 import sys
-import io
 import argparse
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 
 # ============================================================
@@ -64,11 +64,63 @@ from validators import MathValidator
 from semantic_cluster import SemanticClusterer
 
 import logging
+import traceback
+
+# ============================================================
+# Logging 配置
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # 数据结构
 # ============================================================
+
+@dataclass
+class Outcome:
+    """
+    多区间市场的一个outcome（选项）
+
+    例如在 "Bitcoin price on January 6" 市场中：
+    - outcomes = ["< 90k", "90k-95k", "95k-98k", "> 98k"]
+    - 每个outcome有独立的YES/NO价格和CLOB token
+
+    注意：在Polymarket的CLOB系统中，每个outcome的YES和NO价格是独立的
+    当 YES + NO < 100 时存在单outcome套利机会
+    """
+    name: str                  # 选项名称，如 "> 98000" 或 "Yes"
+    yes_price: float           # YES买价 (best_ask)
+    no_price: float            # NO买价 (best_ask for NO side)
+    yes_bid: float = 0.0       # YES卖价 (best_bid)
+    no_bid: float = 0.0        # NO卖价
+    token_id: str = ""         # CLOB token ID for YES side
+    token_id_no: str = ""      # CLOB token ID for NO side
+
+    def __repr__(self):
+        return f"Outcome('{self.name}', YES=${self.yes_price:.2f}, NO=${self.no_price:.2f})"
+
+    @property
+    def total_cost(self) -> float:
+        """买入YES+NO的总成本"""
+        return self.yes_price + self.no_price
+
+    @property
+    def has_arbitrage(self) -> bool:
+        """检查是否存在单outcome套利 (YES + NO < 100)"""
+        return self.total_cost <= 0.98  # 允许2%误差（使用<=包含边界情况）
+
+    @property
+    def arbitrage_profit(self) -> float:
+        """单outcome套利利润"""
+        if self.has_arbitrage:
+            return 1.0 - self.total_cost
+        return 0.0
+
 
 class RelationType(Enum):
     IMPLIES_AB = "implies_ab"
@@ -109,10 +161,19 @@ class Market:
     event_description: str = ""   # Event的description (包含resolution rules!)
     market_description: str = ""  # Market自己的description
     tags: List[Dict] = None       # Event的tags (用于分类过滤)
+    orderbook: Dict = None        # Full orderbook data (for arbitrage opportunity reporting)
+
+    # ✅ 新增: 多outcome市场支持
+    outcomes_detail: List[Outcome] = None  # 每个outcome的详细信息 (YES/NO价格)
+    is_multi_outcome: bool = False          # 是否为多outcome市场 (>2个选项)
 
     def __post_init__(self):
         if self.tags is None:
             self.tags = []
+        if self.orderbook is None:
+            self.orderbook = {}
+        if self.outcomes_detail is None:
+            self.outcomes_detail = []
 
     def __repr__(self):
         return f"Market('{self.question[:50]}...', YES=${self.yes_price:.2f}, spread={self.spread:.3f})"
@@ -250,7 +311,7 @@ class PolymarketClient:
             # 兼容旧的description字段
             description = market_description or event_description
 
-            return Market(
+            market = Market(
                 id=data.get('id', ''),
                 condition_id=data.get('conditionId', ''),
                 question=data.get('question', ''),
@@ -269,8 +330,69 @@ class PolymarketClient:
                 market_description=market_description,
                 tags=tags
             )
+
+            # ✅ 新增: 检测并处理多outcome市场
+            if len(outcomes) > 2:
+                market.is_multi_outcome = True
+                # 为多outcome市场创建Outcome对象
+                market.outcomes_detail = self._parse_multi_outcomes(
+                    outcomes, token_ids, prices
+                )
+
+            return market
         except Exception:
             return None
+
+    def _parse_multi_outcomes(
+        self,
+        outcomes: List[str],
+        token_ids: List[str],
+        prices: List[float]
+    ) -> List[Outcome]:
+        """
+        解析多outcome市场的每个outcome
+
+        对于多outcome市场（如价格区间市场）：
+        - 每个outcome有独立的YES token和NO token
+        - clobTokenIds数组结构: [outcome1_YES, outcome1_NO, outcome2_YES, outcome2_NO, ...]
+        - outcomePrices数组结构: [outcome1_YES_price, outcome2_YES_price, ...]
+
+        Args:
+            outcomes: 选项名称列表，如 ["< 90k", "90k-95k", "> 95k"]
+            token_ids: CLOB token ID列表
+            prices: YES价格列表
+
+        Returns:
+            List[Outcome] 对象列表
+        """
+        outcomes_detail = []
+
+        for i, outcome_name in enumerate(outcomes):
+            # 计算token索引：每个outcome有YES和NO两个token
+            yes_token_idx = i * 2
+            no_token_idx = i * 2 + 1
+
+            # 获取价格
+            yes_price = float(prices[i]) if i < len(prices) else 0.5
+
+            # 在CLOB系统中，NO价格通常需要单独获取
+            # 这里先使用1 - yes_price作为默认值，后续通过orderbook更新
+            no_price = 1.0 - yes_price
+
+            # 获取token IDs
+            yes_token = token_ids[yes_token_idx] if yes_token_idx < len(token_ids) else ""
+            no_token = token_ids[no_token_idx] if no_token_idx < len(token_ids) else ""
+
+            outcome = Outcome(
+                name=outcome_name,
+                yes_price=yes_price,
+                no_price=no_price,
+                token_id=yes_token,
+                token_id_no=no_token
+            )
+            outcomes_detail.append(outcome)
+
+        return outcomes_detail
 
     def fetch_orderbook(self, token_id: str) -> Dict:
         """
@@ -333,6 +455,38 @@ class PolymarketClient:
         market.best_bid = orderbook["best_bid"]
         market.best_ask = orderbook["best_ask"]
         market.spread = orderbook["spread"]
+        market.orderbook = orderbook  # Store full orderbook for arbitrage reporting
+
+        return market
+
+    def enrich_multi_outcome_market(self, market: Market) -> Market:
+        """
+        为多outcome市场补充每个outcome的订单簿数据
+
+        对于多outcome市场（如价格区间市场），每个outcome有独立的YES/NO token。
+        需要为每个outcome获取真实的YES和NO价格。
+
+        Args:
+            market: Market 对象 (is_multi_outcome=True)
+
+        Returns:
+            补充了每个outcome订单簿数据的 Market 对象
+        """
+        if not market.is_multi_outcome or not market.outcomes_detail:
+            return market
+
+        for outcome in market.outcomes_detail:
+            # 获取YES侧订单簿
+            if outcome.token_id:
+                yes_orderbook = self.fetch_orderbook(outcome.token_id)
+                outcome.yes_bid = yes_orderbook["best_bid"]
+                outcome.yes_price = yes_orderbook["best_ask"] or outcome.yes_price
+
+            # 获取NO侧订单簿
+            if outcome.token_id_no:
+                no_orderbook = self.fetch_orderbook(outcome.token_id_no)
+                outcome.no_bid = no_orderbook["best_bid"]
+                outcome.no_price = no_orderbook["best_ask"] or outcome.no_price
 
         return market
 
@@ -454,6 +608,78 @@ class PolymarketClient:
             return []
 
         return self.get_markets_by_tag(tag_id, active=active, limit=limit, min_liquidity=min_liquidity)
+
+    # ============================================================
+    # ✅ 新增: 按Event Slug获取Event及其Markets
+    # ============================================================
+
+    def get_event_by_slug(self, slug: str) -> Optional[Dict]:
+        """
+        通过slug获取单个event及其所有市场
+
+        Args:
+            slug: Event slug (e.g., "bitcoin-price-on-january-6")
+
+        Returns:
+            Event字典，包含markets数组；如果未找到返回None
+
+        Example:
+            event = client.get_event_by_slug("bitcoin-price-on-january-6")
+            markets = event.get("markets", [])
+        """
+        try:
+            url = f"{self.base_url}/events"
+            params = {"slug": slug}
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            events = response.json()
+            return events[0] if events else None
+        except requests.RequestException as e:
+            logger.error(f"获取event失败 (slug={slug}): {e}")
+            return None
+
+    def get_markets_in_event(
+        self,
+        event_slug: str,
+        min_liquidity: float = 0
+    ) -> List[Market]:
+        """
+        获取一个event下的所有市场并解析为Market对象
+
+        这是检测跨Event套利的关键方法。例如：
+        - "bitcoin-price-on-january-6" event有11个区间市场
+        - "bitcoin-above-on-january-6" event有10个阈值市场
+        - 可以对比两个event中的等价市场（如">98,000"）
+
+        Args:
+            event_slug: Event slug
+            min_liquidity: 最小流动性过滤
+
+        Returns:
+            Market列表
+        """
+        event = self.get_event_by_slug(event_slug)
+        if not event:
+            return []
+
+        markets = []
+        event_data = {
+            "id": event.get("id"),
+            "title": event.get("title"),
+            "description": event.get("description", ""),
+            "slug": event.get("slug"),
+            "tags": event.get("tags", []),
+            "resolutionSource": event.get("resolutionSource", "")
+        }
+
+        for market_data in event.get("markets", []):
+            market = self._parse_market(market_data, event_data)
+            if market:
+                if min_liquidity > 0 and market.liquidity < min_liquidity:
+                    continue
+                markets.append(market)
+
+        return markets
 
     # ============================================================
     # 原有方法
@@ -946,9 +1172,26 @@ class LLMAnalyzer:
             return normalized
 
         except json.JSONDecodeError as e:
+            error_msg = (
+                f"JSON解析失败\n"
+                f"  错误信息: {e}\n"
+                f"  市场A: {market_a.question[:50]}...\n"
+                f"  市场B: {market_b.question[:50]}...\n"
+                f"  原始响应: {content[:200] if 'content' in dir() else 'N/A'}..."
+            )
+            logger.error(error_msg)
             print(f"    JSON解析失败: {e}")
             return self._analyze_with_rules(market_a, market_b)
         except Exception as e:
+            error_msg = (
+                f"LLM分析失败\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {e}\n"
+                f"  市场A: {market_a.question[:50]}...\n"
+                f"  市场B: {market_b.question[:50]}...\n"
+                f"  堆栈跟踪:\n{traceback.format_exc()}"
+            )
+            logger.error(error_msg)
             print(f"    LLM分析失败: {e}")
             return self._analyze_with_rules(market_a, market_b)
 
@@ -1102,14 +1345,14 @@ class LLMAnalyzer:
             - error_message: 矛盾描述
 
         Examples:
-            >>> # 矛盾案例：reasoning 说互斥，但 relationship 是 IMPLIES
-            >>> result = {
+             # 矛盾案例：reasoning 说互斥，但 relationship 是 IMPLIES
+             result = {
             ...     'relationship': 'IMPLIES_AB',
             ...     'reasoning': 'These markets are mutually exclusive'
             ... }
-            >>> is_valid, msg = analyzer._validate_llm_response_consistency(result)
-            >>> assert not is_valid
-            >>> assert 'mutual' in msg.lower()
+             is_valid, msg = analyzer._validate_llm_response_consistency(result)
+             assert not is_valid
+             assert 'mutual' in msg.lower()
         """
         relationship = llm_result.get('relationship', '')
         reasoning = llm_result.get('reasoning', '').lower()
@@ -1234,6 +1477,16 @@ class ArbitrageDetector:
             }
 
         except json.JSONDecodeError as e:
+            market_questions = [m.question[:30] + "..." for m in markets[:3]]
+            error_msg = (
+                f"LLM完备集验证JSON解析失败\n"
+                f"  错误信息: {e}\n"
+                f"  事件: {event_title}\n"
+                f"  市场数量: {len(markets)}\n"
+                f"  市场样例: {market_questions}\n"
+                f"  原始响应: {content[:200] if 'content' in dir() else 'N/A'}..."
+            )
+            logger.error(error_msg)
             print(f"    [WARNING] LLM完备集验证JSON解析失败: {e}")
             return {
                 "is_valid": False,
@@ -1241,6 +1494,17 @@ class ArbitrageDetector:
                 "reasoning": f"JSON解析失败: {e}"
             }
         except Exception as e:
+            market_questions = [m.question[:30] + "..." for m in markets[:3]]
+            error_msg = (
+                f"LLM完备集验证失败\n"
+                f"  错误类型: {type(e).__name__}\n"
+                f"  错误信息: {e}\n"
+                f"  事件: {event_title}\n"
+                f"  市场数量: {len(markets)}\n"
+                f"  市场样例: {market_questions}\n"
+                f"  堆栈跟踪:\n{traceback.format_exc()}"
+            )
+            logger.error(error_msg)
             print(f"    [WARNING] LLM完备集验证失败: {e}")
             return {
                 "is_valid": False,
@@ -1347,7 +1611,8 @@ class ArbitrageDetector:
                 id=f"exhaustive_{datetime.now().strftime('%Y%m%d%H%M%S')}",
                 type="EXHAUSTIVE_SET_UNDERPRICED",
                 markets=[{"id": m.id, "question": m.question, "yes_price": m.yes_price,
-                          "best_ask": m.best_ask, "spread": m.spread} for m in markets],
+                          "best_ask": m.best_ask, "spread": m.spread, "liquidity": m.liquidity,
+                          "orderbook": m.orderbook} for m in markets],
                 relationship="exhaustive",
                 confidence=0.85,
                 total_cost=real_total,
@@ -1409,12 +1674,32 @@ class ArbitrageDetector:
             relation=relation_type  # 注意参数名是 relation 不是 relation_type
         )
 
-        if validation_result.result.value != 'PASSED':
+        # 使用枚举比较，而不是字符串（修复大小写Bug）
+        from validators import ValidationResult as VR
+        if validation_result.result not in [VR.PASSED, VR.WARNING]:
             print(f"    [ERROR] 数学验证失败: {validation_result.reason}")
             print(f"       验证详情: {validation_result.details}")
             return None
         else:
             print(f"    [OK] 数学验证通过: {validation_result.reason}")
+
+        # ✅ 阈值蕴含方向验证 (v2.0.5)
+        # 验证价格阈值类市场(如dip/above)的蕴含方向是否正确
+        threshold_validation = self.math_validator.validate_threshold_implication(
+            market_a=implying_data,
+            market_b=implied_data,
+            llm_relation=relation_type
+        )
+
+        if threshold_validation.result == VR.FAILED:
+            print(f"    [ERROR] 阈值方向验证失败: {threshold_validation.reason}")
+            if threshold_validation.details:
+                print(f"       详情: {threshold_validation.details}")
+            return None
+        elif threshold_validation.result == VR.NEEDS_REVIEW:
+            print(f"    [WARNING] 阈值验证需人工复核: {threshold_validation.reason}")
+        elif threshold_validation.reason and "跳过" not in threshold_validation.reason:
+            print(f"    [OK] 阈值方向验证: {threshold_validation.reason}")
 
         # ✅ Priority 2: 时间一致性验证
         if relation_type in ['IMPLIES_AB', 'IMPLIES_BA']:
@@ -1521,9 +1806,11 @@ class ArbitrageDetector:
             type="IMPLICATION_VIOLATION",
             markets=[
                 {"id": implied.id, "question": implied.question, "yes_price": implied.yes_price,
-                 "best_ask": implied.best_ask, "spread": implied.spread},
+                 "best_ask": implied.best_ask, "spread": implied.spread, "liquidity": implied.liquidity,
+                 "orderbook": implied.orderbook},
                 {"id": implying.id, "question": implying.question, "yes_price": implying.yes_price,
-                 "best_bid": implying.best_bid, "spread": implying.spread}
+                 "best_bid": implying.best_bid, "spread": implying.spread, "liquidity": implying.liquidity,
+                 "orderbook": implying.orderbook}
             ],
             relationship=f"implies_{direction.lower().replace('→', '_')}",
             confidence=analysis.get("confidence", 0.5),
@@ -1692,9 +1979,11 @@ class ArbitrageDetector:
             type="EQUIVALENT_MISPRICING",
             markets=[
                 {"id": cheap.id, "question": cheap.question, "yes_price": cheap.yes_price,
-                 "best_ask": cheap.best_ask, "spread": cheap.spread},
+                 "best_ask": cheap.best_ask, "spread": cheap.spread, "liquidity": cheap.liquidity,
+                 "orderbook": cheap.orderbook},
                 {"id": expensive.id, "question": expensive.question, "yes_price": expensive.yes_price,
-                 "best_bid": expensive.best_bid, "spread": expensive.spread}
+                 "best_bid": expensive.best_bid, "spread": expensive.spread, "liquidity": expensive.liquidity,
+                 "orderbook": expensive.orderbook}
             ],
             relationship="equivalent",
             confidence=analysis.get("confidence", 0.5),
@@ -1831,6 +2120,440 @@ class ArbitrageDetector:
             timestamp=datetime.now().isoformat()
         )
 
+    def check_single_market_arbitrage(
+        self,
+        market: Market
+    ) -> List[ArbitrageOpportunity]:
+        """
+        检测单市场内部套利机会
+
+        针对多outcome市场（如价格区间市场）：
+        1. 单outcome套利：每个outcome的 YES + NO < 100
+        2. 完备集套利：所有outcome的YES价格总和 < 100
+
+        单outcome套利示例：
+            - ">98000" 区间: YES = 0.4, NO = 99.3
+            - 总成本 = 0.4 + 99.3 = 99.3% < 100%
+            - 套利：买YES + 买NO = 保证回报$1.00
+
+        完备集套利示例：
+            - 区间市场: ["<90k", "90k-95k", "95k-98k", ">98k"]
+            - YES价格: [0.1, 0.15, 0.2, 0.3]
+            - 总和 = 0.75 < 1.00
+            - 套利：买所有区间的YES = 保证回报$1.00
+
+        Args:
+            market: Market对象 (is_multi_outcome=True)
+
+        Returns:
+            List[ArbitrageOpportunity]: 检测到的套利机会列表
+        """
+        opportunities = []
+
+        # 只处理多outcome市场
+        if not market.is_multi_outcome or not market.outcomes_detail:
+            return opportunities
+
+        # 检查1: 单outcome内部套利 (YES + NO < 100)
+        for outcome in market.outcomes_detail:
+            if outcome.has_arbitrage:
+                profit = outcome.arbitrage_profit
+                profit_pct = (profit / outcome.total_cost) * 100 if outcome.total_cost > 0 else 0
+
+                if profit_pct >= self.min_profit_pct:
+                    opp = ArbitrageOpportunity(
+                        id=f"single_outcome_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                        type="SINGLE_OUTCOME_ARBITRAGE",
+                        markets=[
+                            {
+                                "id": market.id,
+                                "question": market.question,
+                                "outcome": outcome.name,
+                                "yes_price": outcome.yes_price,
+                                "no_price": outcome.no_price,
+                            }
+                        ],
+                        relationship="single_outcome_internal",
+                        confidence=0.90,  # 高置信度：这是数学确定性套利
+                        total_cost=outcome.total_cost,
+                        guaranteed_return=1.0,
+                        profit=profit,
+                        profit_pct=profit_pct,
+                        action=f"买 '{outcome.name}' YES @ ${outcome.yes_price:.3f} + NO @ ${outcome.no_price:.3f}",
+                        reasoning=f"单outcome内部套利：{outcome.name} 的YES+NO价格 ({outcome.yes_price:.3f} + {outcome.no_price:.3f} = {outcome.total_cost:.3f}) < $1.00",
+                        edge_cases=[
+                            "确认该outcome的结算规则清晰",
+                            "检查YES和NO的流动性是否充足",
+                        ],
+                        needs_review=[
+                            f"中间价利润: {profit:.3f} ({profit_pct:.1f}%)",
+                            f"YES价格: ${outcome.yes_price:.3f}, NO价格: ${outcome.no_price:.3f}",
+                        ],
+                        timestamp=datetime.now().isoformat()
+                    )
+                    opportunities.append(opp)
+
+        # 检查2: 完备集套利 (所有outcome的YES价格总和 < 100)
+        total_yes = sum(o.yes_price for o in market.outcomes_detail)
+
+        if total_yes < 0.98:  # 允许2%误差
+            profit = 1.0 - total_yes
+            profit_pct = (profit / total_yes) * 100 if total_yes > 0 else 0
+
+            if profit_pct >= self.min_profit_pct:
+                outcomes_info = [
+                    f"{o.name}: ${o.yes_price:.3f}" for o in market.outcomes_detail
+                ]
+
+                opp = ArbitrageOpportunity(
+                    id=f"exhaustive_outcomes_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    type="EXHAUSTIVE_OUTCOMES_ARBITRAGE",
+                    markets=[
+                        {
+                            "id": market.id,
+                            "question": market.question,
+                            "outcomes": [o.name for o in market.outcomes_detail],
+                            "yes_prices": [o.yes_price for o in market.outcomes_detail],
+                        }
+                    ],
+                    relationship="exhaustive_outcomes",
+                    confidence=0.85,
+                    total_cost=total_yes,
+                    guaranteed_return=1.0,
+                    profit=profit,
+                    profit_pct=profit_pct,
+                    action=f"买所有outcome的YES:\n" + "\n".join([f"  - 买 '{o.name}' YES @ ${o.yes_price:.3f}" for o in market.outcomes_detail]),
+                    reasoning=f"多outcome完备集套利：所有outcome的YES价格总和 ({total_yes:.3f}) < $1.00\n各outcome价格:\n" + "\n".join([f"  - {info}" for info in outcomes_info]),
+                    edge_cases=[
+                        "确认所有outcome覆盖了所有可能的结果（完备集）",
+                        "确认各outcome之间互斥（不会同时为真）",
+                        "检查所有outcome的流动性是否充足",
+                    ],
+                    needs_review=[
+                        f"中间价利润: {profit:.3f} ({profit_pct:.1f}%)",
+                        f"Outcome数量: {len(market.outcomes_detail)}",
+                    ],
+                    timestamp=datetime.now().isoformat()
+                )
+                opportunities.append(opp)
+
+        return opportunities
+
+    # ============================================================
+    # ✅ 新增: 跨Event套利检测方法
+    # ============================================================
+
+    def check_cross_event_equivalent(
+        self,
+        event1_slug: str,
+        event2_slug: str,
+        client: 'PolymarketClient'
+    ) -> List[ArbitrageOpportunity]:
+        """
+        检测跨Event的等价市场套利
+
+        例如：
+        - Event 1: "bitcoin-price-on-january-6" 有 ">98,000" 区间市场
+        - Event 2: "bitcoin-above-on-january-6" 有 ">98,000" 阈值市场
+        - 这两个市场问的是同一件事，如果价格不同则存在套利
+
+        Args:
+            event1_slug: 第一个event的slug
+            event2_slug: 第二个event的slug
+            client: PolymarketClient实例
+
+        Returns:
+            检测到的套利机会列表
+        """
+        opportunities = []
+
+        # 获取两个event的市场
+        markets1 = client.get_markets_in_event(event1_slug)
+        markets2 = client.get_markets_in_event(event2_slug)
+
+        if not markets1 or not markets2:
+            logger.warning(f"无法获取event市场: {event1_slug} 或 {event2_slug}")
+            return opportunities
+
+        # 使用规则匹配识别等价市场
+        for m1 in markets1:
+            for m2 in markets2:
+                if self._are_equivalent_markets(m1, m2):
+                    # 检查价差
+                    price1 = m1.effective_buy_price
+                    price2 = m2.effective_buy_price
+                    spread = abs(price1 - price2)
+
+                    # 价差阈值: 0.3%
+                    if spread > 0.003:
+                        # 确定买卖方向
+                        if price1 < price2:
+                            cheaper, expensive = m1, m2
+                        else:
+                            cheaper, expensive = m2, m1
+
+                        profit = spread
+                        profit_pct = (spread / expensive.effective_buy_price) * 100
+
+                        if profit_pct >= self.min_profit_pct:
+                            opportunities.append(ArbitrageOpportunity(
+                                id=f"cross_event_eq_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                                type="CROSS_EVENT_EQUIVALENT",
+                                markets=[
+                                    {"id": cheaper.id, "question": cheaper.question,
+                                     "yes_price": cheaper.yes_price, "event": event1_slug},
+                                    {"id": expensive.id, "question": expensive.question,
+                                     "yes_price": expensive.yes_price, "event": event2_slug}
+                                ],
+                                relationship="equivalent_cross_event",
+                                confidence=0.75,
+                                total_cost=expensive.effective_buy_price,
+                                guaranteed_return=cheaper.effective_buy_price,
+                                profit=profit,
+                                profit_pct=profit_pct,
+                                action=f"买 '{cheaper.question[:50]}...' YES @ ${cheaper.effective_buy_price:.3f}\n"
+                                       f"卖 '{expensive.question[:50]}...' YES @ ${expensive.effective_buy_price:.3f}",
+                                reasoning=f"跨Event等价市场套利：两个市场问同一问题但价格不同\n"
+                                         f"Event1 ({event1_slug}): {m1.question} @ ${price1:.3f}\n"
+                                         f"Event2 ({event2_slug}): {m2.question} @ ${price2:.3f}",
+                                edge_cases=[
+                                    "确认两个市场的结算规则完全一致",
+                                    "确认结算时间相同",
+                                    "检查边界值处理是否相同"
+                                ],
+                                needs_review=[
+                                    f"价差: {spread:.4f} ({spread*100:.2f} cents)",
+                                    f"Event1 slug: {event1_slug}",
+                                    f"Event2 slug: {event2_slug}"
+                                ],
+                                timestamp=datetime.now().isoformat()
+                            ))
+
+        return opportunities
+
+    def check_event_implication_arbitrage(
+        self,
+        event_slug: str,
+        client: 'PolymarketClient'
+    ) -> List[ArbitrageOpportunity]:
+        """
+        检测同一Event内的蕴含关系套利（单调性违反）
+
+        例如：在"Bitcoin above" event中
+        - P(>98k) 蕴含 P(>96k)
+        - 应该满足: P(>96k) >= P(>98k)
+        - 如果违反，则存在套利机会
+
+        Args:
+            event_slug: Event slug
+            client: PolymarketClient实例
+
+        Returns:
+            检测到的套利机会列表
+        """
+        opportunities = []
+
+        # 获取event的所有市场
+        markets = client.get_markets_in_event(event_slug)
+        if not markets:
+            return opportunities
+
+        # 识别阈值递增序列（如 ">78k", ">80k", ">82k" ...）
+        threshold_markets = self._extract_threshold_markets(markets)
+        if len(threshold_markets) < 2:
+            return opportunities
+
+        # 按阈值排序
+        threshold_markets.sort(key=lambda m: m.get("threshold_value", float("inf")))
+
+        # 检查单调性: P(>T1) >= P(>T2) if T1 < T2
+        for i in range(len(threshold_markets) - 1):
+            m_lower = threshold_markets[i]["market"]   # 较低阈值
+            m_higher = threshold_markets[i + 1]["market"]  # 较高阈值
+
+            price_lower = m_lower.effective_buy_price
+            price_higher = m_higher.effective_buy_price
+
+            # 单调性违反: 较低阈值的价格应该 >= 较高阈值的价格
+            if price_lower < price_higher:
+                # 违反！存在套利机会
+                # 策略：买较低的阈值（YES），卖较高的阈值（YES）
+                total_cost = price_higher + (1 - price_lower)
+                profit = 1.0 - total_cost
+                profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
+
+                if profit_pct >= self.min_profit_pct:
+                    t_lower = threshold_markets[i]["threshold_value"]
+                    t_higher = threshold_markets[i + 1]["threshold_value"]
+
+                    opportunities.append(ArbitrageOpportunity(
+                        id=f"event_implication_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                        type="EVENT_IMPLICATION_VIOLATION",
+                        markets=[
+                            {"id": m_lower.id, "question": m_lower.question,
+                             "yes_price": m_lower.yes_price, "threshold": t_lower},
+                            {"id": m_higher.id, "question": m_higher.question,
+                             "yes_price": m_higher.yes_price, "threshold": t_higher}
+                        ],
+                        relationship="implication_violation",
+                        confidence=0.85,
+                        total_cost=total_cost,
+                        guaranteed_return=1.0,
+                        profit=profit,
+                        profit_pct=profit_pct,
+                        action=f"买 '{m_lower.question[:50]}...' YES @ ${price_lower:.3f}\n"
+                               f"买 '{m_higher.question[:50]}...' NO @ ${(1 - price_higher):.3f}",
+                        reasoning=f"蕴含关系违反：P(>{t_lower}) = ${price_lower:.3f} < P(>{t_higher}) = ${price_higher:.3f}\n"
+                                 f"应该满足: P(>{t_lower}) >= P(>{t_higher})",
+                        edge_cases=[
+                            "确认两个市场的结算规则一致",
+                            "确认结算时间相同",
+                            "验证阈值提取正确"
+                        ],
+                        needs_review=[
+                            f"违反程度: {price_higher - price_lower:.4f}",
+                            f"Event: {event_slug}"
+                        ],
+                        timestamp=datetime.now().isoformat()
+                    ))
+
+        return opportunities
+
+    def _are_equivalent_markets(self, m1: Market, m2: Market) -> bool:
+        """
+        判断两个市场是否等价（问同一问题）
+
+        改进逻辑：
+        1. 相同的结算日期
+        2. 检查否定关系词对 - 如果存在则为互补市场，非等价
+        3. 数字和关键词相似度检查
+        4. 同义词识别（> / above, less / below等）
+
+        Args:
+            m1: 第一个市场
+            m2: 第二个市场
+
+        Returns:
+            是否等价
+        """
+        # 结算日期必须相同
+        if m1.end_date != m2.end_date:
+            return False
+
+        q1 = m1.question.lower()
+        q2 = m2.question.lower()
+
+        # 首先检查是否是互补（否定）关系
+        # 如果问题是互补的，则不等价
+        negation_pairs = [
+            ("less than", "above"),
+            ("less than", "greater than"),
+            ("below", "above"),
+            ("below", "greater than"),
+            ("under", "above"),
+            ("under", "over"),
+            ("<", ">"),
+            ("≤", "≥"),
+            ("<=", ">="),
+        ]
+
+        for neg1, neg2 in negation_pairs:
+            # 检查m1是否有neg1且m2有neg2，或反之
+            has_neg1_in_q1 = neg1 in q1
+            has_neg2_in_q1 = neg2 in q1
+            has_neg1_in_q2 = neg1 in q2
+            has_neg2_in_q2 = neg2 in q2
+
+            # 如果一个问题包含否定词对中的一个，另一个包含另一个
+            # 则它们是互补的，不等价
+            if (has_neg1_in_q1 and has_neg2_in_q2) or (has_neg2_in_q1 and has_neg1_in_q2):
+                return False
+
+        # 检查数字是否相同
+        import re
+        numbers1 = re.findall(r'\d+', q1)
+        numbers2 = re.findall(r'\d+', q2)
+
+        if not numbers1 or not numbers2 or numbers1 != numbers2:
+            return False
+
+        # 同义词映射 - 在相似度计算前进行标准化
+        synonym_map = {
+            ">": "above",
+            ">=": "at least",
+            "greater than": "above",
+            "over": "above",
+            "exceed": "above",
+            "<": "below",
+            "<=": "at most",
+            "less than": "below",
+            "under": "below",
+        }
+
+        # 标准化问题文本
+        q1_normalized = q1
+        q2_normalized = q2
+        for old, new in synonym_map.items():
+            q1_normalized = q1_normalized.replace(old, new)
+            q2_normalized = q2_normalized.replace(old, new)
+
+        # 进一步检查关键词相似度
+        keywords1 = set(re.findall(r'[a-z]+', q1_normalized))
+        keywords2 = set(re.findall(r'[a-z]+', q2_normalized))
+
+        # 移除停用词（常见但不具区分度的词）
+        stopwords = {'the', 'a', 'an', 'on', 'in', 'at', 'by', 'for', 'to', 'of', 'will', 'be', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'}
+        keywords1 -= stopwords
+        keywords2 -= stopwords
+
+        # 计算关键词相似度
+        intersection = keywords1 & keywords2
+        union = keywords1 | keywords2
+        similarity = len(intersection) / len(union) if union else 0
+
+        return similarity > 0.4  # 降低阈值到40%（因为标准化后关键词更少了）  # 50%相似度阈值
+
+    def _extract_threshold_markets(self, markets: List[Market]) -> List[Dict]:
+        """
+        从市场列表中提取阈值市场
+
+        阈值市场示例："Will BTC be above $98,000?"
+        提取阈值: 98000
+
+        Args:
+            markets: Market列表
+
+        Returns:
+            [{"threshold_value": 98000, "market": Market}, ...]
+        """
+        threshold_markets = []
+        import re
+
+        for market in markets:
+            # 查找问题中的数字
+            question = market.question.lower()
+
+            # 匹配 "above $X" 或 "above X" 或 "> X" 模式
+            match = re.search(r'above\s*\$?(\d+)', question)
+            if match:
+                threshold = int(match.group(1))
+                threshold_markets.append({
+                    "threshold_value": threshold,
+                    "market": market
+                })
+                continue
+
+            # 匹配 ">X,000" 模式
+            match = re.search(r'(\d+)k', question)
+            if match:
+                threshold = int(match.group(1)) * 1000
+                threshold_markets.append({
+                    "threshold_value": threshold,
+                    "market": market
+                })
+
+        return threshold_markets
+
 
 # ============================================================
 # 相似度筛选器
@@ -1934,71 +2657,88 @@ class ArbitrageScanner:
     def scan(self) -> List[ArbitrageOpportunity]:
         """执行完整扫描"""
         opportunities = []
-        
+
         self._print_header()
-        
+
         # Step 1: 获取市场
-        print("\n[1/4] 获取市场数据...")
+        print("\n[1/5] 获取市场数据...")
         markets = self.client.get_markets(
             limit=self.config.scan.market_limit,
             min_liquidity=self.config.scan.min_liquidity
         )
         print(f"      获取到 {len(markets)} 个高流动性市场")
-        
+
         if not markets:
             print("      ❌ 无法获取市场数据")
             return []
-        
-        # Step 2: 检查完备集
-        print("\n[2/4] 扫描完备集套利...")
+
+        # Step 2: 检测单市场内部套利（多outcome市场）
+        print("\n[2/5] 扫描单市场内部套利（多outcome市场）...")
+        multi_outcome_markets = [m for m in markets if m.is_multi_outcome]
+        print(f"      发现 {len(multi_outcome_markets)} 个多outcome市场")
+
+        for market in multi_outcome_markets:
+            # 为多outcome市场获取订单簿数据
+            if market.is_multi_outcome:
+                self.client.enrich_multi_outcome_market(market)
+
+            # 检测单市场套利
+            single_market_opps = self.detector.check_single_market_arbitrage(market)
+            if single_market_opps:
+                opportunities.extend(single_market_opps)
+                for opp in single_market_opps:
+                    print(f"        [ARBITRAGE] {opp.type}: 利润={opp.profit_pct:.2f}%")
+
+        # Step 3: 检查完备集
+        print("\n[3/5] 扫描完备集套利...")
         event_groups = self._group_by_event(markets)
         print(f"      发现 {len(event_groups)} 个事件组")
-        
+
         for event_id, group in event_groups.items():
             if len(group) >= 2:
                 total = sum(m.yes_price for m in group)
                 if self.config.output.detailed_log:
                     print(f"      - {event_id}: {len(group)}个市场, Σ={total:.3f}")
-                
+
                 opp = self.detector.check_exhaustive_set(group)
                 if opp:
                     opportunities.append(opp)
                     print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
-        
-        # Step 3: 分析相似市场对
-        print("\n[3/4] 分析逻辑关系...")
+
+        # Step 4: 分析相似市场对
+        print("\n[4/5] 分析逻辑关系...")
         similar_pairs = self.filter.find_similar_pairs(markets)
         print(f"      发现 {len(similar_pairs)} 对相似市场")
-        
+
         analyzed = 0
         max_calls = self.config.scan.max_llm_calls
-        
+
         for m1, m2, sim in similar_pairs:
             if analyzed >= max_calls:
                 break
-            
+
             # 跳过同一事件的（已在完备集检查中处理）
             if m1.event_id and m1.event_id == m2.event_id:
                 continue
-            
+
             analyzed += 1
             if self.config.output.detailed_log:
                 print(f"      分析 #{analyzed}: {m1.question[:40]}... vs {m2.question[:40]}...")
-            
+
             analysis = self.analyzer.analyze(m1, m2)
             rel = analysis.get("relationship", "UNRELATED")
             conf = analysis.get("confidence", 0)
-            
+
             if self.config.output.detailed_log:
                 print(f"        关系={rel}, 置信度={conf:.2f}")
-            
+
             opp = self.detector.check_pair(m1, m2, analysis)
             if opp:
                 opportunities.append(opp)
                 print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
-        
-        # Step 4: 生成报告
-        print("\n[4/4] 生成报告...")
+
+        # Step 5: 生成报告
+        print("\n[5/5] 生成报告...")
         self._save_report(opportunities)
         self._print_summary(opportunities)
         
@@ -2044,6 +2784,24 @@ class ArbitrageScanner:
         embeddings = self.semantic_clusterer.get_embeddings(questions)
         logging.info(f"[OK] 向量化完成")
 
+        # Step 2.5: 单市场内部套利检测（多outcome市场）
+        logging.info("[Step 2.5] 扫描单市场内部套利（多outcome市场）...")
+        multi_outcome_markets = [m for m in all_markets if m.is_multi_outcome]
+        logging.info(f"[OK] 发现 {len(multi_outcome_markets)} 个多outcome市场")
+
+        opportunities = []
+        for market in multi_outcome_markets:
+            # 为多outcome市场获取订单簿数据
+            if market.is_multi_outcome:
+                self.client.enrich_multi_outcome_market(market)
+
+            # 检测单市场套利
+            single_market_opps = self.detector.check_single_market_arbitrage(market)
+            if single_market_opps:
+                opportunities.extend(single_market_opps)
+                for opp in single_market_opps:
+                    logging.info(f"  [ARBITRAGE] {opp.type}: 利润={opp.profit_pct:.2f}%")
+
         # Step 3: 语义聚类
         logging.info(f"[Step 3] 语义聚类 (threshold={semantic_threshold})...")
         clusters = self.semantic_clusterer.cluster_markets(
@@ -2062,7 +2820,7 @@ class ArbitrageScanner:
 
         # Step 4: 全自动聚类内套利分析
         logging.info("🔍 Step 4: 聚类内套利分析...")
-        opportunities = []
+        # opportunities 已在 Step 2.5 中初始化
         llm_call_count = 0
         max_llm_calls = self.config.scan.max_llm_calls
 
@@ -2123,33 +2881,92 @@ class ArbitrageScanner:
 
         return opportunities
 
+    def _load_tag_categories(self) -> Dict[str, List[str]]:
+        """
+        加载标签分类文件
+
+        Returns:
+            字典，key为类别名，value为tag slug列表
+        """
+        tag_categories_file = Path(__file__).parent / "data" / "tag_categories.json"
+        if not tag_categories_file.exists():
+            logging.warning(f"[WARNING] 标签分类文件不存在: {tag_categories_file}")
+            return {}
+
+        try:
+            with open(tag_categories_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get("categories", {})
+        except Exception as e:
+            logging.error(f"[ERROR] 加载标签分类失败: {e}")
+            return {}
+
     def _fetch_domain_markets(self, domain: str) -> List[Market]:
         """
         获取指定领域的所有市场（带缓存）
 
+        使用分类后的tags来获取市场，确保获取该领域的所有市场。
+
         Args:
-            domain: 领域标识 ("crypto", "politics", "sports", "other")
+            domain: 领域标识 ("crypto", "politics", "sports", "economics", "entertainment", "other")
 
         Returns:
             市场列表
         """
-        if domain == "crypto":
-            # 加密货币市场：使用多关键词策略
-            fetcher = lambda: self.client.fetch_crypto_markets(
-                min_liquidity=self.config.scan.min_liquidity
-            )
-        else:
-            # 其他领域：获取通用市场并过滤
-            def fetcher():
-                all_markets = self.client.get_markets(
-                    limit=500,
+        # 加载标签分类
+        tag_categories = self._load_tag_categories()
+
+        if not tag_categories or domain not in tag_categories:
+            logging.warning(f"[WARNING] 域 '{domain}' 的标签分类不存在")
+            # 回退到原始方法
+            if domain == "crypto":
+                fetcher = lambda: self.client.fetch_crypto_markets(
                     min_liquidity=self.config.scan.min_liquidity
                 )
-                # 按领域过滤
-                return [
-                    m for m in all_markets
-                    if self.domain_classifier.classify(m) == domain
-                ]
+            else:
+                def fetcher():
+                    all_markets = self.client.get_markets(
+                        limit=500,
+                        min_liquidity=self.config.scan.min_liquidity
+                    )
+                    return [m for m in all_markets if self.domain_classifier.classify(m) == domain]
+            return self.market_cache.load_or_fetch(domain, fetcher)
+
+        # 使用分类后的tags获取市场
+        def fetcher():
+            tag_slugs = tag_categories.get(domain, [])
+            if not tag_slugs:
+                logging.warning(f"[WARNING] 域 '{domain}' 没有关联的tags")
+                return []
+
+            logging.info(f"[FETCH] 域 '{domain}' 有 {len(tag_slugs)} 个tags")
+
+            all_markets = []
+            for i, slug in enumerate(tag_slugs):
+                try:
+                    markets = self.client.get_markets_by_tag_slug(
+                        slug,
+                        active=True,
+                        limit=100,
+                        min_liquidity=self.config.scan.min_liquidity
+                    )
+                    all_markets.extend(markets)
+                    if (i + 1) % 20 == 0:
+                        logging.info(f"  进度: {i+1}/{len(tag_slugs)} tags, 已获取 {len(all_markets)} 个市场")
+                except Exception as e:
+                    logging.debug(f"  获取tag '{slug}' 失败: {e}")
+                    continue
+
+            # 去重（基于market ID）
+            seen_ids = set()
+            unique_markets = []
+            for m in all_markets:
+                if m.id not in seen_ids:
+                    seen_ids.add(m.id)
+                    unique_markets.append(m)
+
+            logging.info(f"[DONE] 域 '{domain}' 获取到 {len(unique_markets)} 个唯一市场")
+            return unique_markets
 
         return self.market_cache.load_or_fetch(domain, fetcher)
 
@@ -2330,7 +3147,7 @@ class ArbitrageScanner:
 
             # ✅ 新增：Polymarket 链接
             links = self._generate_polymarket_links(opp.markets)
-            print(f"\n🔗 Polymarket 链接:")
+            print(f"\n[Polymarket 链接:]")
             for j, (market, link) in enumerate(zip(opp.markets, links), 1):
                 question = market.get('question', '')[:60]
                 print(f"  {j}. {question}...")
@@ -2357,10 +3174,146 @@ class ArbitrageScanner:
                     print(f"  • {item}")
 
             print()
-    
+
+    def scan_cross_event(
+        self,
+        event1_slug: str = "bitcoin-price-on-january-6",
+        event2_slug: str = "bitcoin-above-on-january-6",
+        check_implication: bool = True
+    ) -> List[ArbitrageOpportunity]:
+        """
+        跨Event套利扫描
+
+        检测两个相关event之间的套利机会：
+        1. 等价市场套利：不同event中问同一问题的市场
+        2. 蕴含关系套利：同一event内阈值市场的单调性违反
+
+        Args:
+            event1_slug: 第一个event的slug
+            event2_slug: 第二个event的slug
+            check_implication: 是否检查蕴含关系套利
+
+        Returns:
+            套利机会列表
+
+        Example:
+            scanner = ArbitrageScanner(config)
+            opps = scanner.scan_cross_event(
+                event1_slug="bitcoin-price-on-january-6",
+                event2_slug="bitcoin-above-on-january-6"
+            )
+        """
+        opportunities = []
+
+        print("=" * 70)
+        print("跨Event套利扫描")
+        print("=" * 70)
+
+        # 检测跨Event等价市场套利
+        print(f"\n[1/2] 检测跨Event等价市场套利...")
+        print(f"      Event 1: {event1_slug}")
+        print(f"      Event 2: {event2_slug}")
+
+        cross_event_opps = self.detector.check_cross_event_equivalent(
+            event1_slug, event2_slug, self.client
+        )
+
+        if cross_event_opps:
+            opportunities.extend(cross_event_opps)
+            print(f"      发现 {len(cross_event_opps)} 个跨Event等价市场套利机会!")
+            for opp in cross_event_opps:
+                print(f"        - {opp.type}: 利润={opp.profit_pct:.2f}%")
+        else:
+            print(f"      未发现跨Event等价市场套利")
+
+        # 检测同Event内的蕴含关系套利
+        if check_implication:
+            print(f"\n[2/2] 检测同Event蕴含关系套利...")
+            print(f"      检查Event: {event2_slug} (阈值市场)")
+
+            implication_opps = self.detector.check_event_implication_arbitrage(
+                event2_slug, self.client
+            )
+
+            if implication_opps:
+                opportunities.extend(implication_opps)
+                print(f"      发现 {len(implication_opps)} 个蕴含关系套利机会!")
+                for opp in implication_opps:
+                    print(f"        - {opp.type}: 利润={opp.profit_pct:.2f}%")
+            else:
+                print(f"      未发现蕴含关系套利")
+
+        # 生成报告
+        if opportunities:
+            print("\n" + "=" * 70)
+            print(f"总计发现 {len(opportunities)} 个套利机会")
+            print("=" * 70)
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"cross_event_scan_{timestamp}.json"
+            output_path = Path(self.config.output.output_dir) / filename
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump([asdict(opp) for opp in opportunities], f, indent=2, ensure_ascii=False)
+
+            print(f"报告已保存: {output_path}")
+        else:
+            print("\n未发现套利机会")
+
+        return opportunities
+
     def close(self):
         """清理资源"""
         self.analyzer.close()
+
+
+# ============================================================
+# 交互式菜单函数
+# ============================================================
+
+def interactive_domain_select(default_domain: str = "crypto") -> str:
+    """交互式领域选择菜单
+
+    Args:
+        default_domain: 默认领域
+
+    Returns:
+        选择的领域名称
+    """
+    domains = {
+        "1": ("crypto", "加密货币"),
+        "2": ("politics", "政治"),
+        "3": ("sports", "体育"),
+        "4": ("other", "其他")
+    }
+
+    print("\n" + "=" * 55)
+    print("请选择要扫描的市场领域:")
+    print("=" * 55)
+    for num, (key, name) in domains.items():
+        default_mark = " (默认)" if key == default_domain else ""
+        print(f"  {num}. {key:10s} - {name}{default_mark}")
+    print("=" * 55)
+
+    while True:
+        prompt = f"请输入选项 [1-4，直接回车使用默认={default_domain}]: "
+        choice = input(prompt).strip()
+
+        # 默认选择
+        if not choice:
+            return default_domain
+
+        # 数字输入
+        if choice in domains:
+            return domains[choice][0]
+
+        # 直接输入领域名
+        for key, name in domains.values():
+            if choice.lower() == key:
+                return key
+
+        print("[错误] 无效选项，请重新输入")
 
 
 # ============================================================
@@ -2414,11 +3367,11 @@ def main():
         help="列出所有可用的LLM配置"
     )
 
-    # 🆕 向量化模式相关参数
+    # 🆕 向量化模式相关参数（默认启用）
     parser.add_argument(
-        "--semantic",
+        "--no-semantic",
         action="store_true",
-        help="启用向量化模式（语义聚类）"
+        help="禁用向量化模式，使用传统关键词搜索"
     )
     parser.add_argument(
         "--domain", "-d",
@@ -2433,9 +3386,28 @@ def main():
         default=0.85,
         help="语义聚类相似度阈值 (默认: 0.85)"
     )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="禁用交互式菜单，直接使用默认配置"
+    )
 
     args = parser.parse_args()
-    
+
+    # ============================================================
+    # 交互式领域选择
+    # ============================================================
+    # 确定要扫描的领域
+    domain = args.domain  # 默认为 "crypto"
+
+    # 默认启用交互式选择（除非通过 --no-interactive 禁用）
+    # 注意：移除了 sys.stdin.isatty() 检查，因为 uv run 等工具会导致它返回 False
+    if not args.no_interactive:
+        print(f"\n[配置] 当前领域: {domain}")
+        change = input("是否更改领域? (y/n, 直接回车=n): ").strip().lower()
+        if change in ['y', 'yes']:
+            domain = interactive_domain_select(args.domain)
+
     # 列出配置
     if args.list_profiles:
         from llm_config import LLMConfigManager, print_profiles_table
@@ -2453,23 +3425,25 @@ def main():
         config.scan.market_limit = args.market_limit
     
     # 创建扫描器
+    # 默认启用向量化模式，使用 --no-semantic 禁用
+    use_semantic = not args.no_semantic
     scanner = ArbitrageScanner(
         config,
         profile_name=args.profile,
         model_override=args.model,
-        use_semantic=args.semantic  # 🆕 传递向量化模式标志
+        use_semantic=use_semantic  # 默认启用向量化模式
     )
 
     try:
-        # 🆕 根据模式选择扫描方法
-        if args.semantic:
-            logging.info(f"[START] 启动向量化模式 - 领域: {args.domain}, 阈值: {args.threshold}")
+        # 根据模式选择扫描方法
+        if use_semantic:
+            logging.info(f"[START] 向量化模式 - 领域: {domain}, 阈值: {args.threshold}")
             opportunities = scanner.scan_semantic(
-                domain=args.domain,
+                domain=domain,
                 semantic_threshold=args.threshold
             )
         else:
-            logging.info("⚠️ 传统模式（关键词搜索）")
+            logging.info("[START] 传统模式（关键词搜索）")
             opportunities = scanner.scan()
         
         print("\n" + "=" * 65)

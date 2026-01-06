@@ -20,7 +20,6 @@
 """
 
 import sys
-import io
 import json
 import numpy as np
 import requests
@@ -50,27 +49,31 @@ class SemanticClusterer:
 
     def __init__(self, config_path: str = "config.json"):
         """初始化聚类器"""
-        self.config = self._load_config(config_path)
-        self.api_base = self.config.get('llm', {}).get('api_base', 'https://api.siliconflow.cn/v1')
-        self.api_key = self.config.get('llm', {}).get('api_key', '')
+        from config import Config
 
-        # SiliconFlow 支持的 Embedding 模型
-        self.embed_model = "BAAI/bge-large-zh-v1.5"
+        config = Config.load(config_path)
+
+        # 从 active_profile 获取 API 配置
+        if config.active_profile and config.active_profile in config.llm_profiles:
+            profile = config.llm_profiles[config.active_profile]
+            # 过滤掉注释字段
+            profile = {k: v for k, v in profile.items() if not k.startswith('_')}
+            self.api_base = profile.get('api_base', 'https://api.siliconflow.cn/v1')
+            self.api_key = profile.get('api_key', '')
+            # 从 profile 读取 embedding_model，如果没有则使用默认值
+            self.embed_model = profile.get('embedding_model', 'BAAI/bge-large-zh-v1.5')
+        else:
+            # 回退到 llm 字段（向后兼容）
+            self.api_base = config.llm.api_base or 'https://api.siliconflow.cn/v1'
+            self.api_key = config.llm.api_key
+            self.embed_model = config.scan.embedding_model  # 从 scan 配置读取
 
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        })
-
-    def _load_config(self, config_path: str) -> Dict:
-        """加载配置文件"""
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            print(f"Warning: {config_path} not found, using defaults")
-            return {}
+        if self.api_key:
+            self.session.headers.update({
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            })
 
     def get_embedding(self, text: str) -> np.ndarray:
         """获取单个文本的向量嵌入"""
@@ -310,74 +313,3 @@ class SemanticClusterer:
         return result
 
 
-def demo():
-    """演示语义聚类功能"""
-    print("=" * 70)
-    print("Semantic Clustering Demo")
-    print("=" * 70)
-
-    # 初始化
-    clusterer = SemanticClusterer()
-
-    # 直接从API获取市场数据（避免使用Market对象）
-    print("\n[1] Fetching markets...")
-    import requests
-    session = requests.Session()
-    session.headers.update({"User-Agent": "SemanticCluster/1.0"})
-
-    url = "https://gamma-api.polymarket.com/markets"
-    params = {"limit": 200, "active": "true", "order": "volume", "ascending": "false"}
-    response = session.get(url, params=params, timeout=30)
-    markets = response.json()
-    print(f"    Got {len(markets)} markets")
-
-    # 语义搜索
-    print("\n[2] Semantic search: 'Bitcoin price January'")
-    similar = clusterer.find_similar_markets(
-        query="Bitcoin price January",
-        markets=markets,
-        top_k=15,
-        threshold=0.4
-    )
-
-    print(f"    Found {len(similar)} similar markets:")
-    for i, item in enumerate(similar[:10], 1):
-        print(f"    [{i}] Sim={item['similarity']:.3f}: {item['question'][:60]}...")
-
-    # 聚类
-    print("\n[3] Clustering Bitcoin-related markets...")
-    btc_markets = [m for m in markets
-                   if 'bitcoin' in m.get('question', '').lower()
-                   or 'btc' in m.get('question', '').lower()]
-
-    print(f"    Bitcoin markets: {len(btc_markets)}")
-
-    if btc_markets:
-        # 使用较高阈值产生更细粒度的聚类
-        clusters = clusterer.cluster_markets(btc_markets, similarity_threshold=0.85)
-        print(f"    Generated {len(clusters)} clusters (threshold=0.85):")
-
-        for i, cluster in enumerate(clusters[:5], 1):
-            print(f"\n    Cluster {i} ({len(cluster)} markets):")
-            for m in cluster[:3]:
-                print(f"      - {m.get('question', '')[:55]}...")
-            if len(cluster) > 3:
-                print(f"      ... and {len(cluster) - 3} more")
-
-    # 搜索January相关市场
-    print("\n[4] Searching for 'Bitcoin January 4' markets...")
-    jan_similar = clusterer.find_similar_markets(
-        query="Bitcoin price above below January 4 2026",
-        markets=markets,
-        top_k=20,
-        threshold=0.5
-    )
-    print(f"    Found {len(jan_similar)} similar markets:")
-    for i, item in enumerate(jan_similar[:15], 1):
-        print(f"    [{i}] Sim={item['similarity']:.3f}: {item['question'][:55]}...")
-
-    print("\n[Done]")
-
-
-if __name__ == "__main__":
-    demo()

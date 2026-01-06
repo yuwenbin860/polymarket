@@ -17,19 +17,24 @@
 
 ## 当前状态
 
-**当前阶段**: Phase 3 - 向量化驱动的套利发现系统
+**当前阶段**: Phase 3 - Event-based跨市场套利检测
 
-**最后更新**: 2026-01-04 (v2.0.2 LLM完备集验证)
+**最后更新**: 2026-01-06 (等价市场匹配误报修复)
 
 **当前焦点**:
-- ✅ **向量化系统全面集成完成** (Phase 3)
-- ✅ 语义聚类 + 按领域获取市场
-- ✅ 全自动聚类内套利分析
-- ✅ **修复完备集误判Bug** (v2.0.1) - event_id 验证
-- ✅ **LLM 完备集语义验证** (v2.0.2) - 双重验证架构
-- 🔄 寻找真实套利案例测试
+- ✅ **Event API结构调查完成** - 发现"多区间市场"实际是多个独立二元市场
+- ✅ **跨Event等价市场检测** - 新增 `check_cross_event_equivalent()`
+- ✅ **Event蕴含关系检测** - 新增 `check_event_implication_arbitrage()`
+- ✅ **等价市场匹配误报修复** - 添加否定关系词对检测 + 同义词标准化 (6/6测试通过)
+- 🔄 继续运行扫描寻找真正的套利机会
 
 **版本历史**:
+- v2.0.8 (2026-01-06): **等价市场匹配误报修复** - 否定关系检测 + 同义词标准化
+- v2.0.7 (2026-01-06): **Event-based跨Event套利检测** - 新增跨Event等价/蕴含关系检测
+- v2.0.6 (2026-01-06): **Tag分类系统 + 项目清理** - 2757个tags分类 + 代码/文件清理
+- v2.0.5 (2026-01-05): **阈值蕴含方向验证** - 自动检测价格阈值类市场的蕴含方向错误
+- v2.0.4 (2026-01-05): **LLM错误日志增强** - 详细记录超时、HTTP错误、堆栈跟踪
+- v2.0.3 (2026-01-05): **关键Bug修复** - ValidationResult大小写比较 + 首个套利案例发现
 - v2.0.2 (2026-01-04): **LLM完备集验证** - 增加语义层验证
 - v2.0.1 (2026-01-04): **完备集误判Bug修复** - 语义相似 ≠ 完备集
 - v2.0 (2026-01-04): **向量化套利发现系统** - 召回问题彻底解决
@@ -104,6 +109,218 @@
 ## 工作日志
 
 > 按时间倒序记录每次工作的进展
+
+### 2026-01-06 (v2.0.6 Tag分类系统 + 项目清理)
+
+- ✅ **Tag全集获取与分类系统** (v2.0.6)
+
+  **完成内容**:
+  - 创建 `scripts/fetch_all_tags.py` - 分页获取所有Polymarket tags
+  - 创建 `scripts/classify_tags_rules.py` - 基于规则的tag分类
+  - 创建 `scripts/classify_tags_with_llm.py` - LLM分类脚本（备用）
+  - 获取 **2757个tags** 并分类到各个领域
+
+  **分类结果**:
+  - crypto: 44 tags (1.6%)
+  - politics: 104 tags (3.8%)
+  - sports: 117 tags (4.2%)
+  - economics: 16 tags (0.6%)
+  - entertainment: 37 tags (1.3%)
+  - other: 2439 tags (88.5%)
+
+  **代码修改**:
+  - 更新 `local_scanner_v2.py`:
+    - 新增 `_load_tag_categories()` 方法
+    - 修改 `_fetch_domain_markets()` 使用分类后的tags
+    - 确保获取每个领域的全部市场（无遗漏）
+
+  **Bug修复**:
+  - 修复 Unicode编码错误（summary输出中emoji）
+  - 修复 `ArbitrageOpportunity` 序列化缺少 `liquidity` 字段
+
+  **新增数据文件**:
+  - `data/polymarket_tags.json` (658KB) - 完整tags数据
+  - `data/tag_categories.json` (134KB) - 分类结果
+
+  **影响**:
+  - 确保每个领域的市场数据是全集
+  - 不再依赖关键词搜索（容易遗漏）
+  - 直接通过tag slug获取市场
+
+- ✅ **项目代码清理** (v2.0.6)
+
+  **归档文件** (22个):
+  - 测试脚本 (7个): test_*.py → archive/tests/
+  - 搜索脚本 (6个): search_*.py → archive/searches/
+  - 工具脚本 (8个): fetch_*.py, check_*.py 等 → archive/utils/
+  - 临时文档 (1个): ENCODING_FIX.md → archive/docs/
+
+  **删除文件** (6个):
+  - 日志文件: scan_output.log, scan_output.txt, scan_results.log, scan_run.log
+  - 临时文件: phase0_output.json, nul
+  - Python缓存: __pycache__/ (清空)
+
+  **代码清理** (4个文件):
+  - `local_scanner_v2.py`: 删除未使用的 `import io`
+  - `semantic_cluster.py`: 删除 `demo()` 函数和 `if __name__ == "__main__"` 块
+  - `validators.py`: 删除 `validate_opportunity()` 函数和测试块
+  - `llm_providers.py`: 删除 `if __name__ == "__main__"` 测试块
+
+  **保留文件**:
+  - `PHASE2_FIX_PLAN.md` (任务未完成)
+
+---
+
+### 2026-01-05 (v2.0.5 阈值蕴含方向验证)
+
+- ✅ **阈值蕴含方向验证** (v2.0.5)
+
+  **问题发现**:
+  - Google Dip 套利案例 (30.38%利润) 经人工验证发现是**误报**
+  - LLM错误判断了蕴含方向：
+    - 市场A: "Will Google dip to $290?" @ $0.24
+    - 市场B: "Will Google dip to $240?" @ $0.007
+    - LLM判断: A→B (跌到$290蕴含跌到$240) **错误!**
+    - 正确逻辑: B→A (跌到$240必然先跌过$290)
+
+  **根本原因**:
+  - `prompts.py` 只有上涨阈值示例 ("BTC突破$150k → 突破$100k")
+  - 缺少下跌阈值示例，LLM混淆了方向
+  - 上涨vs下跌阈值的蕴含方向**相反**
+
+  **修复方案**:
+
+  1. **改进Prompt** (`prompts.py:55-71`)
+     - 添加下跌阈值示例: "Stock跌到$50 → Stock跌到$100"
+     - 明确说明上涨vs下跌方向相反
+     - 在IMPLIES_BA部分添加警告
+
+  2. **新增阈值验证器** (`validators.py:461-622`)
+     - `_extract_threshold_info()`: 从市场问题提取阈值信息(类型+数值)
+     - `validate_threshold_implication()`: 验证蕴含方向是否正确
+     - 支持k/K/M后缀 (如$150k = $150,000)
+     - 规则:
+       - 上涨(above/hit/突破): 更高阈值 → 更低阈值
+       - 下跌(dip/below/跌到): 更低阈值 → 更高阈值
+
+  3. **集成到扫描流程** (`local_scanner_v2.py:1470-1486`)
+     - 在 `_check_implication()` 中调用阈值验证
+     - LLM方向错误时直接拒绝套利机会
+
+  **测试结果**:
+  - 6/6 测试全部通过
+  - 关键测试: Google Dip案例被正确拒绝
+  - 测试文件: `test_threshold_validation.py`
+
+  **影响文件**:
+  - `prompts.py` - 添加下跌阈值示例
+  - `validators.py` - 新增2个方法
+  - `local_scanner_v2.py` - 集成阈值验证
+  - `test_threshold_validation.py` - 新建测试文件
+
+  **核心教训**:
+  - **上涨 vs 下跌阈值的蕴含方向相反!**
+  - 上涨: 更高阈值 → 更低阈值 (达到$150k必然达到$100k)
+  - 下跌: 更低阈值 → 更高阈值 (跌到$50必然跌过$100)
+
+---
+
+### 2026-01-05 (v2.0.4 LLM错误日志增强)
+
+- ✅ **增强LLM调用错误记录** (v2.0.4)
+
+  **改进内容**:
+
+  1. **初始化logging系统** (`local_scanner_v2.py:72-77`)
+     - 添加 `logging.basicConfig()` 配置
+     - 格式: `2026-01-05 16:11:17 [INFO] 消息内容`
+
+  2. **增强HTTP层错误处理** (`llm_providers.py:553-634`)
+     - 捕获 `httpx.TimeoutException` - 超时错误
+     - 捕获 `httpx.HTTPStatusError` - HTTP状态错误
+     - 捕获 `httpx.RequestError` - 网络错误
+     - 记录: URL、模型、超时设置、Prompt摘要、响应内容
+
+  3. **增强LLM分析错误记录** (`local_scanner_v2.py:959-981`)
+     - 记录: 错误类型、市场A/B问题、堆栈跟踪
+
+  4. **增强完备集验证错误记录** (`local_scanner_v2.py:1264-1298`)
+     - 记录: 事件标题、市场数量、市场样例
+
+  **改进前后对比**:
+  ```
+  # 改进前
+  LLM分析失败: The read operation timed out
+
+  # 改进后
+  2026-01-05 16:11:17 [ERROR] LLM请求超时
+    错误类型: ReadTimeout
+    请求URL: https://api.siliconflow.cn/v1/chat/completions
+    请求模型: deepseek-ai/DeepSeek-V3
+    超时设置: 60秒
+    Prompt摘要: 分析以下两个预测市场的逻辑关系...
+  ```
+
+  **影响文件**:
+  - `local_scanner_v2.py` - logging初始化 + 错误记录增强
+  - `llm_providers.py` - HTTP异常详细捕获
+
+---
+
+### 2026-01-05 (v2.0.3 关键Bug修复 + 首个套利案例)
+
+- ✅ **修复关键Bug: ValidationResult大小写比较** (v2.0.3)
+
+  **问题发现**:
+  - 运行扫描时发现矛盾日志: `[ERROR] 数学验证失败: 数学验证通过！净利润率: 22.79%`
+  - 验证通过的机会被错误地标记为失败并丢弃
+
+  **根本原因**:
+  - `validators.py:33`: `ValidationResult.PASSED = "passed"` (小写)
+  - `local_scanner_v2.py:1412`: `if validation_result.result.value != 'PASSED':` (大写)
+  - 大小写不匹配导致所有验证通过的机会都被错误过滤
+
+  **修复方案**:
+  ```python
+  # 修改前（错误）
+  if validation_result.result.value != 'PASSED':
+
+  # 修改后（正确）
+  from validators import ValidationResult as VR
+  if validation_result.result not in [VR.PASSED, VR.WARNING]:
+  ```
+
+  **影响**: 这是一个严重Bug，导致系统从v1.5开始一直无法正确识别套利机会！
+
+---
+
+- 🎉 **发现首个潜在套利案例: Google Dip**
+
+  **机会详情**:
+  - 市场A: "Will Google dip to $290 in January?" (P = $0.24)
+  - 市场B: "Will Google dip to $240 in January?" (P = $0.007)
+  - 关系: IMPLIES_AB (置信度 95%)
+  - 利润率: **30.38%**
+  - 报告: `output/scan_default_20260105_092337.json`
+
+  **验证状态**:
+  - ✅ LLM关系识别通过
+  - ✅ 数学验证通过
+  - ✅ 时间一致性验证通过
+  - ✅ 语义验证通过
+  - 🔄 **待人工复核** (需验证逻辑关系)
+
+  **注意**: LLM判断为 A→B (跌到$290则必跌到$240)，但逻辑上应该是 B→A (跌到$240必然先跌到$290)。需要人工验证LLM分析是否有误。
+
+---
+
+- ✅ **更新PROJECT_BIBLE.md任务状态**
+  - Phase 2: 标记为大部分完成
+  - Phase 3: 标记为进行中
+  - T3.1 向量相似度: 已完成
+  - T3.5 Kalshi API: 标记为不可用(需美国身份)
+
+---
 
 ### 2026-01-04 (v2.0.2 LLM完备集验证)
 
