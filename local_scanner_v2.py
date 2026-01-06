@@ -81,46 +81,6 @@ logger = logging.getLogger(__name__)
 # 数据结构
 # ============================================================
 
-@dataclass
-class Outcome:
-    """
-    多区间市场的一个outcome（选项）
-
-    例如在 "Bitcoin price on January 6" 市场中：
-    - outcomes = ["< 90k", "90k-95k", "95k-98k", "> 98k"]
-    - 每个outcome有独立的YES/NO价格和CLOB token
-
-    注意：在Polymarket的CLOB系统中，每个outcome的YES和NO价格是独立的
-    当 YES + NO < 100 时存在单outcome套利机会
-    """
-    name: str                  # 选项名称，如 "> 98000" 或 "Yes"
-    yes_price: float           # YES买价 (best_ask)
-    no_price: float            # NO买价 (best_ask for NO side)
-    yes_bid: float = 0.0       # YES卖价 (best_bid)
-    no_bid: float = 0.0        # NO卖价
-    token_id: str = ""         # CLOB token ID for YES side
-    token_id_no: str = ""      # CLOB token ID for NO side
-
-    def __repr__(self):
-        return f"Outcome('{self.name}', YES=${self.yes_price:.2f}, NO=${self.no_price:.2f})"
-
-    @property
-    def total_cost(self) -> float:
-        """买入YES+NO的总成本"""
-        return self.yes_price + self.no_price
-
-    @property
-    def has_arbitrage(self) -> bool:
-        """检查是否存在单outcome套利 (YES + NO < 100)"""
-        return self.total_cost <= 0.98  # 允许2%误差（使用<=包含边界情况）
-
-    @property
-    def arbitrage_profit(self) -> float:
-        """单outcome套利利润"""
-        if self.has_arbitrage:
-            return 1.0 - self.total_cost
-        return 0.0
-
 
 class RelationType(Enum):
     IMPLIES_AB = "implies_ab"
@@ -163,18 +123,12 @@ class Market:
     tags: List[Dict] = None       # Event的tags (用于分类过滤)
     orderbook: Dict = None        # Full orderbook data (for arbitrage opportunity reporting)
 
-    # ✅ 新增: 多outcome市场支持
-    outcomes_detail: List[Outcome] = None  # 每个outcome的详细信息 (YES/NO价格)
-    is_multi_outcome: bool = False          # 是否为多outcome市场 (>2个选项)
 
     def __post_init__(self):
         if self.tags is None:
             self.tags = []
         if self.orderbook is None:
             self.orderbook = {}
-        if self.outcomes_detail is None:
-            self.outcomes_detail = []
-
     def __repr__(self):
         return f"Market('{self.question[:50]}...', YES=${self.yes_price:.2f}, spread={self.spread:.3f})"
 
@@ -331,68 +285,9 @@ class PolymarketClient:
                 tags=tags
             )
 
-            # ✅ 新增: 检测并处理多outcome市场
-            if len(outcomes) > 2:
-                market.is_multi_outcome = True
-                # 为多outcome市场创建Outcome对象
-                market.outcomes_detail = self._parse_multi_outcomes(
-                    outcomes, token_ids, prices
-                )
-
             return market
         except Exception:
             return None
-
-    def _parse_multi_outcomes(
-        self,
-        outcomes: List[str],
-        token_ids: List[str],
-        prices: List[float]
-    ) -> List[Outcome]:
-        """
-        解析多outcome市场的每个outcome
-
-        对于多outcome市场（如价格区间市场）：
-        - 每个outcome有独立的YES token和NO token
-        - clobTokenIds数组结构: [outcome1_YES, outcome1_NO, outcome2_YES, outcome2_NO, ...]
-        - outcomePrices数组结构: [outcome1_YES_price, outcome2_YES_price, ...]
-
-        Args:
-            outcomes: 选项名称列表，如 ["< 90k", "90k-95k", "> 95k"]
-            token_ids: CLOB token ID列表
-            prices: YES价格列表
-
-        Returns:
-            List[Outcome] 对象列表
-        """
-        outcomes_detail = []
-
-        for i, outcome_name in enumerate(outcomes):
-            # 计算token索引：每个outcome有YES和NO两个token
-            yes_token_idx = i * 2
-            no_token_idx = i * 2 + 1
-
-            # 获取价格
-            yes_price = float(prices[i]) if i < len(prices) else 0.5
-
-            # 在CLOB系统中，NO价格通常需要单独获取
-            # 这里先使用1 - yes_price作为默认值，后续通过orderbook更新
-            no_price = 1.0 - yes_price
-
-            # 获取token IDs
-            yes_token = token_ids[yes_token_idx] if yes_token_idx < len(token_ids) else ""
-            no_token = token_ids[no_token_idx] if no_token_idx < len(token_ids) else ""
-
-            outcome = Outcome(
-                name=outcome_name,
-                yes_price=yes_price,
-                no_price=no_price,
-                token_id=yes_token,
-                token_id_no=no_token
-            )
-            outcomes_detail.append(outcome)
-
-        return outcomes_detail
 
     def fetch_orderbook(self, token_id: str) -> Dict:
         """
@@ -458,41 +353,6 @@ class PolymarketClient:
         market.orderbook = orderbook  # Store full orderbook for arbitrage reporting
 
         return market
-
-    def enrich_multi_outcome_market(self, market: Market) -> Market:
-        """
-        为多outcome市场补充每个outcome的订单簿数据
-
-        对于多outcome市场（如价格区间市场），每个outcome有独立的YES/NO token。
-        需要为每个outcome获取真实的YES和NO价格。
-
-        Args:
-            market: Market 对象 (is_multi_outcome=True)
-
-        Returns:
-            补充了每个outcome订单簿数据的 Market 对象
-        """
-        if not market.is_multi_outcome or not market.outcomes_detail:
-            return market
-
-        for outcome in market.outcomes_detail:
-            # 获取YES侧订单簿
-            if outcome.token_id:
-                yes_orderbook = self.fetch_orderbook(outcome.token_id)
-                outcome.yes_bid = yes_orderbook["best_bid"]
-                outcome.yes_price = yes_orderbook["best_ask"] or outcome.yes_price
-
-            # 获取NO侧订单簿
-            if outcome.token_id_no:
-                no_orderbook = self.fetch_orderbook(outcome.token_id_no)
-                outcome.no_bid = no_orderbook["best_bid"]
-                outcome.no_price = no_orderbook["best_ask"] or outcome.no_price
-
-        return market
-
-    # ============================================================
-    # ✅ 新增: 按Tag获取Events和Markets
-    # ============================================================
 
     def get_events_by_tag(
         self,
@@ -2120,129 +1980,6 @@ class ArbitrageDetector:
             timestamp=datetime.now().isoformat()
         )
 
-    def check_single_market_arbitrage(
-        self,
-        market: Market
-    ) -> List[ArbitrageOpportunity]:
-        """
-        检测单市场内部套利机会
-
-        针对多outcome市场（如价格区间市场）：
-        1. 单outcome套利：每个outcome的 YES + NO < 100
-        2. 完备集套利：所有outcome的YES价格总和 < 100
-
-        单outcome套利示例：
-            - ">98000" 区间: YES = 0.4, NO = 99.3
-            - 总成本 = 0.4 + 99.3 = 99.3% < 100%
-            - 套利：买YES + 买NO = 保证回报$1.00
-
-        完备集套利示例：
-            - 区间市场: ["<90k", "90k-95k", "95k-98k", ">98k"]
-            - YES价格: [0.1, 0.15, 0.2, 0.3]
-            - 总和 = 0.75 < 1.00
-            - 套利：买所有区间的YES = 保证回报$1.00
-
-        Args:
-            market: Market对象 (is_multi_outcome=True)
-
-        Returns:
-            List[ArbitrageOpportunity]: 检测到的套利机会列表
-        """
-        opportunities = []
-
-        # 只处理多outcome市场
-        if not market.is_multi_outcome or not market.outcomes_detail:
-            return opportunities
-
-        # 检查1: 单outcome内部套利 (YES + NO < 100)
-        for outcome in market.outcomes_detail:
-            if outcome.has_arbitrage:
-                profit = outcome.arbitrage_profit
-                profit_pct = (profit / outcome.total_cost) * 100 if outcome.total_cost > 0 else 0
-
-                if profit_pct >= self.min_profit_pct:
-                    opp = ArbitrageOpportunity(
-                        id=f"single_outcome_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                        type="SINGLE_OUTCOME_ARBITRAGE",
-                        markets=[
-                            {
-                                "id": market.id,
-                                "question": market.question,
-                                "outcome": outcome.name,
-                                "yes_price": outcome.yes_price,
-                                "no_price": outcome.no_price,
-                            }
-                        ],
-                        relationship="single_outcome_internal",
-                        confidence=0.90,  # 高置信度：这是数学确定性套利
-                        total_cost=outcome.total_cost,
-                        guaranteed_return=1.0,
-                        profit=profit,
-                        profit_pct=profit_pct,
-                        action=f"买 '{outcome.name}' YES @ ${outcome.yes_price:.3f} + NO @ ${outcome.no_price:.3f}",
-                        reasoning=f"单outcome内部套利：{outcome.name} 的YES+NO价格 ({outcome.yes_price:.3f} + {outcome.no_price:.3f} = {outcome.total_cost:.3f}) < $1.00",
-                        edge_cases=[
-                            "确认该outcome的结算规则清晰",
-                            "检查YES和NO的流动性是否充足",
-                        ],
-                        needs_review=[
-                            f"中间价利润: {profit:.3f} ({profit_pct:.1f}%)",
-                            f"YES价格: ${outcome.yes_price:.3f}, NO价格: ${outcome.no_price:.3f}",
-                        ],
-                        timestamp=datetime.now().isoformat()
-                    )
-                    opportunities.append(opp)
-
-        # 检查2: 完备集套利 (所有outcome的YES价格总和 < 100)
-        total_yes = sum(o.yes_price for o in market.outcomes_detail)
-
-        if total_yes < 0.98:  # 允许2%误差
-            profit = 1.0 - total_yes
-            profit_pct = (profit / total_yes) * 100 if total_yes > 0 else 0
-
-            if profit_pct >= self.min_profit_pct:
-                outcomes_info = [
-                    f"{o.name}: ${o.yes_price:.3f}" for o in market.outcomes_detail
-                ]
-
-                opp = ArbitrageOpportunity(
-                    id=f"exhaustive_outcomes_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                    type="EXHAUSTIVE_OUTCOMES_ARBITRAGE",
-                    markets=[
-                        {
-                            "id": market.id,
-                            "question": market.question,
-                            "outcomes": [o.name for o in market.outcomes_detail],
-                            "yes_prices": [o.yes_price for o in market.outcomes_detail],
-                        }
-                    ],
-                    relationship="exhaustive_outcomes",
-                    confidence=0.85,
-                    total_cost=total_yes,
-                    guaranteed_return=1.0,
-                    profit=profit,
-                    profit_pct=profit_pct,
-                    action=f"买所有outcome的YES:\n" + "\n".join([f"  - 买 '{o.name}' YES @ ${o.yes_price:.3f}" for o in market.outcomes_detail]),
-                    reasoning=f"多outcome完备集套利：所有outcome的YES价格总和 ({total_yes:.3f}) < $1.00\n各outcome价格:\n" + "\n".join([f"  - {info}" for info in outcomes_info]),
-                    edge_cases=[
-                        "确认所有outcome覆盖了所有可能的结果（完备集）",
-                        "确认各outcome之间互斥（不会同时为真）",
-                        "检查所有outcome的流动性是否充足",
-                    ],
-                    needs_review=[
-                        f"中间价利润: {profit:.3f} ({profit_pct:.1f}%)",
-                        f"Outcome数量: {len(market.outcomes_detail)}",
-                    ],
-                    timestamp=datetime.now().isoformat()
-                )
-                opportunities.append(opp)
-
-        return opportunities
-
-    # ============================================================
-    # ✅ 新增: 跨Event套利检测方法
-    # ============================================================
-
     def check_cross_event_equivalent(
         self,
         event1_slug: str,
@@ -2672,23 +2409,6 @@ class ArbitrageScanner:
             print("      ❌ 无法获取市场数据")
             return []
 
-        # Step 2: 检测单市场内部套利（多outcome市场）
-        print("\n[2/5] 扫描单市场内部套利（多outcome市场）...")
-        multi_outcome_markets = [m for m in markets if m.is_multi_outcome]
-        print(f"      发现 {len(multi_outcome_markets)} 个多outcome市场")
-
-        for market in multi_outcome_markets:
-            # 为多outcome市场获取订单簿数据
-            if market.is_multi_outcome:
-                self.client.enrich_multi_outcome_market(market)
-
-            # 检测单市场套利
-            single_market_opps = self.detector.check_single_market_arbitrage(market)
-            if single_market_opps:
-                opportunities.extend(single_market_opps)
-                for opp in single_market_opps:
-                    print(f"        [ARBITRAGE] {opp.type}: 利润={opp.profit_pct:.2f}%")
-
         # Step 3: 检查完备集
         print("\n[3/5] 扫描完备集套利...")
         event_groups = self._group_by_event(markets)
@@ -2783,24 +2503,6 @@ class ArbitrageScanner:
         questions = [m.question for m in all_markets]
         embeddings = self.semantic_clusterer.get_embeddings(questions)
         logging.info(f"[OK] 向量化完成")
-
-        # Step 2.5: 单市场内部套利检测（多outcome市场）
-        logging.info("[Step 2.5] 扫描单市场内部套利（多outcome市场）...")
-        multi_outcome_markets = [m for m in all_markets if m.is_multi_outcome]
-        logging.info(f"[OK] 发现 {len(multi_outcome_markets)} 个多outcome市场")
-
-        opportunities = []
-        for market in multi_outcome_markets:
-            # 为多outcome市场获取订单簿数据
-            if market.is_multi_outcome:
-                self.client.enrich_multi_outcome_market(market)
-
-            # 检测单市场套利
-            single_market_opps = self.detector.check_single_market_arbitrage(market)
-            if single_market_opps:
-                opportunities.extend(single_market_opps)
-                for opp in single_market_opps:
-                    logging.info(f"  [ARBITRAGE] {opp.type}: 利润={opp.profit_pct:.2f}%")
 
         # Step 3: 语义聚类
         logging.info(f"[Step 3] 语义聚类 (threshold={semantic_threshold})...")
