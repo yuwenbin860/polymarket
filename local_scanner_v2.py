@@ -38,6 +38,7 @@ import argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
+from collections import defaultdict
 
 # ============================================================
 # UTF-8编码配置 - 已通过emoji→ASCII替换解决编码问题
@@ -76,6 +77,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# 🆕 子类别简写映射（v2.1新增）
+# ============================================================
+# 支持常见币种/标签的简写，方便用户快速输入
+SUBCATEGORY_ALIASES = {
+    "btc": "bitcoin",
+    "eth": "ethereum",
+    "sol": "solana",
+    "bnb": "bnb",
+    "xrp": "xrp",
+    "ada": "cardano",  # ada对应cardano
+    "dot": "polkadot",
+    "avax": "avalanche",
+    "matic": "polygon",
+    "uni": "uniswap",
+    "aave": "aave",
+    "comp": "compound",
+    "link": "chainlink",
+}
+
+# 子类别分组配置（用于交互式选择）
+SUBCATEGORY_GROUPS = {
+    "crypto": [
+        ("Bitcoin", ["bitcoin-prices", "bitcoin-volatility", "bitcoin-conference", "strategic-bitcoin-reserve"]),
+        ("Ethereum", ["ethereum-prices", "ethereum-dencun", "ethgas", "ethbtc", "ether-rock", "etherfi", "ethena"]),
+        ("Solana", ["solana-prices", "sol", "solana"]),
+        ("主要币种", ["xrp", "xrp-prices", "ada", "bnb", "litecoin"]),
+        ("稳定币/DeFi", ["tether", "usdc", "uniswap", "defi-app", "chainlink"]),
+        ("NFT/meme", ["nft", "cryptopunks", "pepe"]),
+        ("平台/项目", ["binance", "megaeth", "token-launch", "token-price"]),
+        ("综合/其他", ["crypto", "crypto-prices", "cryptocurrency", "crypto-summit", "crypto-policy", "bitboy-crypto", "scroll-airdrop", "fivethirtyeight"]),
+    ],
+    # 其他领域可后续扩展
+    "politics": [],
+    "sports": [],
+    "other": [],
+}
+
 
 # ============================================================
 # 数据结构
@@ -94,6 +133,12 @@ class RelationType(Enum):
     INTERVAL_COVERS = "interval_covers"      # A的区间覆盖B（B是A的子集）
     INTERVAL_SUBSET = "interval_subset"      # A是B的子集
     INTERVAL_OVERLAP = "interval_overlap"    # 区间重叠
+
+
+class RunMode(Enum):
+    """运行模式枚举"""
+    DEBUG = "debug"           # 调试模式：发现套利后暂停确认
+    PRODUCTION = "production" # 生产模式：自动保存所有机会，无人值守运行
 
 
 @dataclass
@@ -122,6 +167,13 @@ class Market:
     market_description: str = ""  # Market自己的description
     tags: List[Dict] = None       # Event的tags (用于分类过滤)
     orderbook: Dict = None        # Full orderbook data (for arbitrage opportunity reporting)
+
+    # ✅ 新增: 区间市场相关字段 (用于多outcome/区间市场套利)
+    group_item_title: str = ""     # 区间显示名称 (如 "80,000-82,000")
+    group_item_threshold: str = "" # 区间排序序号 (如 "0", "1", "2"...)
+    interval_type: str = ""        # 区间类型: "below", "range", "above", ""
+    interval_lower: float = None   # 区间下界 (如 80000)
+    interval_upper: float = None   # 区间上界 (如 82000)
 
 
     def __post_init__(self):
@@ -169,18 +221,57 @@ class ArbitrageOpportunity:
 
 
 # ============================================================
+# 速率限制器
+# ============================================================
+
+class RateLimiter:
+    """简单的速率限制器，控制API请求频率"""
+
+    def __init__(self, calls_per_second: float = 2.0):
+        """
+        初始化速率限制器
+
+        Args:
+            calls_per_second: 每秒允许的请求数
+        """
+        self.min_interval = 1.0 / calls_per_second
+        self.last_call = 0
+
+    def wait(self):
+        """在发起请求前调用，确保不超过速率限制"""
+        import time
+        elapsed = time.time() - self.last_call
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_call = time.time()
+
+
+# ============================================================
 # Polymarket API客户端
 # ============================================================
 
 class PolymarketClient:
     """Polymarket API客户端"""
-    
-    def __init__(self, api_base: str = "https://gamma-api.polymarket.com"):
+
+    def __init__(
+        self,
+        api_base: str = "https://gamma-api.polymarket.com",
+        rate_limit: float = 2.0
+    ):
+        """
+        初始化 Polymarket API 客户端
+
+        Args:
+            api_base: API基础URL
+            rate_limit: 每秒请求数限制（默认2次/秒）
+        """
         self.base_url = api_base
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "PolymarketArbitrageScanner/2.0"
         })
+        # 初始化速率限制器
+        self.rate_limiter = RateLimiter(calls_per_second=rate_limit)
     
     def get_markets(self, limit: int = 100, active: bool = True, 
                     min_liquidity: float = 0) -> List[Market]:
@@ -265,15 +356,42 @@ class PolymarketClient:
             # 兼容旧的description字段
             description = market_description or event_description
 
+            # ✅ 新增: 解析区间市场信息
+            group_item_title = data.get('groupItemTitle', '')
+            group_item_threshold = data.get('groupItemThreshold', '')
+
+            # 使用区间解析器解析区间信息
+            interval_type = ""
+            interval_lower = None
+            interval_upper = None
+
+            question = data.get('question', '')
+
+            if group_item_title or question:
+                from interval_parser_v2 import IntervalParser
+                parser = IntervalParser()
+
+                # 优先从 groupItemTitle 解析，如果没有则从 question 解析
+                interval = parser.parse(group_item_title, question)
+                if interval:
+                    interval_type = interval.type.value
+                    interval_lower = interval.lower
+                    interval_upper = interval.upper if interval.upper != float('inf') else None
+
+            # /events API 返回的market数据没有liquidity字段，使用volume作为流动性指标
+            liquidity_value = data.get('liquidity')
+            if liquidity_value is None:
+                liquidity_value = data.get('volume', 0)
+
             market = Market(
                 id=data.get('id', ''),
                 condition_id=data.get('conditionId', ''),
-                question=data.get('question', ''),
+                question=question,
                 description=description,
                 yes_price=yes_price,
                 no_price=1 - yes_price,
                 volume=float(data.get('volume', 0) or 0),
-                liquidity=float(data.get('liquidity', 0) or 0),
+                liquidity=float(liquidity_value or 0),
                 end_date=data.get('endDate', ''),
                 event_id=data.get('eventSlug', '') or data.get('groupItemTitle', '') or '',
                 event_title=data.get('groupItemTitle', '') or data.get('eventSlug', '') or '',
@@ -282,7 +400,13 @@ class PolymarketClient:
                 token_id=yes_token_id,
                 event_description=event_description,
                 market_description=market_description,
-                tags=tags
+                tags=tags,
+                # ✅ 新增: 区间市场字段
+                group_item_title=group_item_title,
+                group_item_threshold=group_item_threshold,
+                interval_type=interval_type,
+                interval_lower=interval_lower,
+                interval_upper=interval_upper
             )
 
             return market
@@ -358,41 +482,88 @@ class PolymarketClient:
         self,
         tag_id: str,
         active: bool = True,
-        limit: int = 100
+        limit: int = 100,
+        max_results: int = None,
+        page_size: int = 100
     ) -> List[Dict]:
         """
-        按tag_id获取events
+        按tag_id获取events（支持分页）
 
         Args:
             tag_id: Tag ID (e.g., "21" for crypto)
             active: 是否只返回活跃事件
-            limit: 返回数量限制
+            limit: 返回数量限制（旧行为兼容，当max_results=None时使用）
+            max_results: 最大结果数（None=旧行为用limit，0=全量获取，>0=指定数量）
+            page_size: 每页大小（默认100）
 
         Returns:
             Event字典列表
         """
-        try:
-            params = {
-                "tag_id": tag_id,
-                "limit": limit
-            }
-            if active is not None:
-                params["active"] = str(active).lower()
+        # 默认行为：max_results=None 时，使用 limit 作为最大数量（向后兼容）
+        if max_results is None:
+            max_results = limit
+        elif max_results == 0:
+            # 0 表示全量获取，设置一个很大的数
+            max_results = float('inf')
 
-            url = f"{self.base_url}/events"
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            print(f"获取events失败 (tag_id={tag_id}): {e}")
-            return []
+        all_events = []
+        offset = 0
+
+        while True:
+            # 终止条件1: 已达到最大结果数
+            if len(all_events) >= max_results:
+                break
+
+            # 计算本次请求需要获取的数量
+            current_limit = min(page_size, max_results - len(all_events))
+
+            try:
+                # 速率限制
+                self.rate_limiter.wait()
+
+                params = {
+                    "tag_id": tag_id,
+                    "limit": current_limit,
+                    "offset": offset
+                }
+                if active is not None:
+                    params["active"] = str(active).lower()
+
+                url = f"{self.base_url}/events"
+                response = self.session.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                events = response.json()
+
+                # 终止条件2: 返回空数组（没有更多数据）
+                if not events:
+                    break
+
+                all_events.extend(events)
+
+                # 全量获取模式：输出进度日志
+                if max_results == float('inf'):
+                    logger.info(f"  [tag_id={tag_id}] 已获取 {len(all_events)} 个events")
+
+                # 终止条件3: 返回数量 < 请求数量（最后一页）
+                if len(events) < current_limit:
+                    break
+
+                offset += current_limit
+
+            except requests.RequestException as e:
+                logger.error(f"获取events失败 (tag_id={tag_id}, offset={offset}): {e}")
+                break
+
+        return all_events
 
     def get_markets_by_tag(
         self,
         tag_id: str,
         active: bool = True,
         limit: int = 100,
-        min_liquidity: float = 0
+        min_liquidity: float = 0,
+        max_results: int = None,
+        page_size: int = 100
     ) -> List[Market]:
         """
         按tag_id获取所有相关markets
@@ -403,15 +574,23 @@ class PolymarketClient:
         Args:
             tag_id: Tag ID (e.g., "21" for crypto)
             active: 是否只返回活跃市场
-            limit: 返回数量限制
+            limit: 返回数量限制（旧行为兼容）
             min_liquidity: 最小流动性过滤
+            max_results: 最大结果数（None=旧行为，0=全量，>0=指定数量）
+            page_size: 每页大小
 
         Returns:
             Market列表（包含event_description和tags）
         """
         markets = []
 
-        events = self.get_events_by_tag(tag_id, active=active, limit=limit)
+        events = self.get_events_by_tag(
+            tag_id,
+            active=active,
+            limit=limit,
+            max_results=max_results,
+            page_size=page_size
+        )
 
         for event in events:
             event_data = {
@@ -437,7 +616,9 @@ class PolymarketClient:
         slug: str,
         active: bool = True,
         limit: int = 100,
-        min_liquidity: float = 0
+        min_liquidity: float = 0,
+        max_results: int = None,
+        page_size: int = 100
     ) -> List[Market]:
         """
         按tag slug获取所有相关markets（便捷方法）
@@ -445,29 +626,39 @@ class PolymarketClient:
         Args:
             slug: Tag slug (e.g., "crypto", "politics")
             active: 是否只返回活跃市场
-            limit: 返回数量限制
+            limit: 返回数量限制（旧行为兼容）
             min_liquidity: 最小流动性过滤
+            max_results: 最大结果数（None=旧行为，0=全量，>0=指定数量）
+            page_size: 每页大小
 
         Returns:
             Market列表
         """
         # 首先获取tag_id
         try:
+            self.rate_limiter.wait()
             url = f"{self.base_url}/tags/slug/{slug}"
             response = self.session.get(url, timeout=10)
             if response.status_code != 200:
-                print(f"Tag not found: {slug}")
+                logger.error(f"Tag not found: {slug}")
                 return []
             tag_data = response.json()
             tag_id = tag_data.get("id")
             if not tag_id:
-                print(f"Tag ID not found for: {slug}")
+                logger.error(f"Tag ID not found for: {slug}")
                 return []
         except Exception as e:
-            print(f"Error fetching tag {slug}: {e}")
+            logger.error(f"Error fetching tag {slug}: {e}")
             return []
 
-        return self.get_markets_by_tag(tag_id, active=active, limit=limit, min_liquidity=min_liquidity)
+        return self.get_markets_by_tag(
+            tag_id,
+            active=active,
+            limit=limit,
+            min_liquidity=min_liquidity,
+            max_results=max_results,
+            page_size=page_size
+        )
 
     # ============================================================
     # ✅ 新增: 按Event Slug获取Event及其Markets
@@ -768,18 +959,28 @@ class MarketCache:
         except Exception as e:
             logging.warning(f"缓存保存失败: {e}")
 
-    def load_or_fetch(self, domain: str, fetcher) -> List[Market]:
+    def load_or_fetch(self, domain: str, fetcher, force_refresh: bool = False) -> List[Market]:
         """
         加载缓存或获取新数据
 
         Args:
             domain: 领域标识（'crypto', 'politics'等）
             fetcher: 数据获取函数（返回 List[Market]）
+            force_refresh: 强制刷新，跳过缓存
 
         Returns:
             市场列表
         """
         cache_file = self._get_cache_file(domain)
+
+        # 🆕 强制刷新时跳过缓存（v2.1新增）
+        if force_refresh:
+            logging.info(f"[REFRESH] 强制刷新 {domain} 市场数据，跳过缓存")
+            markets = fetcher()
+            # 保存到缓存
+            if markets:
+                self._save_cache(cache_file, markets)
+            return markets
 
         # 尝试从缓存加载
         if self._is_cache_valid(cache_file):
@@ -2291,6 +2492,238 @@ class ArbitrageDetector:
 
         return threshold_markets
 
+    # ============================================================
+    # ✅ 新增: 跨Event区间套利检测
+    # ============================================================
+
+    def check_cross_event_interval_arbitrage(
+        self,
+        all_markets: List[Market]
+    ) -> List[ArbitrageOpportunity]:
+        """
+        检测跨Event的区间套利机会
+
+        支持的套利类型：
+        1. 阈值-区间蕴含关系: P(>92k) vs P(92k-94k) + P(94k-96k) + P(>98k)
+        2. 等价市场: 阈值 ">98k" vs 区间 ">98k"
+        3. 跨Event完备集: 组合多个Event的市场形成完备集
+
+        Args:
+            all_markets: 所有市场列表
+
+        Returns:
+            套利机会列表
+        """
+        from interval_parser_v2 import IntervalParser
+        from collections import defaultdict
+
+        opportunities = []
+
+        # 1. 按标的资产分组（通过结算日期和关键词）
+        asset_groups = self._group_by_asset(all_markets)
+
+        for asset_key, markets in asset_groups.items():
+            # 分离区间型和阈值型市场
+            range_markets = [m for m in markets if m.interval_type == "range"]
+            above_markets = [m for m in markets if m.interval_type == "above"]
+            below_markets = [m for m in markets if m.interval_type == "below"]
+
+            # 至少需要一些区间市场才能进行套利分析
+            if len(range_markets) < 2 and len(above_markets) < 2:
+                continue
+
+            # 类型1: 阈值-区间蕴含关系套利
+            opps = self._check_implication_arbitrage(above_markets, range_markets)
+            opportunities.extend(opps)
+
+            # 类型2: 等价市场套利
+            opps = self._check_equivalent_markets(above_markets, range_markets)
+            opportunities.extend(opps)
+
+        return opportunities
+
+    def _group_by_asset(self, markets: List[Market]) -> Dict[str, List[Market]]:
+        """
+        按标的资产分组
+
+        通过结算日期和关键词将市场分组
+        """
+        groups = defaultdict(list)
+
+        for market in markets:
+            # 使用结算日期作为主要分组键
+            date_key = market.end_date.split('T')[0] if market.end_date else "unknown"
+
+            # 检测资产类型关键词
+            asset_type = "unknown"
+            keywords_lower = market.question.lower()
+            if "bitcoin" in keywords_lower or "btc" in keywords_lower:
+                asset_type = "btc"
+            elif "ethereum" in keywords_lower or "eth" in keywords_lower:
+                asset_type = "eth"
+            elif "solana" in keywords_lower or "sol" in keywords_lower:
+                asset_type = "sol"
+
+            # 组合键: date_asset
+            group_key = f"{date_key}_{asset_type}"
+            groups[group_key].append(market)
+
+        return dict(groups)
+
+    def _check_implication_arbitrage(
+        self,
+        above_markets: List[Market],
+        range_markets: List[Market]
+    ) -> List[ArbitrageOpportunity]:
+        """
+        检测阈值-区间蕴含关系套利
+
+        逻辑：阈值 ">X" 蕴含所有下界 >= X 的区间
+        例如：P(>92k) ≈ P(92k-94k) + P(94k-96k) + P(>98k)
+
+        如果实际价格偏离理论关系，可能存在套利机会
+        """
+        opportunities = []
+
+        for above_m in above_markets:
+            if above_m.interval_lower is None:
+                continue
+
+            # 找到所有下界 >= 阈值下界的区间市场（包括range和above类型）
+            relevant_ranges = [
+                m for m in range_markets
+                if m.interval_lower is not None and m.interval_lower >= above_m.interval_lower
+            ]
+
+            if len(relevant_ranges) < 1:
+                continue
+
+            # 计算区间市场的YES价格总和
+            range_sum = sum(m.yes_price for m in relevant_ranges)
+            above_price = above_m.yes_price
+
+            # 检查价格差异
+            # 理论上：P(>X) ≈ sum(所有下界>=X的区间)
+            # 如果 P(>X) > sum(区间)，可能存在套利：卖阈值YES，买区间YES组合
+            # 如果 P(>X) < sum(区间) - 容差，可能存在套利：买阈值YES，卖区间NO组合
+
+            diff = range_sum - above_price
+            tolerance = 0.02  # 2% 容差（降低阈值以提高灵敏度）
+
+            if abs(diff) > tolerance:
+                # 发现套利机会
+                profit_pct = abs(diff) / above_m.yes_price * 100
+
+                if profit_pct >= self.min_profit_pct:
+                    # 确定套利方向
+                    if above_price > range_sum:
+                        # 阈值被高估：卖阈值YES，买区间YES组合
+                        direction = "sell_above_buy_ranges"
+                        reasoning = (f"阈值 {above_m.group_item_title} (YES={above_price:.1%}) "
+                                    f"高于相关区间总和 (YES={range_sum:.1%})")
+                        action = (f"卖 '{above_m.question[:50]}...' YES\n"
+                                f"买相关区间的YES组合")
+                    else:
+                        # 阈值被低估：买阈值YES，卖区间NO组合
+                        direction = "buy_above_sell_ranges"
+                        reasoning = (f"阈值 {above_m.group_item_title} (YES={above_price:.1%}) "
+                                    f"低于相关区间总和 (YES={range_sum:.1%})")
+                        action = (f"买 '{above_m.question[:50]}...' YES\n"
+                                f"卖相关区间的NO组合")
+
+                    opp = ArbitrageOpportunity(
+                        id=f"interval_impl_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                        type="INTERVAL_IMPLICATION",
+                        markets=[
+                            {"id": above_m.id, "question": above_m.question, "yes_price": above_m.yes_price,
+                             "type": "above", "interval_lower": above_m.interval_lower}
+                        ] + [
+                            {"id": m.id, "question": m.question, "yes_price": m.yes_price,
+                             "type": "range", "interval_lower": m.interval_lower, "interval_upper": m.interval_upper}
+                            for m in relevant_ranges
+                        ],
+                        relationship="interval_implication",
+                        confidence=0.7,  # 基于规则的套利，置信度设为中等
+                        total_cost=range_sum,
+                        guaranteed_return=1.0,
+                        profit=abs(diff),
+                        profit_pct=profit_pct,
+                        action=action,
+                        reasoning=reasoning,
+                        edge_cases=[],
+                        needs_review=[
+                            "验证区间划分规则",
+                            "确认结算规则一致性",
+                            f"理论值差异: {diff:.1%}"
+                        ],
+                        timestamp=datetime.now().isoformat()
+                    )
+                    opportunities.append(opp)
+
+        return opportunities
+
+    def _check_equivalent_markets(
+        self,
+        above_markets: List[Market],
+        range_markets: List[Market]
+    ) -> List[ArbitrageOpportunity]:
+        """
+        检测等价市场套利
+
+        例如：
+        - 阈值 ">98k" vs 区间 ">98k" 应该价格相同
+        - 组合等价：P(>94k) - P(>96k) ≈ P(94k-96k)
+        """
+        opportunities = []
+
+        # 类型1: 完全等价（阈值 vs 阈值）
+        for above_m in above_markets:
+            if above_m.interval_lower is None:
+                continue
+
+            # 查找相同的above区间
+            for range_m in range_markets:
+                if (range_m.interval_type == "above" and
+                    range_m.interval_lower is not None and
+                    abs(range_m.interval_lower - above_m.interval_lower) < 1):  # 几乎相等
+
+                    # 检查价格差异
+                    price_diff = abs(above_m.yes_price - range_m.yes_price)
+                    if price_diff > 0.02:  # 2% 差异阈值
+                        profit_pct = price_diff / min(above_m.yes_price, range_m.yes_price) * 100
+
+                        if profit_pct >= self.min_profit_pct:
+                            # 买便宜的，卖贵的
+                            if above_m.yes_price < range_m.yes_price:
+                                cheaper, expensive = above_m, range_m
+                            else:
+                                cheaper, expensive = range_m, above_m
+
+                            opportunities.append(ArbitrageOpportunity(
+                                id=f"equiv_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                                type="EQUIVALENT_MARKETS",
+                                markets=[
+                                    {"id": cheaper.id, "question": cheaper.question,
+                                     "yes_price": cheaper.yes_price, "type": cheaper.interval_type},
+                                    {"id": expensive.id, "question": expensive.question,
+                                     "yes_price": expensive.yes_price, "type": expensive.interval_type}
+                                ],
+                                relationship="equivalent",
+                                confidence=0.9,  # 等价市场套利置信度较高
+                                total_cost=cheaper.yes_price,
+                                guaranteed_return=expensive.yes_price,
+                                profit=price_diff,
+                                profit_pct=profit_pct,
+                                action=f"买 '{cheaper.question[:50]}...' YES @ {cheaper.yes_price:.1%}\n"
+                                       f"卖 '{expensive.question[:50]}...' YES @ {expensive.yes_price:.1%}",
+                                reasoning=f"等价市场存在价格差异: {price_diff:.1%}",
+                                edge_cases=[],
+                                needs_review=["验证结算规则完全一致"],
+                                timestamp=datetime.now().isoformat()
+                            ))
+
+        return opportunities
+
 
 # ============================================================
 # 相似度筛选器
@@ -2358,7 +2791,11 @@ class ArbitrageScanner:
         config: AppConfig,
         profile_name: str = None,
         model_override: str = None,
-        use_semantic: bool = True
+        use_semantic: bool = True,
+        run_mode: RunMode = RunMode.PRODUCTION,
+        # @deprecated 使用 run_mode 代替
+        verify_mode: bool = False,
+        verify_auto_save: bool = False
     ):
         """
         Args:
@@ -2366,11 +2803,31 @@ class ArbitrageScanner:
             profile_name: LLM配置名称
             model_override: 模型覆盖
             use_semantic: 是否启用向量化模式（默认True）
+            run_mode: 运行模式 (DEBUG=暂停确认, PRODUCTION=自动保存)
+            verify_mode: @deprecated，使用 run_mode 代替
+            verify_auto_save: @deprecated，DEBUG模式下自动保存所有机会
         """
         self.config = config
         self.profile_name = profile_name
         self.model_override = model_override
         self.use_semantic = use_semantic and hasattr(config.scan, 'use_semantic_clustering') and config.scan.use_semantic_clustering
+
+        # 🆕 运行模式（优先使用 run_mode，否则从 verify_mode 推断）
+        if run_mode != RunMode.PRODUCTION:
+            self.run_mode = run_mode
+        elif verify_mode:
+            self.run_mode = RunMode.DEBUG
+        else:
+            self.run_mode = RunMode.PRODUCTION
+
+        # 向后兼容：保留旧属性
+        self.verify_mode = (self.run_mode == RunMode.DEBUG)
+        self.verify_auto_save = verify_auto_save
+
+        # 成员变量
+        self.false_positive_log = []   # 误报日志
+        self.opportunity_counter = 0    # 机会计数器
+        self.discovered_opportunities = []  # 发现的所有机会（用于自动保存）
 
         # 基础组件
         self.client = PolymarketClient()
@@ -2398,7 +2855,7 @@ class ArbitrageScanner:
         self._print_header()
 
         # Step 1: 获取市场
-        print("\n[1/5] 获取市场数据...")
+        print("\n[1/6] 获取市场数据...")
         markets = self.client.get_markets(
             limit=self.config.scan.market_limit,
             min_liquidity=self.config.scan.min_liquidity
@@ -2409,8 +2866,21 @@ class ArbitrageScanner:
             print("      ❌ 无法获取市场数据")
             return []
 
+        # Step 2: 扫描区间市场套利 (跨Event区间关系套利)
+        print("\n[2/6] 扫描区间市场套利...")
+        interval_opps = self.detector.check_cross_event_interval_arbitrage(markets)
+        print(f"      发现 {len(interval_opps)} 个区间套利机会")
+        for opp in interval_opps:
+            print(f"        [ARBITRAGE] {opp.strategy_type}: 利润={opp.profit_pct:.2f}%")
+
+            # 统一处理机会发现（根据模式决定是否暂停）
+            if not self._on_opportunity_found(opp, opportunities):
+                self._save_false_positive_log()
+                self._save_discovered_opportunities()
+                return opportunities
+
         # Step 3: 检查完备集
-        print("\n[3/5] 扫描完备集套利...")
+        print("\n[3/6] 扫描完备集套利...")
         event_groups = self._group_by_event(markets)
         print(f"      发现 {len(event_groups)} 个事件组")
 
@@ -2422,11 +2892,16 @@ class ArbitrageScanner:
 
                 opp = self.detector.check_exhaustive_set(group)
                 if opp:
-                    opportunities.append(opp)
                     print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
 
+                    # 统一处理机会发现（根据模式决定是否暂停）
+                    if not self._on_opportunity_found(opp, opportunities):
+                        self._save_false_positive_log()
+                        self._save_discovered_opportunities()
+                        return opportunities
+
         # Step 4: 分析相似市场对
-        print("\n[4/5] 分析逻辑关系...")
+        print("\n[4/6] 分析逻辑关系...")
         similar_pairs = self.filter.find_similar_pairs(markets)
         print(f"      发现 {len(similar_pairs)} 对相似市场")
 
@@ -2454,20 +2929,31 @@ class ArbitrageScanner:
 
             opp = self.detector.check_pair(m1, m2, analysis)
             if opp:
-                opportunities.append(opp)
                 print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
 
+                # 统一处理机会发现（根据模式决定是否暂停）
+                if not self._on_opportunity_found(opp, opportunities):
+                    self._save_false_positive_log()
+                    self._save_discovered_opportunities()
+                    return opportunities
+
         # Step 5: 生成报告
-        print("\n[5/5] 生成报告...")
+        print("\n[5/6] 生成报告...")
         self._save_report(opportunities)
         self._print_summary(opportunities)
-        
+
+        # 验证模式：保存误报日志和所有发现的机会
+        self._save_false_positive_log()
+        self._save_discovered_opportunities()
+
         return opportunities
 
     def scan_semantic(
         self,
         domain: str = "crypto",
-        semantic_threshold: float = 0.85
+        semantic_threshold: float = 0.85,
+        subcategories: List[str] = None,
+        force_refresh: bool = False  # 🆕 新增参数（v2.1）
     ) -> List[ArbitrageOpportunity]:
         """
         向量化驱动的套利扫描（新流程）
@@ -2482,15 +2968,19 @@ class ArbitrageScanner:
         Args:
             domain: 市场领域 ("crypto", "politics", "sports", "other")
             semantic_threshold: 聚类相似度阈值 (0.0-1.0)
+            subcategories: 子类别筛选 (如 ["bitcoin", "ethereum"])，None表示获取全部
+            force_refresh: 强制刷新缓存，重新获取数据
 
         Returns:
             套利机会列表
         """
         logging.info(f"[START] 开始向量化套利扫描 - 领域: {domain}")
+        if subcategories:
+            logging.info(f"[START] 子类别筛选: {', '.join(subcategories)}")
 
         # Step 1: 获取领域内所有市场（带缓存）
         logging.info("[Step 1] 获取市场数据...")
-        all_markets = self._fetch_domain_markets(domain)
+        all_markets = self._fetch_domain_markets(domain, subcategories, force_refresh)
 
         if not all_markets:
             logging.warning("[ERROR] 未获取到市场数据")
@@ -2522,7 +3012,7 @@ class ArbitrageScanner:
 
         # Step 4: 全自动聚类内套利分析
         logging.info("🔍 Step 4: 聚类内套利分析...")
-        # opportunities 已在 Step 2.5 中初始化
+        opportunities = []  # 初始化机会列表
         llm_call_count = 0
         max_llm_calls = self.config.scan.max_llm_calls
 
@@ -2550,25 +3040,38 @@ class ArbitrageScanner:
                     if opps:
                         # 确保opps是列表
                         if isinstance(opps, list):
-                            opportunities.extend(opps)
                             for opp in opps:
                                 logging.info(f"    [ARBITRAGE] 完备集套利! 利润={opp.profit_pct:.2f}%")
+                                # 统一处理机会发现（根据模式决定是否暂停）
+                                if not self._on_opportunity_found(opp, opportunities):
+                                    self._save_false_positive_log()
+                                    self._save_discovered_opportunities()
+                                    return opportunities
                         else:
-                            opportunities.append(opps)  # 单个对象
                             logging.info(f"    [ARBITRAGE] 完备集套利! 利润={opps.profit_pct:.2f}%")
+                            # 统一处理机会发现（根据模式决定是否暂停）
+                            if not self._on_opportunity_found(opps, opportunities):
+                                self._save_false_positive_log()
+                                self._save_discovered_opportunities()
+                                return opportunities
 
             # 4.2 聚类内全对LLM分析
-            cluster_opps = self._analyze_cluster_fully(
+            cluster_opps, should_continue = self._analyze_cluster_fully(
                 cluster,
                 cluster_id=i,
-                max_llm_calls=max_llm_calls - llm_call_count
+                max_llm_calls=max_llm_calls - llm_call_count,
+                opportunities=opportunities  # 传入主列表，用于验证模式
             )
-            if cluster_opps:  # 确保cluster_opps是列表
-                if isinstance(cluster_opps, list):
-                    opportunities.extend(cluster_opps)
-                else:
-                    opportunities.append(cluster_opps)  # 如果是单个对象，添加它
+            # 注意：opportunities 已经在 _analyze_cluster_fully 中更新了
+            # 不需要再次 extend
             llm_call_count += len(cluster) * (len(cluster) - 1) // 2  # 估算
+
+            # 🆕 检查是否应该继续（验证模式下用户可能选择退出）
+            if not should_continue:
+                # 用户选择退出，提前结束扫描
+                self._save_false_positive_log()
+                self._save_discovered_opportunities()
+                return opportunities
 
             if llm_call_count >= max_llm_calls:
                 logging.warning(f"[WARNING] 达到LLM调用限制 ({max_llm_calls})")
@@ -2578,6 +3081,10 @@ class ArbitrageScanner:
         logging.info("[Step 5] 生成报告...")
         self._save_report(opportunities, domain=domain)
         self._print_summary(opportunities)
+
+        # 🆕 验证模式：保存误报日志和所有发现的机会
+        self._save_false_positive_log()
+        self._save_discovered_opportunities()
 
         logging.info(f"[DONE] 扫描完成: 发现 {len(opportunities)} 个套利机会")
 
@@ -2603,7 +3110,27 @@ class ArbitrageScanner:
             logging.error(f"[ERROR] 加载标签分类失败: {e}")
             return {}
 
-    def _fetch_domain_markets(self, domain: str) -> List[Market]:
+    def _expand_subcategory(self, subcat: str, all_tags: List[str]) -> List[str]:
+        """
+        扩展子类别，自动包含相关标签
+
+        例如: bitcoin -> [bitcoin, bitcoin-prices, bitcoin-volatility, strategic-bitcoin-reserve, ...]
+
+        Args:
+            subcat: 子类别名称（如 "bitcoin"）
+            all_tags: 该领域所有可用的tag列表
+
+        Returns:
+            包含该子类别的所有相关tag列表
+        """
+        # 查找所有包含子类别名称的标签（不区分大小写）
+        subcat_lower = subcat.lower()
+        related = [tag for tag in all_tags if subcat_lower in tag.lower()]
+
+        # 如果没有找到相关标签，至少返回原始输入（可能是无效的，后续会验证）
+        return related if related else [subcat]
+
+    def _fetch_domain_markets(self, domain: str, subcategories: List[str] = None, force_refresh: bool = False) -> List[Market]:
         """
         获取指定领域的所有市场（带缓存）
 
@@ -2611,6 +3138,8 @@ class ArbitrageScanner:
 
         Args:
             domain: 领域标识 ("crypto", "politics", "sports", "economics", "entertainment", "other")
+            subcategories: 子类别筛选 (如 ["bitcoin", "ethereum"])，None表示获取全部
+            force_refresh: 强制刷新缓存，重新获取数据
 
         Returns:
             市场列表
@@ -2641,16 +3170,50 @@ class ArbitrageScanner:
                 logging.warning(f"[WARNING] 域 '{domain}' 没有关联的tags")
                 return []
 
-            logging.info(f"[FETCH] 域 '{domain}' 有 {len(tag_slugs)} 个tags")
+            # 🆕 子类别筛选和扩展（v2.1新增）
+            if subcategories:
+                all_tags = set(tag_slugs)
+                expanded_tags = set()
+
+                for subcat in subcategories:
+                    # 验证子类别是否有效
+                    if subcat in all_tags:
+                        # 自动包含相关标签
+                        related = self._expand_subcategory(subcat, tag_slugs)
+                        expanded_tags.update(related)
+                    else:
+                        logging.warning(f"[WARNING] 无效的子类别将被忽略: {subcat}")
+
+                tag_slugs = list(expanded_tags)
+
+                if not tag_slugs:
+                    logging.warning(f"[WARNING] 没有有效的子类别")
+                    return []
+
+                subcat_info = f", 子类别: {', '.join(sorted(set(subcategories)))}"
+                logging.info(f"[FETCH] 域 '{domain}'{subcat_info}")
+                logging.info(f"[FETCH] 扩展为 {len(tag_slugs)} 个tags: {', '.join(sorted(tag_slugs)[:5])}{'...' if len(tag_slugs) > 5 else ''}")
+            else:
+                logging.info(f"[FETCH] 域 '{domain}' 有 {len(tag_slugs)} 个tags")
 
             all_markets = []
             for i, slug in enumerate(tag_slugs):
                 try:
+                    # 根据配置决定是否启用全量获取
+                    max_results = (
+                        self.config.scan.fetch_max_per_tag
+                        if getattr(self.config.scan, 'enable_full_fetch', False)
+                        else None
+                    )
+                    page_size = getattr(self.config.scan, 'fetch_page_size', 100)
+
                     markets = self.client.get_markets_by_tag_slug(
                         slug,
                         active=True,
                         limit=100,
-                        min_liquidity=self.config.scan.min_liquidity
+                        min_liquidity=self.config.scan.min_liquidity,
+                        max_results=max_results,
+                        page_size=page_size
                     )
                     all_markets.extend(markets)
                     if (i + 1) % 20 == 0:
@@ -2670,14 +3233,22 @@ class ArbitrageScanner:
             logging.info(f"[DONE] 域 '{domain}' 获取到 {len(unique_markets)} 个唯一市场")
             return unique_markets
 
-        return self.market_cache.load_or_fetch(domain, fetcher)
+        # 🆕 构建缓存键：domain + subcategories（v2.1新增）
+        cache_key = domain
+        if subcategories:
+            # 将subcategories排序后加入缓存键，确保顺序不影响缓存
+            subcat_suffix = "_".join(sorted(subcategories))
+            cache_key = f"{domain}_{subcat_suffix}"
+
+        return self.market_cache.load_or_fetch(cache_key, fetcher, force_refresh)
 
     def _analyze_cluster_fully(
         self,
         cluster: List[Market],
         cluster_id: int,
-        max_llm_calls: int = 100
-    ) -> List[ArbitrageOpportunity]:
+        max_llm_calls: int = 100,
+        opportunities: List[ArbitrageOpportunity] = None
+    ) -> Tuple[List[ArbitrageOpportunity], bool]:
         """
         全自动聚类内分析
 
@@ -2687,13 +3258,18 @@ class ArbitrageScanner:
             cluster: 聚类内的市场列表
             cluster_id: 聚类ID
             max_llm_calls: 最大LLM调用次数
+            opportunities: 主机会列表（用于验证模式保存）
 
         Returns:
-            套利机会列表
+            (套利机会列表, 是否应该继续扫描)
         """
-        opportunities = []
+        if opportunities is None:
+            opportunities = []
+
+        local_opps = []
         n = len(cluster)
         llm_count = 0
+        should_continue = True
 
         # 按流动性排序（优先分析高流动性市场）
         cluster_sorted = sorted(cluster, key=lambda m: m.liquidity, reverse=True)
@@ -2703,7 +3279,7 @@ class ArbitrageScanner:
                 # 检查LLM调用限制
                 if llm_count >= max_llm_calls:
                     logging.warning(f"    ⚠️ 达到LLM调用限制 ({max_llm_calls})")
-                    return opportunities
+                    return local_opps, should_continue
 
                 m1, m2 = cluster_sorted[i], cluster_sorted[j]
 
@@ -2724,10 +3300,16 @@ class ArbitrageScanner:
 
                     opp = self.detector.check_pair(m1, m2, analysis)
                     if opp:
-                        opportunities.append(opp)
+                        local_opps.append(opp)
                         logging.info(f"    [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
 
-        return opportunities
+                        # 统一处理机会发现（根据模式决定是否暂停）
+                        if not self._on_opportunity_found(opp, opportunities):
+                            # 用户选择退出
+                            should_continue = False
+                            return local_opps, should_continue
+
+        return local_opps, should_continue
 
 
     def _generate_polymarket_links(self, markets: List[Dict]) -> List[str]:
@@ -2822,7 +3404,36 @@ class ArbitrageScanner:
 
         logging.info(f"[OK] 报告已保存到 {output_file}")
         print(f"      [OK] 报告已保存到 {output_file}")
-    
+
+    def _on_opportunity_found(
+        self,
+        opp: ArbitrageOpportunity,
+        opportunities: List[ArbitrageOpportunity]
+    ) -> bool:
+        """处理发现的套利机会
+
+        统一处理机会发现时的逻辑：
+        - DEBUG 模式：暂停等待用户确认
+        - PRODUCTION 模式：自动收集所有机会
+
+        Args:
+            opp: 发现的套利机会
+            opportunities: 机会列表（用于最终报告）
+
+        Returns:
+            True if scanning should continue, False to exit
+        """
+        # 始终收集到 discovered_opportunities（用于自动保存）
+        self.discovered_opportunities.append(opp)
+
+        if self.run_mode == RunMode.DEBUG:
+            # DEBUG 模式：暂停确认
+            return self._handle_opportunity_verification(opp, opportunities)
+        else:
+            # PRODUCTION 模式：自动添加到结果列表
+            opportunities.append(opp)
+            return True
+
     def _print_summary(self, opportunities: List[ArbitrageOpportunity]):
         """打印摘要"""
         print("\n" + "=" * 65)
@@ -2876,6 +3487,214 @@ class ArbitrageScanner:
                     print(f"  • {item}")
 
             print()
+
+    # ============================================================
+    # 🆕 验证模式相关方法
+    # ============================================================
+
+    def _print_opportunity_detailed(self, opp: ArbitrageOpportunity) -> None:
+        """
+        打印套利机会的完整详细信息（验证模式）
+
+        Args:
+            opp: 套利机会对象
+        """
+        self.opportunity_counter += 1
+
+        print("\n" + "=" * 60)
+        print(f"[套利机会 #{self.opportunity_counter}] {opp.type}")
+        print("=" * 60)
+
+        # 【市场信息】
+        print("\n[市场信息]")
+        print("-" * 60)
+        links = self._generate_polymarket_links(opp.markets)
+
+        for i, (market, link) in enumerate(zip(opp.markets, links), 1):
+            role = f"市场 {chr(64+i)}"  # A, B, C...
+            print(f"{role}:")
+            print(f"  问题: {market.get('question', '')}")
+            print(f"  YES价格: ${market.get('yes_price', 0):.4f} (ask: ${market.get('best_ask', 0):.4f})")
+            print(f"  NO价格:  ${market.get('no_price', 0):.4f} (bid: ${market.get('best_bid', 0):.4f})")
+            print(f"  流动性:  ${market.get('liquidity', 0):,.0f} USDC")
+            end_date = market.get('end_date', 'N/A')
+            if end_date and end_date != 'N/A':
+                end_date = end_date[:10] if 'T' in end_date else end_date
+            print(f"  结算:   {end_date}")
+            print(f"  链接:   {link}")
+            print()
+
+        # 【套利详情】
+        print("[套利详情]")
+        print("-" * 60)
+        print(f"逻辑关系: {opp.relationship}")
+        print(f"置信度:   {opp.confidence:.0%}")
+        print(f"利润率:   {opp.profit_pct:.2f}%")
+        print(f"\n操作:")
+        for line in opp.action.split('\n'):
+            print(f"  {line}")
+
+        # 【LLM 完整推理】
+        if opp.reasoning:
+            print("\n[LLM 完整推理]")
+            print("-" * 60)
+            # 限制推理长度，避免输出过长
+            reasoning = opp.reasoning
+            if len(reasoning) > 2000:
+                reasoning = reasoning[:2000] + "\n... (推理内容过长，已截断)"
+            print(reasoning)
+
+        # 【风险提示】
+        print("\n[风险提示]")
+        print("-" * 60)
+        for item in opp.needs_review:
+            print(f"  - {item}")
+
+        if opp.edge_cases:
+            print("\nEdge Cases:")
+            for case in opp.edge_cases:
+                print(f"  - {case}")
+
+        print("=" * 60)
+
+    def _handle_opportunity_verification(
+        self,
+        opp: ArbitrageOpportunity,
+        opportunities: List[ArbitrageOpportunity]
+    ) -> bool:
+        """
+        处理套利机会的验证流程（交互式）
+
+        Args:
+            opp: 发现的套利机会
+            opportunities: 机会列表（用于保存）
+
+        Returns:
+            True if scanning should continue, False to exit
+        """
+        # 注意：机会已在 _on_opportunity_found 中添加到 discovered_opportunities
+
+        # 打印详细信息
+        self._print_opportunity_detailed(opp)
+
+        while True:
+            try:
+                choice = input(
+                    "\n[验证模式] 操作 (Enter=继续,s=保存,f=误报,q=退出,d=详情,r=阈值,l=流动性,j=存文件,?=帮助): "
+                ).strip().lower()
+
+                if not choice or choice == 'enter':
+                    print("  -> 跳过此机会，继续扫描...")
+                    return True
+
+                elif choice == 's':
+                    opportunities.append(opp)
+                    print("  -> 已保存到结果列表，继续扫描...")
+                    return True
+
+                elif choice == 'f':
+                    reason = input("  -> 请输入误报原因: ").strip()
+                    self.false_positive_log.append({
+                        'opportunity': asdict(opp),
+                        'reason': reason,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    print("  -> 已记录为误报，继续扫描...")
+                    return True
+
+                elif choice == 'q':
+                    print("  -> 退出扫描...")
+                    return False
+
+                elif choice == 'd':
+                    # 显示更多调试信息
+                    print("\n[调试详情]")
+                    print(f"  ID: {opp.id}")
+                    print(f"  总成本: ${opp.total_cost:.4f}")
+                    print(f"  保证回报: ${opp.guaranteed_return:.4f}")
+                    print(f"  时间戳: {opp.timestamp}")
+                    if opp.edge_cases:
+                        print(f"  边界情况: {opp.edge_cases}")
+                    continue
+
+                elif choice == 'r':
+                    new_threshold = input(f"  -> 当前利润率阈值={self.config.scan.min_profit_pct:.1%}，新阈值: ").strip()
+                    try:
+                        self.config.scan.min_profit_pct = float(new_threshold)
+                        print(f"  -> 阈值已更新为 {self.config.scan.min_profit_pct:.1%}")
+                    except ValueError:
+                        print("  -> 无效输入")
+                    continue
+
+                elif choice == 'l':
+                    new_liquidity = input(f"  -> 当前最小流动性=${self.config.scan.min_liquidity:,.0f}，新值: ").strip()
+                    try:
+                        self.config.scan.min_liquidity = float(new_liquidity)
+                        print(f"  -> 流动性阈值已更新为 ${self.config.scan.min_liquidity:,.0f}")
+                    except ValueError:
+                        print("  -> 无效输入")
+                    continue
+
+                elif choice == 'j':
+                    filename = f"opportunity_{opp.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                    filepath = Path(self.config.output.output_dir) / filename
+                    filepath.parent.mkdir(parents=True, exist_ok=True)
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(asdict(opp), f, indent=2, ensure_ascii=False)
+                    print(f"  -> 已保存到 {filepath}")
+                    continue
+
+                elif choice == '?':
+                    print("\n[命令帮助]")
+                    print("  Enter - 继续扫描（不保存此机会）")
+                    print("  s    - 保存此机会到结果列表")
+                    print("  f    - 标记为误报并记录原因")
+                    print("  q    - 退出扫描")
+                    print("  d    - 显示更多调试详情")
+                    print("  r    - 调整最小利润率阈值")
+                    print("  l    - 调整最小流动性阈值")
+                    print("  j    - 保存此机会到单独JSON文件")
+                    print("  ?    - 显示此帮助")
+                    continue
+
+                else:
+                    print("  -> 未知命令，输入 ? 查看帮助")
+                    continue
+
+            except KeyboardInterrupt:
+                print("\n  -> 检测到 Ctrl+C，退出扫描...")
+                return False
+            except EOFError:
+                print("\n  -> 检测到 EOF，退出扫描...")
+                return False
+
+    def _save_false_positive_log(self) -> None:
+        """保存误报日志到文件"""
+        if self.run_mode == RunMode.DEBUG and self.false_positive_log:
+            false_positive_file = Path(self.config.output.output_dir) / f"false_positives_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            false_positive_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(false_positive_file, 'w', encoding='utf-8') as f:
+                json.dump(self.false_positive_log, f, indent=2, ensure_ascii=False)
+            print(f"\n[OK] 误报日志已保存: {false_positive_file}")
+
+    def _save_discovered_opportunities(self) -> None:
+        """保存所有发现的机会
+
+        - PRODUCTION 模式：自动保存所有机会
+        - DEBUG 模式：仅在 verify_auto_save=True 时保存
+        """
+        should_save = (
+            self.run_mode == RunMode.PRODUCTION or
+            (self.run_mode == RunMode.DEBUG and self.verify_auto_save)
+        )
+
+        if should_save and self.discovered_opportunities:
+            filename = f"discovered_opportunities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filepath = Path(self.config.output.output_dir) / filename
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump([asdict(opp) for opp in self.discovered_opportunities], f, indent=2, ensure_ascii=False)
+            print(f"\n[OK] 所有发现的机会已保存: {filepath}")
 
     def scan_cross_event(
         self,
@@ -3018,6 +3837,129 @@ def interactive_domain_select(default_domain: str = "crypto") -> str:
         print("[错误] 无效选项，请重新输入")
 
 
+def interactive_subcategory_select(domain: str) -> List[str]:
+    """交互式子类别选择菜单
+
+    Args:
+        domain: 领域名称
+
+    Returns:
+        选中的子类别标签列表（扁平化）
+    """
+    groups = SUBCATEGORY_GROUPS.get(domain, [])
+    if not groups:
+        return []
+
+    print("\n" + "=" * 55)
+    print(f"请选择要扫描的 {domain} 子类别:")
+    print("=" * 55)
+
+    for i, (name, tags) in enumerate(groups, 1):
+        tag_str = ", ".join(tags[:3])
+        more = f" +{len(tags)-3}更多" if len(tags) > 3 else ""
+        print(f"  {i}. {name:12s} ({tag_str}{more})")
+    print("  0. 全部子类别")
+    print("=" * 55)
+
+    while True:
+        prompt = "请输入选项 [多个用逗号分隔，直接回车=全部]: "
+        choice = input(prompt).strip()
+
+        # 直接回车 = 全部
+        if not choice:
+            all_tags = []
+            for _, tags in groups:
+                all_tags.extend(tags)
+            print(f"[INFO] 已选择全部 {len(all_tags)} 个子类别")
+            return all_tags
+
+        # 解析输入
+        selected = []
+        try:
+            parts = choice.replace(" ", "").split(",")
+            for part in parts:
+                if "-" in part:
+                    # 范围选择: 1-3
+                    start, end = map(int, part.split("-"))
+                    selected.extend(range(start, end + 1))
+                else:
+                    num = int(part)
+                    selected.append(num)
+
+            # 验证范围
+            valid = set(range(0, len(groups) + 1))
+            if not set(selected).issubset(valid):
+                print("[错误] 编号超出范围，请重新输入")
+                continue
+
+            # 收集选中的标签
+            result = []
+            for num in selected:
+                if num == 0:
+                    for _, tags in groups:
+                        result.extend(tags)
+                elif 1 <= num <= len(groups):
+                    result.extend(groups[num - 1][1])
+
+            # 去重
+            result = list(set(result))
+            print(f"[INFO] 已选择 {len(result)} 个子类别")
+            return result
+
+        except ValueError:
+            print("[错误] 输入格式错误，请重新输入")
+
+
+def interactive_mode_select() -> RunMode:
+    """交互式运行模式选择菜单
+
+    Returns:
+        选中的运行模式
+    """
+    print("\n" + "=" * 55)
+    print("请选择运行模式:")
+    print("=" * 55)
+    print("  1. DEBUG 模式")
+    print("     - 发现套利机会后暂停，等待确认")
+    print("     - 可以逐个审查每个机会")
+    print("     - 支持保存/跳过/标记误报等操作")
+    print("     - 适合开发调试和学习")
+    print()
+    print("  2. PRODUCTION 模式")
+    print("     - 自动保存所有发现的套利机会")
+    print("     - 不暂停确认，无人值守运行")
+    print("     - 适合定期扫描和监控")
+    print("=" * 55)
+
+    while True:
+        try:
+            choice = input("请输入选项 [1-2，直接回车=PRODUCTION]: ").strip()
+
+            # 直接回车 = PRODUCTION 模式（默认）
+            if not choice:
+                print("[INFO] 已选择 PRODUCTION 模式")
+                return RunMode.PRODUCTION
+
+            num = int(choice)
+            if num == 1:
+                print("[INFO] 已选择 DEBUG 模式")
+                return RunMode.DEBUG
+            elif num == 2:
+                print("[INFO] 已选择 PRODUCTION 模式")
+                return RunMode.PRODUCTION
+            else:
+                print("[错误] 请输入 1 或 2")
+
+        except ValueError:
+            print("[错误] 输入格式错误，请输入 1 或 2")
+        except KeyboardInterrupt:
+            print("\n[INFO] 用户取消，退出程序")
+            sys.exit(0)
+        except EOFError:
+            print("\n[INFO] 检测到 EOF，使用默认 PRODUCTION 模式")
+            return RunMode.PRODUCTION
+
+
 # ============================================================
 # 主程序入口
 # ============================================================
@@ -3030,10 +3972,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 基础扫描（向量化模式）
+  python local_scanner_v2.py --domain crypto
+
+  # 验证模式（发现机会后暂停确认）
+  python local_scanner_v2.py -d crypto --verify
+
+  # 使用特定LLM配置
   python local_scanner_v2.py --profile siliconflow
   python local_scanner_v2.py --profile deepseek --model deepseek-reasoner
-  python local_scanner_v2.py --profile ollama --model llama3.1:70b
-  
+
+  # 调整聚类阈值
+  python local_scanner_v2.py -d crypto -t 0.80
+
+  # 禁用向量化模式（使用传统关键词搜索）
+  python local_scanner_v2.py --no-semantic
+
 查看所有可用配置:
   python llm_config.py --list
         """
@@ -3088,13 +4042,83 @@ def main():
         default=0.85,
         help="语义聚类相似度阈值 (默认: 0.85)"
     )
+    # 🆕 子类别筛选参数（v2.1新增）
+    parser.add_argument(
+        "--subcat",
+        type=str,
+        help="子类别筛选 (逗号分隔，如: btc,eth 或 bitcoin,ethereum)。支持简写，如btc→bitcoin"
+    )
+    parser.add_argument(
+        "--list-subcats",
+        action="store_true",
+        help="列出指定领域的所有可用子类别"
+    )
     parser.add_argument(
         "--no-interactive",
         action="store_true",
         help="禁用交互式菜单，直接使用默认配置"
     )
 
+    # 🆕 缓存控制参数（v2.1新增）
+    parser.add_argument(
+        "--refresh", "-r",
+        action="store_true",
+        help="强制刷新缓存，重新获取市场数据"
+    )
+    parser.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="明确指定使用缓存（如果缓存有效）"
+    )
+
+    # 🆕 验证模式相关参数
+    parser.add_argument(
+        "--verify", "-v",
+        action="store_true",
+        help="验证模式：发现套利机会后暂停，等待用户确认"
+    )
+    parser.add_argument(
+        "--verify-auto-save",
+        action="store_true",
+        help="验证模式下自动保存所有机会（包括未确认的）"
+    )
+
+    # 🆕 运行模式参数（v2.2新增）
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["debug", "production"],
+        help="运行模式 (debug=暂停确认, production=自动保存)"
+    )
+
     args = parser.parse_args()
+
+    # ============================================================
+    # 🆕 列出子类别（v2.1新增）- 需要在交互式选择之前处理
+    # ============================================================
+    if args.list_subcats:
+        # 直接读取tag_categories.json
+        tag_categories_file = Path(__file__).parent / "data" / "tag_categories.json"
+        if tag_categories_file.exists():
+            with open(tag_categories_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                tag_categories = data.get("categories", {})
+        else:
+            print(f"[ERROR] 标签分类文件不存在: {tag_categories_file}")
+            return 1
+
+        if args.domain in tag_categories:
+            print(f"\n=== {args.domain.upper()} 可用子类别 ===")
+            subcats = sorted(tag_categories[args.domain])
+            print(f"共 {len(subcats)} 个子类别:\n")
+            for i, subcat in enumerate(subcats, 1):
+                print(f"  {i:2d}. {subcat}")
+            print("\n提示: 可使用简写，如 btc→bitcoin、eth→ethereum")
+            print("      使用 --subcat 参数进行筛选，如: --subcat bitcoin,ethereum")
+            return 0
+        else:
+            print(f"[ERROR] 领域 '{args.domain}' 没有可用的子类别")
+            return 1
 
     # ============================================================
     # 交互式领域选择
@@ -3116,38 +4140,152 @@ def main():
         manager = LLMConfigManager()
         print_profiles_table(manager.list_profiles())
         return 0
-    
+
     # 加载配置
     config = AppConfig.load(args.config)
-    
+
     # 覆盖配置
     if args.min_profit:
         config.scan.min_profit_pct = args.min_profit
     if args.market_limit:
         config.scan.market_limit = args.market_limit
-    
+
+    # 🆕 处理子类别参数（v2.1新增）
+    subcategories = None
+    if args.subcat:
+        # 使用命令行参数指定的子类别
+        raw_subcats = [s.strip() for s in args.subcat.split(",")]
+
+        # 应用简写映射
+        expanded = []
+        for s in raw_subcats:
+            mapped = SUBCATEGORY_ALIASES.get(s.lower(), s)
+            expanded.append(mapped)
+
+        # 🆕 改进的验证逻辑：允许不存在的子类别（会自动扩展为相关标签）
+        tag_categories_file = Path(__file__).parent / "data" / "tag_categories.json"
+        if tag_categories_file.exists():
+            with open(tag_categories_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                tag_categories = data.get("categories", {})
+
+            all_tags = tag_categories.get(args.domain, [])
+
+            # 检查每个子类别是否能扩展为有效标签
+            final_subcats = []
+            for subcat in expanded:
+                # 检查是否直接有效
+                if subcat in all_tags:
+                    final_subcats.append(subcat)
+                else:
+                    # 尝试扩展为相关标签
+                    related = [t for t in all_tags if subcat.lower() in t.lower()]
+                    if related:
+                        print(f"[INFO] '{subcat}' 扩展为: {', '.join(related)}")
+                        final_subcats.extend(related)
+                    else:
+                        print(f"[WARNING] 无效的子类别将被忽略: {subcat} (没有相关标签)")
+
+            expanded = final_subcats
+
+        if expanded:
+            subcategories = expanded
+            print(f"[INFO] 子类别筛选: {', '.join(sorted(set(expanded)))}")
+    elif not args.no_interactive:
+        # 🆕 交互式子类别选择（v2.1新增）
+        # 用户没有通过 --subcat 指定，且允许交互
+        selected = interactive_subcategory_select(domain)
+        if selected:
+            subcategories = selected
+
     # 创建扫描器
     # 默认启用向量化模式，使用 --no-semantic 禁用
     use_semantic = not args.no_semantic
+
+    # ============================================================
+    # 🆕 运行模式选择（v2.2新增）
+    # ============================================================
+    # 优先级: --mode > --verify > 交互式选择 > 默认(PRODUCTION)
+    if args.mode:
+        # 命令行明确指定模式
+        run_mode = RunMode(args.mode)
+        print(f"[INFO] 运行模式: {args.mode.upper()}")
+    elif args.verify:
+        # 向后兼容：--verify 等价于 --mode debug
+        run_mode = RunMode.DEBUG
+        print("[INFO] 运行模式: DEBUG (通过 --verify 参数)")
+    elif not args.no_interactive:
+        # 交互式选择模式
+        run_mode = interactive_mode_select()
+    else:
+        # 默认：生产模式
+        run_mode = RunMode.PRODUCTION
+        print("[INFO] 运行模式: PRODUCTION (默认)")
+
     scanner = ArbitrageScanner(
         config,
         profile_name=args.profile,
         model_override=args.model,
-        use_semantic=use_semantic  # 默认启用向量化模式
+        use_semantic=use_semantic,  # 默认启用向量化模式
+        run_mode=run_mode,          # 🆕 运行模式
+        # 向后兼容参数
+        verify_mode=args.verify,    # @deprecated
+        verify_auto_save=args.verify_auto_save
     )
+
+    # 🆕 缓存控制交互（v2.1新增）
+    force_refresh = False
+
+    if args.refresh:
+        # CLI参数明确指定刷新
+        force_refresh = True
+        print("[INFO] 强制刷新模式，将重新获取市场数据")
+    elif args.use_cache:
+        # CLI参数明确指定使用缓存
+        force_refresh = False
+        print("[INFO] 使用缓存模式")
+    elif not args.no_interactive:
+        # 交互模式：询问用户
+        cache_dir = scanner.config.output.cache_dir
+        # 构建可能的缓存文件名
+        cache_files_to_check = [f"{domain}_markets.json"]
+        if subcategories:
+            subcat_suffix = "_".join(sorted(subcategories))
+            cache_files_to_check.append(f"{domain}_{subcat_suffix}_markets.json")
+
+        has_cache = False
+        cache_file_path = None
+        for cf in cache_files_to_check:
+            fp = os.path.join(cache_dir, cf)
+            if os.path.exists(fp):
+                has_cache = True
+                cache_file_path = fp
+                break
+
+        if has_cache:
+            print(f"\n[缓存] 发现缓存的 {domain} 市场数据")
+            choice = input("是否使用缓存？(y=使用缓存, n=重新获取, 直接回车=y): ").strip().lower()
+            if choice in ['n', 'no']:
+                force_refresh = True
+                print("[INFO] 将重新获取市场数据")
+            else:
+                print("[INFO] 使用缓存数据")
 
     try:
         # 根据模式选择扫描方法
         if use_semantic:
-            logging.info(f"[START] 向量化模式 - 领域: {domain}, 阈值: {args.threshold}")
+            subcat_info = f", 子类别: {subcategories}" if subcategories else ""
+            logging.info(f"[START] 向量化模式 - 领域: {domain}{subcat_info}, 阈值: {args.threshold}")
             opportunities = scanner.scan_semantic(
                 domain=domain,
-                semantic_threshold=args.threshold
+                semantic_threshold=args.threshold,
+                subcategories=subcategories,
+                force_refresh=force_refresh  # 🆕 传入刷新标志
             )
         else:
             logging.info("[START] 传统模式（关键词搜索）")
             opportunities = scanner.scan()
-        
+
         print("\n" + "=" * 65)
         print("扫描完成！")
         print("=" * 65)

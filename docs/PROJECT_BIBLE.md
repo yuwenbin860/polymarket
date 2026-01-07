@@ -897,8 +897,12 @@ Kalshi:     NO  = $0.48
 |------|------|----------|------|
 | **DataFetcher** | 获取市场数据 | `get_markets()`, `get_events()` | PolymarketFetcher, MockFetcher |
 | **SimilarityFilter** | 筛选相似市场对 | `find_similar_pairs()` | Jaccard (P1), 向量 (P2) |
+| **SemanticClusterer** | 语义聚类分析 | `get_embeddings()`, `cluster_markets()` | sentence-transformers |
 | **LLMAnalyzer** | 分析逻辑关系 | `analyze_pair()`, `batch_analyze()` | 多LLM提供商 |
 | **ArbitrageDetector** | 检测套利机会 | `check_exhaustive_set()`, `check_implication()`, `check_equivalent()` | 规则+LLM混合 |
+| **MarketCache** | 市场数据缓存 | `load_or_fetch()`, `_save_cache()` | TTL缓存机制 |
+| **IntervalParser** | 区间市场解析 | `parse_interval()`, `compare_intervals()` | below/range/above解析 |
+| **TagClassifier** | 标签分类系统 | `classify_tags()`, `get_tags_by_domain()` | 2757个tags分类 |
 
 **支持的LLM提供商**：
 
@@ -1211,9 +1215,129 @@ def calculate_similarity(market_a: Market, market_b: Market) -> float:
     # 同结算日加权
     if market_a.end_date and market_a.end_date == market_b.end_date:
         text_sim += 0.1
-    
+
     return min(text_sim, 1.0)
 ```
+
+### Phase 2: 语义相似度（向量化）
+
+```python
+# SemanticClusterer (semantic_cluster.py)
+from sentence_transformers import SentenceTransformer
+
+class SemanticClusterer:
+    def __init__(self, model_name="BAAI/bge-large-zh-v1.5"):
+        self.model = SentenceTransformer(model_name)
+
+    def get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """获取文本向量嵌入"""
+        return self.model.encode(texts, normalize_embeddings=True)
+
+    def find_similar_markets(self, query: str, markets: List[Market],
+                            threshold: float = 0.85) -> List[Tuple[Market, float]]:
+        """基于余弦相似度查找相似市场"""
+        query_emb = self.get_embeddings([query])[0]
+        market_texts = [f"{m.question} {m.description or ''}" for m in markets]
+        market_embs = self.get_embeddings(market_texts)
+
+        similarities = np.dot(market_embs, query_emb)
+        results = [(markets[i], similarities[i]) for i in range(len(markets))
+                  if similarities[i] >= threshold]
+        return sorted(results, key=lambda x: x[1], reverse=True)
+
+    def cluster_markets(self, markets: List[Market],
+                       threshold: float = 0.85) -> List[List[Market]]:
+        """使用Union-Find算法聚类相似市场"""
+        embs = self.get_embeddings([m.question for m in markets])
+        sim_matrix = np.dot(embs, embs.T)
+
+        parent = list(range(len(markets)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py and sim_matrix[x][y] >= threshold:
+                parent[px] = py
+
+        for i in range(len(markets)):
+            for j in range(i+1, len(markets)):
+                union(i, j)
+
+        clusters = {}
+        for i in range(len(markets)):
+            root = find(i)
+            clusters.setdefault(root, []).append(markets[i])
+        return list(clusters.values())
+```
+
+### 区间解析器（IntervalParser v2）
+
+```python
+# interval_parser_v2.py
+class IntervalParser:
+    """解析区间型/阈值型预测市场"""
+
+    def parse_interval(self, market: Market) -> Optional[IntervalData]:
+        """
+        解析市场的区间信息
+
+        支持格式:
+        - "<80,000" → below, upper=80000
+        - "80,000-82,000" → range, lower=80000, upper=82000
+        - ">98,000" → above, lower=98000
+        - "above $100k" → above, lower=100000
+
+        优先从 groupItemTitle 解析，失败则从 question 解析
+        """
+        text = market.group_item_title or market.question or ""
+        text = text.lower().replace(',', '')
+
+        # Below pattern: "<X" or "under X" or "below X"
+        below_match = re.search(r'<\s*(\d+(?:\.\d+)?[kmbt]?)|(?:under|below)\s+(\d+(?:\.\d+)?[kmbt]?)', text)
+        if below_match:
+            value = self._parse_value(below_match.group(1) or below_match.group(2))
+            return IntervalData(type="below", upper=value)
+
+        # Range pattern: "X-Y" or "between X and Y"
+        range_match = re.search(r'(\d+(?:\.\d+)?[kmbt]?)\s*[-–to]+\s*(\d+(?:\.\d+)?[kmbt]?)', text)
+        if range_match:
+            lower = self._parse_value(range_match.group(1))
+            upper = self._parse_value(range_match.group(2))
+            return IntervalData(type="range", lower=lower, upper=upper)
+
+        # Above pattern: ">X" or "above X" or "over X"
+        above_match = re.search(r'>\s*(\d+(?:\.\d+)?[kmbt]?)|(?:above|over)\s+(\d+(?:\.\d+)?[kmbt]?)', text)
+        if above_match:
+            value = self._parse_value(above_match.group(1) or above_match.group(2))
+            return IntervalData(type="above", lower=value)
+
+        return None
+
+    def _parse_value(self, s: str) -> float:
+        """解析带单位的数值"""
+        s = s.lower().strip()
+        multiplier = 1
+        if s.endswith('k'): multiplier = 1_000
+        elif s.endswith('m'): multiplier = 1_000_000
+        elif s.endswith('b'): multiplier = 1_000_000_000
+        elif s.endswith('t'): multiplier = 1_000_000_000_000
+        return float(s.rstrip('kmbt')) * multiplier
+
+    def compare_intervals(self, a: IntervalData, b: IntervalData) -> str:
+        """比较两个区间的关系: implies, implied_by, equivalent, unrelated"""
+        # 蕴含关系检测用于阈值市场套利
+        ...
+```
+
+**应用场景**:
+- 区间型市场完备集检测（如 Bitcoin Jan 4 价格区间）
+- 阈值型市场蕴含关系验证（如 >$100k 蕴含 >$80k）
+- 跨 Event 区间套利机会发现
 
 ## 8.2 LLM分析算法
 
@@ -1385,6 +1509,90 @@ def detect_implication_arbitrage(
     )
 ```
 
+### 阈值蕴含方向验证
+
+> **v2.0.5 新增** - 解决上涨/下跌阈值蕴含方向相反的问题
+
+**问题**: 上涨阈值和下跌阈值的蕴含方向**相反**，LLM容易混淆：
+
+```python
+# 上涨阈值: BTC突破$150k → BTC突破$100k (更高阈值蕴含更低阈值)
+# 下跌阈值: Google跌到$50 → Google跌到$100 (更低阈值蕴含更高阈值)
+```
+
+**验证规则** (validators.py):
+
+```python
+def validate_threshold_implication(market_a: Market, market_b: Market,
+                                  relationship: RelationType) -> ValidationResult:
+    """
+    验证阈值类市场的蕴含方向是否正确
+
+    规则:
+    - 上涨(above/hit/突破): 更高阈值 → 更低阈值
+    - 下跌(dip/below/跌到): 更低阈值 → 更高阈值
+
+    反例: Google跌到$290 @ $0.24, Google跌到$240 @ $0.007
+          LLM误判为 A→B, 实际应该是 B→A
+    """
+    info_a = _extract_threshold_info(market_a.question)
+    info_b = _extract_threshold_info(market_b.question)
+
+    if not info_a or not info_b:
+        return ValidationResult.SKIPPED  # 不是阈值市场
+
+    # 判断方向是否正确
+    direction_correct = False
+
+    if info_a["type"] == "above" and info_b["type"] == "above":
+        # 上涨: 更高阈值 → 更低阈值
+        if relationship == RelationType.IMPLIES_AB:
+            direction_correct = info_a["value"] >= info_b["value"]
+        elif relationship == RelationType.IMPLIES_BA:
+            direction_correct = info_b["value"] >= info_a["value"]
+
+    elif info_a["type"] == "below" and info_b["type"] == "below":
+        # 下跌: 更低阈值 → 更高阈值
+        if relationship == RelationType.IMPLIES_AB:
+            direction_correct = info_a["value"] <= info_b["value"]
+        elif relationship == RelationType.IMPLIES_BA:
+            direction_correct = info_b["value"] <= info_a["value"]
+
+    if not direction_correct:
+        return ValidationResult.FAILED.with_reason(
+            f"阈值蕴含方向错误: {info_a} vs {info_b}"
+        )
+
+    return ValidationResult.PASSED
+
+def _extract_threshold_info(question: str) -> Optional[dict]:
+    """从市场问题中提取阈值信息"""
+    patterns = [
+        r'>\$?([\d,]+(?:\.\d+)?[kmbt]?)',      # >$X 或 >$X
+        r'>\s*\$?([\d,]+(?:\.\d+)?[kmbt]?)',    # > $X
+        r'(?:over|above|exceeds)\s*\$?([\d,]+(?:\.\d+)?[kmbt]?)',
+        r'<\$?([\d,]+(?:\.\d+)?[kmbt]?)',      # <$X
+        r'(?:under|below|dip to)\s*\$?([\d,]+(?:\.\d+)?[kmbt]?)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, question.lower())
+        if match:
+            value_str = match.group(1).replace(',', '')
+            value = _parse_value(value_str)  # 处理 k/m/b 后缀
+
+            # 判断类型
+            text = question.lower()
+            if any(word in text for word in ['under', 'below', 'dip']):
+                return {"type": "below", "value": value}
+            else:
+                return {"type": "above", "value": value}
+
+    return None
+```
+
+**核心教训**: 相信 Python 的 `>` 运算符，不要完全相信 LLM 的推理！
+
 ### 利润计算公式汇总
 
 | 套利类型 | 成本公式 | 回报公式 | 利润公式 |
@@ -1437,6 +1645,89 @@ GET /markets
   }
 ]
 ```
+
+#### 分页支持
+
+**基础信息**:
+- 无需认证
+- 支持跨域请求
+
+**分页参数**:
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| limit | int | 每页数量（默认100） |
+| offset | int | 偏移量（用于分页） |
+| tag_id | string | 按标签ID过滤 |
+| slug | string | 按事件slug过滤 |
+
+**核心端点**:
+
+| 端点 | 用途 | 关键参数 |
+|------|------|----------|
+| `/markets` | 获取市场列表 | limit, offset, tag_id, slug, active, closed |
+| `/events` | 获取事件列表 | limit, offset, tag_id, slug, active |
+| `/tags` | 获取所有标签 | 无 |
+| `/tags/slug/{slug}` | 通过slug获取标签 | 路径参数 |
+
+**分页示例**:
+```bash
+# 分页获取crypto标签下的events
+GET /events?tag_id=21&limit=100&offset=0    # 第1页
+GET /events?tag_id=21&limit=100&offset=100  # 第2页
+GET /events?tag_id=21&limit=100&offset=200  # 第3页
+```
+
+**通过Tag过滤获取全量数据**:
+```python
+import requests
+
+base_url = "https://gamma-api.polymarket.com"
+
+# 方式1: 先获取tag_id，再分页获取events
+tag_response = requests.get(f"{base_url}/tags/slug/crypto")
+tag_id = tag_response.json()["id"]
+
+events = []
+offset = 0
+page_size = 100
+
+while True:
+    response = requests.get(
+        f"{base_url}/events",
+        params={"tag_id": tag_id, "limit": page_size, "offset": offset}
+    )
+    batch = response.json()
+    if not batch:
+        break
+    events.extend(batch)
+    offset += page_size
+    print(f"已获取 {len(events)} 个events")
+```
+
+**速率限制建议**:
+- 每秒不超过2次请求
+- 使用指数退避处理错误
+- 添加重试机制
+
+**当前系统实现** (v2.1.2):
+- ✅ RateLimiter类 - 请求速率控制
+- ✅ 分页循环 - 自动获取全量数据
+- ✅ 配置化 - enable_full_fetch开关
+- ✅ 向后兼容 - 默认保持旧行为（最多100个）
+
+**配置示例**:
+```json
+{
+  "scan": {
+    "enable_full_fetch": false,
+    "fetch_page_size": 100,
+    "fetch_max_per_tag": 0,
+    "fetch_rate_limit": 2.0
+  }
+}
+```
+
+**官方文档**: https://docs.polymarket.com/developers/gamma-markets-api/
 
 ## 9.2 LLM API（多提供商支持）
 
@@ -1616,17 +1907,23 @@ numpy>=1.24.0                 # 数值计算
 
 **目标**：提高效率和覆盖面
 **时间**：2-3周
-**状态**：进行中 (2026-01-04)
+**状态**：进行中 (2026-01-07)
 
 ### 任务清单
 
 - [x] T3.1 实现向量相似度筛选 (semantic_cluster.py + SiliconFlow API)
+- [x] T3.1.1 实现语义聚类全自动分析
+- [x] T3.1.2 按领域获取市场 (MarketDomainClassifier)
+- [x] T3.1.3 本地缓存机制 (MarketCache)
 - [ ] T3.2 实现WebSocket实时监控
 - [ ] T3.3 实现定时扫描
 - [ ] T3.4 实现通知功能（Telegram/微信）
 - [x] T3.5 ~~实现Kalshi API客户端~~ (不可用 - 需美国身份)
 - [ ] T3.6 实现跨平台套利检测 (目标: Myriad/Drift BET)
-- [ ] T3.7 实现历史回测
+- [x] T3.7 实现区间套利检测 (interval_parser_v2.py)
+- [x] T3.8 实现Tag分类系统 (2757个tags)
+- [x] T3.9 实现交互式子类别选择
+- [ ] T3.10 实现历史回测
 
 ## 10.4 Phase 4: 自动化执行
 
@@ -1656,6 +1953,12 @@ numpy>=1.24.0                 # 数值计算
      │         v2.0.2 向量化系统 + LLM验证
      │
      ├─ Phase 3 进行中
+     │
+2026/01/07 ─── M2.5: 核心功能增强 ✅
+     │         v2.1.4 交互式子类别选择
+     │         v2.1.3 缓存控制+子类别筛选
+     │         v2.1.2 API分页支持
+     │         v2.1.0 区间套利功能
      │
      ├─ 待完成: 发现并验证真实套利案例
      │
@@ -1857,6 +2160,33 @@ export LLM_PROVIDER=ollama
 python local_scanner_v2.py
 ```
 
+### 向量化扫描（v2.0+）
+
+```bash
+# 按领域扫描（向量化模式）
+python local_scanner_v2.py --semantic --domain crypto
+
+# 调整聚类阈值
+python local_scanner_v2.py --semantic --domain crypto --threshold 0.80
+
+# 交互式子类别选择（v2.1.4）
+python local_scanner_v2.py
+# 输出菜单：
+#   1. Bitcoin     (bitcoin-prices, bitcoin-volatility...)
+#   2. Ethereum    (ethereum-prices, ethereum-dencun...)
+#   3. Solana      (solana-prices, sol, solana)
+#   ...
+
+# 子类别筛选（v2.1.3）
+python local_scanner_v2.py --subcat btc,eth
+python local_scanner_v2.py --domain crypto --list-subcats
+
+# 缓存控制（v2.1.3）
+python local_scanner_v2.py --refresh      # 强制刷新数据
+python local_scanner_v2.py --use-cache    # 使用缓存数据
+python local_scanner_v2.py -r             # --refresh 简写
+```
+
 ### 配置文件示例
 
 ```json
@@ -1937,6 +2267,23 @@ A:
 | 1.0 | 2024-12-29 | 初始版本 |
 | 1.1 | 2024-12-29 | 添加多LLM提供商支持，完善文档结构 |
 | 1.2 | 2024-12-30 | 添加开发准则、进度追踪、创意池章节，重新组织章节编号 |
+| 1.3 | 2026-01-02 | 添加战略共识、验证优先原则、散户优势分析 |
+| 1.4 | 2026-01-03 | 添加三大实战陷阱（Bid/Ask、跨链成本、时间一致性） |
+| 2.0 | 2026-01-04 | 向量化套利发现系统 - SemanticClusterer、MarketCache、按领域扫描 |
+| 2.0.1 | 2026-01-04 | 完备集误报修复 - Event ID 一致性检查 |
+| 2.0.2 | 2026-01-04 | LLM 完备集验证 + 编码问题永久解决 |
+| 2.0.3 | 2026-01-05 | 关键Bug修复 - ValidationResult大小写比较 |
+| 2.0.4 | 2026-01-05 | LLM错误日志增强 |
+| 2.0.5 | 2026-01-05 | 阈值蕴含方向验证 - 上涨/下跌方向相反规则 |
+| 2.0.6 | 2026-01-06 | Tag分类系统 - 2757个tags分类 |
+| 2.0.7 | 2026-01-06 | Event-based跨Event套利检测 |
+| 2.0.8 | 2026-01-06 | 等价市场匹配误报修复 |
+| 2.0.9 | 2026-01-06 | 代码清理 - 删除多outcome死代码 |
+| 2.1.0 | 2026-01-06 | 区间套利功能 - IntervalParser、跨Event区间关系检测 |
+| 2.1.1 | 2026-01-07 | 阈值提取Bug修复 - 支持 ">$X" 格式和B/T后缀 |
+| 2.1.2 | 2026-01-07 | API分页支持 - RateLimiter、获取全量Events |
+| 2.1.3 | 2026-01-07 | 缓存控制 + 子类别筛选 |
+| 2.1.4 | 2026-01-07 | 交互式子类别选择 |
 
 ---
 

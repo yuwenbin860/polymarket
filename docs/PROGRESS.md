@@ -19,9 +19,17 @@
 
 **当前阶段**: Phase 3 - Event-based跨市场套利检测
 
-**最后更新**: 2026-01-06 (代码清理 - 死代码移除)
+**最后更新**: 2026-01-07 (v2.1.4 交互式子类别选择)
 
 **当前焦点**:
+- ✅ **交互式子类别选择完成** - 启动后菜单选择Bitcoin/Ethereum/Solana等分组
+- ✅ **缓存控制功能完成** - 支持CLI参数(--refresh/-r, --use-cache)和交互式提示
+- ✅ **子类别筛选功能完成** - 支持快捷别名(btc→bitcoin)和自动扩展相关标签
+- ✅ **多Outcome/区间市场套利功能完成** - 支持区间型、阈值型市场解析和跨Event套利检测
+- ✅ **区间解析器 v2** - interval_parser_v2.py 支持多种格式解析
+- ✅ **跨Event区间关系套利检测** - 蕴含关系、等价市场套利
+- ✅ **集成到主扫描流程** - 新增 Step 2: 区间市场套利检测
+- 🔄 继续运行扫描寻找真正的套利机会
 - ✅ **Event API结构调查完成** - 发现"多区间市场"实际是多个独立二元市场
 - ✅ **跨Event等价市场检测** - 新增 `check_cross_event_equivalent()`
 - ✅ **Event蕴含关系检测** - 新增 `check_event_implication_arbitrage()`
@@ -29,6 +37,11 @@
 - 🔄 继续运行扫描寻找真正的套利机会
 
 **版本历史**:
+- v2.1.4 (2026-01-07): **交互式子类别选择** - 启动菜单选择Bitcoin/Ethereum/Solana等8个分组
+- v2.1.3 (2026-01-07): **缓存控制 + 子类别筛选** - --refresh/-r/--use-cache CLI参数 + 子类别快捷别名
+- v2.1.2 (2026-01-07): **API分页支持** - 获取全量指定领域Events，添加RateLimiter类
+- v2.1.1 (2026-01-07): **阈值提取Bug修复** - 修复 ">$X" 格式解析，添加 B/T 后缀支持
+- v2.1.0 (2026-01-06): **多Outcome/区间市场套利功能** - 区间解析器、跨Event区间套利检测
 - v2.0.9 (2026-01-06): **代码清理** - 删除多outcome死代码（~200行）+ 8个过时scripts
 - v2.0.8 (2026-01-06): **等价市场匹配误报修复** - 否定关系检测 + 同义词标准化
 - v2.0.7 (2026-01-06): **Event-based跨Event套利检测** - 新增跨Event等价/蕴含关系检测
@@ -110,6 +123,417 @@
 ## 工作日志
 
 > 按时间倒序记录每次工作的进展
+
+### 2026-01-07 (v2.1.4 交互式子类别选择)
+
+- ✅ **交互式子类别选择功能** (v2.1.4)
+
+  **需求背景**:
+  - 用户希望启动脚本后通过命令框菜单选择子类别
+  - 而非记忆命令行参数如 `--subcat btc,eth`
+
+  **实现内容**:
+
+  1. **SUBCATEGORY_GROUPS 分组数据** (local_scanner_v2.py:100-116):
+     ```python
+     SUBCATEGORY_GROUPS = {
+         "crypto": [
+             ("Bitcoin", ["bitcoin-prices", "bitcoin-volatility", "bitcoin-conference", "strategic-bitcoin-reserve"]),
+             ("Ethereum", ["ethereum-prices", "ethereum-dencun", "ethgas", "ethbtc", "ether-rock", "etherfi", "ethena"]),
+             ("Solana", ["solana-prices", "sol", "solana"]),
+             ("主要币种", ["xrp", "xrp-prices", "ada", "bnb", "litecoin"]),
+             ("稳定币/DeFi", ["tether", "usdc", "uniswap", "defi-app", "chainlink"]),
+             ("NFT/meme", ["nft", "cryptopunks", "pepe"]),
+             ("平台/项目", ["binance", "megaeth", "token-launch", "token-price"]),
+             ("综合/其他", ["crypto", "crypto-prices", ...]),
+         ],
+     }
+     ```
+
+  2. **interactive_subcategory_select() 函数** (local_scanner_v2.py:3795-3865):
+     - 显示分组菜单
+     - 支持多选（输入 `1,3,5` 或 `1-5`）
+     - 直接回车 = 全选
+     - 返回选中的子类别标签列表
+
+  3. **main() 函数集成** (local_scanner_v2.py:4091-4096):
+     ```python
+     elif not args.no_interactive:
+         # 用户没有通过 --subcat 指定，且允许交互
+         selected = interactive_subcategory_select(domain)
+         if selected:
+             subcategories = selected
+     ```
+
+  **使用效果**:
+  ```bash
+  $ python local_scanner_v2.py
+
+  =======================================================
+  请选择要扫描的 crypto 子类别:
+  =======================================================
+    1. Bitcoin     (bitcoin-prices, bitcoin-volatility... +2更多)
+    2. Ethereum    (ethereum-prices, ethereum-dencun... +5更多)
+    3. Solana      (solana-prices, sol, solana)
+    4. 主要币种    (xrp, xrp-prices, ada, bnb, litecoin)
+    5. 稳定币/DeFi (tether, usdc, uniswap... +2更多)
+    6. NFT/meme    (nft, cryptopunks, pepe)
+    7. 平台/项目   (binance, megaeth... +2更多)
+    8. 综合/其他   (crypto, crypto-prices... +7更多)
+    0. 全部子类别
+  =======================================================
+  请输入选项 [多个用逗号分隔，直接回车=全部]: 1,2,3
+  [INFO] 已选择 14 个子类别
+  ```
+
+  **CLI参数优先级**:
+  1. `--subcat xxx,yyy` → 跳过交互，使用命令行指定
+  2. `--no-interactive` → 跳过交互
+  3. 无参数 → 显示交互式菜单
+
+  **影响文件**:
+  - `local_scanner_v2.py`: 新增分组数据、选择函数、main集成
+
+### 2026-01-07 (v2.1.3 缓存控制 + 子类别筛选)
+
+- ✅ **子类别筛选功能** (v2.1.3)
+
+  **需求背景**:
+  - 获取整个领域数据量较大，验证套利逻辑时希望能缩小范围
+  - 希望能在选择领域后进一步筛选子类别（如 crypto → bitcoin/ethereum）
+
+  **实现内容**:
+
+  1. **SUBCATEGORY_ALIASES 常量** (local_scanner_v2.py:84-98):
+     ```python
+     SUBCATEGORY_ALIASES = {
+         "btc": "bitcoin",
+         "eth": "ethereum",
+         "sol": "solana",
+         # ... 14个常见币种简写
+     }
+     ```
+
+  2. **_expand_subcategory 方法** (local_scanner_v2.py:3093-3103):
+     - 自动扩展子类别到相关标签
+     - 如 "bitcoin" → ["bitcoin-prices", "bitcoin-volatility", "bitcoin-conference", "strategic-bitcoin-reserve"]
+
+  3. **CLI 参数**:
+     - `--subcat SUBCAT`: 逗号分隔的子类别筛选
+     - `--list-subcats`: 列出指定领域的所有可用子类别
+
+  4. **配置支持** (config.py):
+     - `scan_subcategories: List[str]` 字段
+     - 环境变量 `SCAN_SUBCATEGORIES` 支持
+
+  5. **缓存隔离**:
+     - 不同子类别组合使用独立缓存key
+     - `cache_key = f"{domain}_{subcat_suffix}"`
+
+  **使用示例**:
+  ```bash
+  # 只扫描 bitcoin 相关市场
+  python local_scanner_v2.py --subcat btc
+
+  # 扫描 bitcoin 和 ethereum
+  python local_scanner_v2.py --subcat btc,eth
+
+  # 列出所有可用的 crypto 子类别
+  python local_scanner_v2.py --domain crypto --list-subcats
+  ```
+
+- ✅ **缓存控制功能** (v2.1.3)
+
+  **需求背景**:
+  - 测试时希望使用缓存数据加快速度
+  - 需要更新时能方便地强制刷新
+
+  **实现内容**:
+
+  1. **MarketCache.load_or_fetch 增强** (local_scanner_v2.py:933):
+     ```python
+     def load_or_fetch(self, domain: str, fetcher, force_refresh: bool = False):
+         if force_refresh:
+             logging.info(f"[REFRESH] 强制刷新 {domain} 市场数据，跳过缓存")
+             markets = fetcher()
+             self._save_cache(cache_file, markets)
+             return markets
+         # ... 原有缓存逻辑
+     ```
+
+  2. **CLI 参数** (local_scanner_v2.py:3873):
+     - `--refresh, -r`: 强制刷新缓存，重新获取市场数据
+     - `--use-cache`: 明确指定使用缓存（如果缓存有效）
+
+  3. **交互式提示** (local_scanner_v2.py:4013-4049):
+     ```python
+     if has_cache and not args.no_interactive:
+         choice = input("是否使用缓存？(y=使用缓存, n=重新获取, 直接回车=y): ")
+         if choice in ['n', 'no']:
+             force_refresh = True
+     ```
+
+  4. **方法签名更新**:
+     - `scan_semantic()`: 添加 `force_refresh: bool = False` 参数
+     - `_fetch_domain_markets()`: 添加 `force_refresh: bool = False` 参数
+
+  **使用示例**:
+  ```bash
+  # 强制刷新（重新获取数据）
+  python local_scanner_v2.py --refresh
+  python local_scanner_v2.py -r
+
+  # 明确使用缓存
+  python local_scanner_v2.py --use-cache
+
+  # 交互模式（默认行为）
+  python local_scanner_v2.py
+  # 输出: [缓存] 发现缓存的 crypto 市场数据
+  #       是否使用缓存？(y=使用缓存, n=重新获取, 直接回车=y):
+  ```
+
+  **测试结果**:
+  - ✅ `--refresh` 正确显示 `[REFRESH] 强制刷新` 消息
+  - ✅ `--use-cache` 正确显示 `[CACHE] 从缓存加载` 消息
+  - ✅ 交互式提示在缓存存在时正常显示
+
+  **影响文件**:
+  - `local_scanner_v2.py`: MarketCache.load_or_fetch, scan_semantic, _fetch_domain_markets, main
+  - `config.py`: ScanSettings.scan_subcategories 字段
+  - `config.example.json`: 添加配置说明
+
+### 2026-01-07 (v2.1.1 阈值提取Bug修复)
+
+- ✅ **修复阈值提取Bug - 防止假套利** (v2.1.1)
+
+  **问题发现**:
+  - 用户报告系统检测到错误的"套利机会"（43.88%利润）
+  - 市场A: "MegaETH market cap (FDV) >$2B" @ $0.575
+  - 市场B: "MegaETH market cap (FDV) >$1B" @ $0.88
+  - LLM错误判断为 IMPLIES_BA，系统计算有套利
+
+  **根本原因**:
+  - `validators.py:_extract_threshold_info()` 无法解析 ">$X" 格式
+  - 正则模式期望关键词 "above" 在数字前，但市场用 ">" 符号
+  - `parse_value()` 不支持 "B" 后缀（只支持 k/m）
+  - 阈值提取失败 → `validate_threshold_implication()` 跳过验证 → 假套利通过
+
+  **正确逻辑**:
+  - A (>2B) 是 B (>1B) 的子集
+  - A → B (IMPLIES_AB)，数学约束: P(A) <= P(B)
+  - 实际价格: 0.575 <= 0.88 ✅ 价格正确，无套利！
+
+  **修复方案** (validators.py:461-516):
+
+  1. **新增regex模式**:
+     ```python
+     # Handle "> $X" format anywhere (e.g., "market cap > $2B")
+     r'>\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)'
+     # Handle ">$X" (no space) format
+     r'>\$([\d,]+(?:\.\d+)?[kKmMbBtT]?)'
+     # Handle "over $X", "exceeds $X", etc.
+     r'(?:over|exceeds|crosses|surpasses|greater than)\s*\$?...'
+     ```
+
+  2. **添加 B/T 后缀支持**:
+     ```python
+     elif suffix == 'b': multiplier = 1_000_000_000  # Billions
+     elif suffix == 't': multiplier = 1_000_000_000_000  # Trillions
+     ```
+
+  3. **同时修复下跌阈值模式**:
+     - 添加 `<\$([\d,]+...` 和 `<\s*\$?...` 模式
+     - 添加 "under", "less than" 关键词模式
+
+  **测试结果**:
+  - ✅ ">$2B" → 2,000,000,000 正确提取
+  - ✅ ">$1B" → 1,000,000,000 正确提取
+  - ✅ "> $100k" → 100,000 正确提取
+  - ✅ "exceeds $1.5T" → 1,500,000,000,000 正确提取
+  - ✅ 阈值验证现在能正确拒绝LLM的错误判断
+
+  **核心教训**:
+  - **"中间状态"陷阱**: 蕴含关系套利存在 "两条腿都输" 的中间地带
+  - 数值提取是金融类预测市场的杀手锏
+  - 相信 Python 的 `>` 运算符，不要完全相信 LLM 的推理
+
+  **影响文件**:
+  - `validators.py` (Lines 461-516) - 正则模式 + 值解析器
+
+---
+
+### 2026-01-07 (v2.1.2 API分页支持)
+
+- ✅ **API分页支持 - 获取全量指定领域Events** (v2.1.2)
+
+  **背景**:
+  - 用户发现获取的events数据不全
+  - 研究问题：是否可以通过API的slug获取全量的指定领域events？
+
+  **Gamma API研究成果**:
+  1. **分页支持确认**
+     - API使用 `limit` + `offset` 参数实现分页
+     - 示例: `/events?tag_id=21&limit=100&offset=0`
+
+  2. **通过Tag Slug获取全量数据的方式**
+     - 方式1: `/tags/slug/{slug}` → 获取tag_id
+     - 方式2: `/events?tag_id={id}&limit=100&offset=0` → 分页获取events
+     - 方式3: `/markets?tag_id={id}` → 直接获取markets
+
+  3. **当前代码问题**
+     - 没有分页循环，每次最多获取100个
+     - 可能导致数据遗漏
+
+  **实现内容**:
+
+  1. **RateLimiter类** (local_scanner_v2.py:183-202)
+     ```python
+     class RateLimiter:
+         def __init__(self, calls_per_second: float = 2.0):
+             self.min_interval = 1.0 / calls_per_second
+             self.last_call = 0
+
+         def wait(self):
+             elapsed = time.time() - self.last_call
+             if elapsed < self.min_interval:
+                 time.sleep(self.min_interval - elapsed)
+             self.last_call = time.time()
+     ```
+
+  2. **PolymarketClient.__init__()** 增强
+     - 新增 `rate_limit` 参数（默认2.0）
+     - 初始化 `self.rate_limiter`
+
+  3. **get_events_by_tag()** 分页循环
+     - 新增 `max_results` 参数（None=旧行为，0=全量，>0=指定数量）
+     - 新增 `page_size` 参数
+     - 循环获取直到满足终止条件
+     - 速率限制调用
+     - 进度日志输出
+
+  4. **get_markets_by_tag()** 参数透传
+  5. **get_markets_by_tag_slug()** 参数透传
+  6. **_fetch_domain_markets()** 根据配置启用分页
+
+  7. **配置扩展** (config.py:78-89)
+     ```python
+     enable_full_fetch: bool = False      # 默认保持旧行为
+     fetch_page_size: int = 100
+     fetch_max_per_tag: int = 0           # 0=全量
+     fetch_rate_limit: float = 2.0
+     ```
+
+  **使用方式**:
+  ```bash
+  # 保持旧行为（默认）
+  python local_scanner_v2.py --domain crypto
+
+  # 启用全量获取 - 编辑config.json
+  {
+    "scan": {
+      "enable_full_fetch": true,
+      "fetch_max_per_tag": 0,
+      "fetch_page_size": 100,
+      "fetch_rate_limit": 2.0
+    }
+  }
+  ```
+
+  **影响文件**:
+  - `local_scanner_v2.py` - RateLimiter + 分页逻辑
+  - `config.py` - 分页配置字段
+  - `config.example.json` - 配置示例
+
+  **API学习成果**:
+  - 官方文档: https://docs.polymarket.com/developers/gamma-markets-api/
+  - 分页参数: limit, offset
+  - Tag过滤: tag_id, slug
+  - 其他参数: active, closed, order, ascending
+
+---
+
+- ✅ **多Outcome/区间市场套利功能完成** (v2.1.0)
+
+  **背景**:
+  - 用户询问系统是否能获取一个event下多个market的情形
+  - 参考: https://polymarket.com/event/bitcoin-price-on-january-6
+  - 需要支持：完备集套利、跨Event区间关系套利
+
+  **实现的6个阶段**:
+
+  **阶段1: 增强Market数据结构** (local_scanner_v2.py)
+  - 添加区间相关字段:
+    - `group_item_title`: 区间显示名称（如 "80,000-82,000"）
+    - `group_item_threshold`: 区间排序序号
+    - `interval_type`: 区间类型（"below", "range", "above"）
+    - `interval_lower` / `interval_upper`: 区间边界
+
+  **阶段2: 创建区间解析器** (interval_parser_v2.py)
+  - 创建 `IntervalParser` 类
+  - 支持解析格式：
+    - `<80,000` → below, upper=80000
+    - `80,000-82,000` → range, lower=80000, upper=82000
+    - `>98,000` → above, lower=98000
+  - 优先从 `groupItemTitle` 解析，失败则从 `question` 解析
+  - 支持k/K/m/M单位后缀
+
+  **阶段3: 增强_parse_market方法** (local_scanner_v2.py)
+  - 集成 `IntervalParser`
+  - 提取 `groupItemTitle` 和 `groupItemThreshold`
+  - 解析并存储区间信息
+
+  **阶段4-5: 区间套利检测** (local_scanner_v2.py)
+  - `check_cross_event_interval_arbitrage()`: 主检测方法
+  - `_group_by_asset()`: 按资产分组（如BTC）
+  - `_check_implication_arbitrage()`: 阈值-区间蕴含关系套利
+    - 逻辑: P(>X) ≈ sum(所有下界>=X的区间)
+    - 容差: 2%
+  - `_check_equivalent_markets()`: 等价市场套利
+    - 检测相同区间的价格差异
+    - 差异阈值: 2%
+
+  **阶段6: 集成到主扫描流程** (local_scanner_v2.py)
+  - 修改 `scan()` 方法
+  - 新增 Step 2: 区间市场套利检测
+  - 步骤编号从 1/5 更新为 1/6
+
+  **新增文件**:
+  - `interval_parser_v2.py` - 区间解析模块（372行）
+  - `test_interval_arbitrage.py` - 测试脚本
+
+  **修改文件**:
+  - `local_scanner_v2.py`:
+    - Market类添加5个字段
+    - _parse_market()添加区间解析
+    - ArbitrageDetector添加3个方法
+    - scan()添加Step 2
+
+  **测试结果**:
+  - ✅ 区间型市场解析: 11个 (below/range/above)
+  - ✅ 阈值型市场解析: 11个 (above)
+  - ✅ 成功检测到蕴含关系套利机会（利润2.1%、2.1%、2.05%）
+
+  **市场数据示例**:
+  ```
+  区间型Event (bitcoin-price-on-january-6):
+    <80,000    | type=below    | YES=0.1%
+    80k-82k    | type=range    | YES=0.05%
+    ...
+    >98,000    | type=above    | YES=0.1%
+
+  阈值型Event (bitcoin-above-on-january-6):
+    >78,000    | type=above    | YES=99.95%
+    >80,000    | type=above    | YES=99.95%
+    ...
+    >98,000    | type=above    | YES=0.15%
+  ```
+
+  **核心发现**:
+  - Polymarket的"多outcome市场"实际是多个独立的二元市场
+  - 两种Event类型：区间型和阈值型
+  - 跨Event存在蕴含关系套利机会
+
+---
 
 ### 2026-01-06 (v2.0.6 Tag分类系统 + 项目清理)
 

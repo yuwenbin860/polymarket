@@ -9,7 +9,7 @@
 import os
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 @dataclass
@@ -75,6 +75,25 @@ class ScanSettings:
     # 扫描的默认市场领域
     scan_domain: str = "crypto"
 
+    # 🆕 子类别筛选配置（v2.1新增）
+    # 子类别筛选列表，留空表示获取整个领域的市场
+    # 支持简写，如 ["btc", "eth"] 等同于 ["bitcoin", "ethereum"]
+    # 会自动包含相关标签，如 "bitcoin" 自动包含 "bitcoin-prices", "bitcoin-volatility" 等
+    scan_subcategories: List[str] = field(default_factory=list)
+
+    # 🆕 分页相关配置
+    # 是否启用全量获取（默认False=保持旧行为，最多100个市场）
+    enable_full_fetch: bool = False
+
+    # 每页大小
+    fetch_page_size: int = 100
+
+    # 每个tag最大获取数量（0=全量获取）
+    fetch_max_per_tag: int = 0
+
+    # API请求速率限制（每秒请求数）
+    fetch_rate_limit: float = 2.0
+
 
 @dataclass
 class OutputSettings:
@@ -125,6 +144,7 @@ class Config:
                 enable_cache=os.getenv("ENABLE_CACHE", "true").lower() == "true",
                 cache_ttl=int(os.getenv("CACHE_TTL", "3600")),
                 scan_domain=os.getenv("SCAN_DOMAIN", "crypto"),
+                scan_subcategories=os.getenv("SCAN_SUBCATEGORIES", "").split(",") if os.getenv("SCAN_SUBCATEGORIES") else [],
             ),
             output=OutputSettings(
                 output_dir=os.getenv("OUTPUT_DIR", "./output"),

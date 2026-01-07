@@ -471,29 +471,47 @@ class MathValidator:
         import re
 
         # 上涨模式: above, hit, reach, exceed, 突破, 超过
-        # 支持 k/K (千), M (百万) 后缀
+        # 支持 k/K (千), M (百万), B (十亿), T (万亿) 后缀
         up_patterns = [
-            r'(?:above|hit|reach|exceed|突破|超过)\s*\$?([\d,]+(?:\.\d+)?[kKmM]?)',
-            r'\$?([\d,]+(?:\.\d+)?[kKmM]?)\s*(?:and above|or higher)',
-            r'(?:price|value)\s*(?:>|>=|above)\s*\$?([\d,]+(?:\.\d+)?[kKmM]?)',
+            r'(?:above|hit|reach|exceed|突破|超过)\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            r'\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)\s*(?:and above|or higher)',
+            r'(?:price|value)\s*(?:>|>=|above)\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            # NEW: Handle "> $X" format anywhere in question (e.g., "market cap > $2B")
+            r'>\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            # NEW: Handle ">$X" (no space) format
+            r'>\$([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            # NEW: Handle "over $X", "exceeds $X", "crosses $X", "surpasses $X"
+            r'(?:over|exceeds|crosses|surpasses|greater than)\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
         ]
 
         # 下跌模式: dip, below, fall, drop, 跌到, 跌破, 跌至
         down_patterns = [
-            r'(?:dip|below|fall|drop|跌到|跌破|跌至)\s*(?:to\s*)?\$?([\d,]+(?:\.\d+)?[kKmM]?)',
-            r'\$?([\d,]+(?:\.\d+)?[kKmM]?)\s*(?:and below|or lower)',
-            r'(?:price|value)\s*(?:<|<=|below)\s*\$?([\d,]+(?:\.\d+)?[kKmM]?)',
+            r'(?:dip|below|fall|drop|跌到|跌破|跌至)\s*(?:to\s*)?\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            r'\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)\s*(?:and below|or lower)',
+            r'(?:price|value)\s*(?:<|<=|below)\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            # NEW: Handle "< $X" format anywhere
+            r'<\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            # NEW: Handle "<$X" (no space) format
+            r'<\$([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
+            # NEW: Handle "under $X", "less than $X"
+            r'(?:under|less than)\s*\$?([\d,]+(?:\.\d+)?[kKmMbBtT]?)',
         ]
 
         def parse_value(val_str: str) -> float:
-            """解析数值字符串，支持 k/K (千), M (百万) 后缀"""
+            """解析数值字符串，支持 k/K (千), M (百万), B (十亿), T (万亿) 后缀"""
             val_str = val_str.replace(',', '')
             multiplier = 1
             if val_str.lower().endswith('k'):
-                multiplier = 1000
+                multiplier = 1_000
                 val_str = val_str[:-1]
             elif val_str.lower().endswith('m'):
-                multiplier = 1000000
+                multiplier = 1_000_000
+                val_str = val_str[:-1]
+            elif val_str.lower().endswith('b'):  # Billions (十亿)
+                multiplier = 1_000_000_000
+                val_str = val_str[:-1]
+            elif val_str.lower().endswith('t'):  # Trillions (万亿)
+                multiplier = 1_000_000_000_000
                 val_str = val_str[:-1]
             return float(val_str) * multiplier
 

@@ -86,7 +86,11 @@
     "embedding_model": "BAAI/bge-large-zh-v1.5",
     "enable_cache": true,
     "cache_ttl": 3600,
-    "scan_domain": "crypto"
+    "scan_domain": "crypto",
+    "enable_full_fetch": true,
+    "fetch_page_size": 100,
+    "fetch_max_per_tag": 0,
+    "fetch_rate_limit": 2.0
   },
   "output": {
     "output_dir": "./output",
