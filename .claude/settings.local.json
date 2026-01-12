@@ -83,7 +83,14 @@
       "Bash(\"D:\\\\work\\\\polymarket\\\\.venv\\\\Scripts\\\\python.exe\" -c \"\nimport sys\nsys.path.insert\\(0, ''D:/work/polymarket''\\)\n\nfrom local_scanner_v2 import PolymarketClient\n\nclient = PolymarketClient\\(\\)\n\n# 测试修复是否有效\nmarkets = client.get_markets_by_tag_slug\\(\n    ''bitcoin-prices'',\n    active=True,\n    limit=10,\n    min_liquidity=10000\n\\)\n\nprint\\(f''获取到 {len\\(markets\\)} 个市场''\\)\nif markets:\n    m = markets[0]\n    print\\(f''示例市场: {m.question[:60]}...''\\)\n    print\\(f''  liquidity: {m.liquidity:.2f}''\\)\n    print\\(f''  volume: {m.volume:.2f}''\\)\n    print\\(f''  yes_price: {m.yes_price}''\\)\n\")",
       "Bash(\"D:\\\\work\\\\polymarket\\\\.venv\\\\Scripts\\\\python.exe\" local_scanner_v2.py --help)",
       "Bash(\"D:\\\\work\\\\polymarket\\\\.venv\\\\Scripts\\\\python.exe\" -c \"\nfrom local_scanner_v2 import RunMode, interactive_mode_select\n\n# 测试直接回车（默认PRODUCTION）\nimport sys\nfrom io import StringIO\n\n# 模拟用户直接回车\nold_stdin = sys.stdin\nsys.stdin = StringIO\\(''\\\\n''\\)\nmode = interactive_mode_select\\(\\)\nprint\\(f''直接回车: {mode}''\\)\nsys.stdin = old_stdin\n\")",
-      "Bash(git -C \"D:/work/polymarket\" log --oneline -20)"
+      "Bash(git -C \"D:/work/polymarket\" log --oneline -20)",
+      "mcp__plugin_serena_serena__read_memory",
+      "Bash(python3:*)",
+      "Bash(printf:*)",
+      "mcp__plugin_serena_serena__insert_after_symbol",
+      "mcp__plugin_serena_serena__search_for_pattern",
+      "mcp__plugin_serena_serena__think_about_whether_you_are_done",
+      "WebFetch(domain:docs.polymarket.com)"
     ]
   }
 }

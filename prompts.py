@@ -510,47 +510,6 @@ def format_second_opinion_prompt(
     )
 
 
-# ============================================================
-# Prompt测试工具
-# ============================================================
-
-def test_prompt():
-    """测试Prompt格式化"""
-    market_a = {
-        "question": "Will Donald Trump win the 2024 presidential election?",
-        "description": "This market resolves YES if Donald Trump wins the 2024 US Presidential Election.",
-        "yes_price": 0.55,
-        "end_date": "2024-11-06",
-        "event_id": "2024-presidential-election",
-        "resolution_source": "Associated Press"
-    }
-
-    market_b = {
-        "question": "Will the Republican Party win the 2024 presidential election?",
-        "description": "This market resolves YES if the Republican candidate wins.",
-        "yes_price": 0.52,
-        "end_date": "2024-11-06",
-        "event_id": "2024-presidential-election",
-        "resolution_source": "Associated Press"
-    }
-
-    # 测试详细版
-    print("=" * 60)
-    print("详细版Prompt (v2)")
-    print("=" * 60)
-    prompt_v2 = format_analysis_prompt(market_a, market_b, PromptConfig(version="v2"))
-    print(prompt_v2[:2000] + "...")
-
-    print("\n" + "=" * 60)
-    print("简化版Prompt (lite)")
-    print("=" * 60)
-    prompt_lite = format_analysis_prompt(market_a, market_b, PromptConfig(version="lite"))
-    print(prompt_lite)
-
-
-if __name__ == "__main__":
-    test_prompt()
-
 
 # ============================================================
 # 区间完备集验证Prompt - Phase 2.5 新增

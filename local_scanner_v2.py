@@ -64,6 +64,9 @@ from validators import MathValidator
 # ✅ 新增：导入语义聚类模块
 from semantic_cluster import SemanticClusterer
 
+# ✅ 新增：导入单调性检查器（Sprint 0）
+from monotonicity_checker import MonotonicityChecker
+
 import logging
 import traceback
 
@@ -100,14 +103,14 @@ SUBCATEGORY_ALIASES = {
 # 子类别分组配置（用于交互式选择）
 SUBCATEGORY_GROUPS = {
     "crypto": [
-        ("Bitcoin", ["bitcoin-prices", "bitcoin-volatility", "bitcoin-conference", "strategic-bitcoin-reserve"]),
-        ("Ethereum", ["ethereum-prices", "ethereum-dencun", "ethgas", "ethbtc", "ether-rock", "etherfi", "ethena"]),
-        ("Solana", ["solana-prices", "sol", "solana"]),
-        ("主要币种", ["xrp", "xrp-prices", "ada", "bnb", "litecoin"]),
-        ("稳定币/DeFi", ["tether", "usdc", "uniswap", "defi-app", "chainlink"]),
+        ("Bitcoin", ["bitcoin", "bitcoin-prices", "bitcoin-volatility", "bitcoin-conference", "strategic-bitcoin-reserve"]),
+        ("Ethereum", ["ethereum", "ethereum-prices", "ethereum-dencun", "ethgas", "ethbtc", "ether-rock", "etherfi", "ethena", "megaeth"]),
+        ("Solana", ["solana", "solana-prices", "sol"]),
+        ("主要币种", ["xrp", "xrp-prices", "ripple", "cardano", "bnb", "litecoin", "dogecoin"]),
+        ("稳定币/DeFi", ["tether", "usdc", "uniswap", "defi-app", "chainlink", "stablecoins"]),
         ("NFT/meme", ["nft", "cryptopunks", "pepe"]),
-        ("平台/项目", ["binance", "megaeth", "token-launch", "token-price"]),
-        ("综合/其他", ["crypto", "crypto-prices", "cryptocurrency", "crypto-summit", "crypto-policy", "bitboy-crypto", "scroll-airdrop", "fivethirtyeight"]),
+        ("平台/项目", ["binance", "token-launch", "token-price", "hyperliquid", "coinbase"]),
+        ("综合/其他", ["crypto", "crypto-prices", "cryptocurrency", "airdrops", "crypto-summit", "crypto-policy", "token-sales", "public-sales", "pre-market", "finance", "business", "tech"]),
     ],
     # 其他领域可后续扩展
     "politics": [],
@@ -160,7 +163,11 @@ class Market:
     best_bid: float = 0.0         # 最佳买价 (你卖出时的价格)
     best_ask: float = 0.0         # 最佳卖价 (你买入时的价格)
     spread: float = 0.0           # 价差 = ask - bid
-    token_id: str = ""            # CLOB token ID (用于获取订单簿)
+    token_id: str = ""            # CLOB token ID - YES token (用于获取订单簿)
+    # 单调性套利修复: 增加 NO token 相关字段
+    no_token_id: str = ""         # CLOB token ID - NO token
+    best_bid_no: float = 0.0      # NO的最佳买价
+    best_ask_no: float = 0.0      # NO的最佳卖价
 
     # ✅ 新增: Rules分析相关字段
     event_description: str = ""   # Event的description (包含resolution rules!)
@@ -200,6 +207,30 @@ class Market:
     def effective_sell_price(self) -> float:
         """实际卖出价格 - 套利计算时使用 best_bid"""
         return self.best_bid if self.best_bid > 0 else self.yes_price
+
+    @property
+    def is_expired(self) -> bool:
+        """检查市场是否已过期（end_date已过）
+
+        Note: Polymarket API dates are in UTC, so we use UTC time for comparison
+        """
+        if not self.end_date:
+            return False  # 无结算日期的市场视为未过期
+        try:
+            # 解析 end_date，支持多种格式
+            date_str = self.end_date
+            if 'T' in date_str:
+                # ISO 8601 格式: "2024-01-15T00:00:00Z" 或 "2024-01-15T00:00:00.000Z"
+                date_str = date_str.split('T')[0]
+            # 解析日期部分
+            end_dt = datetime.strptime(date_str, "%Y-%m-%d")
+            # 使用UTC时间比较，因为Polymarket API使用UTC
+            from datetime import timezone
+            now_utc = datetime.now(timezone.utc)
+            # 如果 end_date 在UTC今天之前，则视为已过期
+            return end_dt.date() < now_utc.date()
+        except (ValueError, TypeError):
+            return False  # 解析失败则视为未过期，保守处理
 
 
 @dataclass
@@ -294,7 +325,8 @@ class PolymarketClient:
             for item in data:
                 try:
                     market = self._parse_market(item)
-                    if market and market.liquidity >= min_liquidity:
+                    # 过滤掉已过期的市场和流动性不足的市场
+                    if market and market.liquidity >= min_liquidity and not market.is_expired:
                         markets.append(market)
                 except Exception as e:
                     continue
@@ -340,8 +372,9 @@ class PolymarketClient:
                     token_ids = []
             else:
                 token_ids = clob_token_ids or []
-            # YES token 是第一个
-            yes_token_id = token_ids[0] if token_ids else ""
+            # YES token 是第一个, NO token 是第二个
+            yes_token_id = token_ids[0] if len(token_ids) > 0 else ""
+            no_token_id = token_ids[1] if len(token_ids) > 1 else ""
 
             # ✅ 新增: 提取Event级别的description和tags
             event_description = ""
@@ -393,11 +426,12 @@ class PolymarketClient:
                 volume=float(data.get('volume', 0) or 0),
                 liquidity=float(liquidity_value or 0),
                 end_date=data.get('endDate', ''),
-                event_id=data.get('eventSlug', '') or data.get('groupItemTitle', '') or '',
-                event_title=data.get('groupItemTitle', '') or data.get('eventSlug', '') or '',
+                event_id=(event_data.get('slug', '') if event_data else '') or data.get('eventSlug', '') or '',
+                event_title=(event_data.get('title', '') if event_data else '') or data.get('groupItemTitle', '') or '',
                 resolution_source=data.get('resolutionSource', ''),
                 outcomes=outcomes,
                 token_id=yes_token_id,
+                no_token_id=no_token_id,
                 event_description=event_description,
                 market_description=market_description,
                 tags=tags,
@@ -478,6 +512,30 @@ class PolymarketClient:
 
         return market
 
+    def enrich_with_no_orderbook(self, market: Market) -> Market:
+        """
+        为市场对象补充 NO token 的订单簿数据
+
+        单调性套利修复: 获取真实的 NO 买入价，而非用 1 - YES价格 估算
+
+        Args:
+            market: Market 对象
+
+        Returns:
+            补充了 best_bid_no/best_ask_no 的 Market 对象
+        """
+        if not market.no_token_id:
+            return market
+
+        try:
+            no_orderbook = self.fetch_orderbook(market.no_token_id)
+            market.best_bid_no = no_orderbook["best_bid"]
+            market.best_ask_no = no_orderbook["best_ask"]
+        except Exception as e:
+            logger.warning(f"获取NO订单簿失败: {e}")
+
+        return market
+
     def get_events_by_tag(
         self,
         tag_id: str,
@@ -524,7 +582,8 @@ class PolymarketClient:
                 params = {
                     "tag_id": tag_id,
                     "limit": current_limit,
-                    "offset": offset
+                    "offset": offset,
+                    "closed": "false"  # 在API层面过滤已关闭的事件
                 }
                 if active is not None:
                     params["active"] = str(active).lower()
@@ -604,6 +663,9 @@ class PolymarketClient:
             for market_data in event.get("markets", []):
                 market = self._parse_market(market_data, event_data)
                 if market:
+                    # 过期市场过滤
+                    if market.is_expired:
+                        continue
                     # 流动性过滤
                     if min_liquidity > 0 and market.liquidity < min_liquidity:
                         continue
@@ -726,6 +788,9 @@ class PolymarketClient:
         for market_data in event.get("markets", []):
             market = self._parse_market(market_data, event_data)
             if market:
+                # 过期市场过滤
+                if market.is_expired:
+                    continue
                 if min_liquidity > 0 and market.liquidity < min_liquidity:
                     continue
                 markets.append(market)
@@ -1233,15 +1298,18 @@ class LLMAnalyzer:
             return normalized
 
         except json.JSONDecodeError as e:
+            # 保存完整LLM响应用于调试
+            self._save_llm_error_response(market_a, market_b, response.content, content, str(e))
+
             error_msg = (
                 f"JSON解析失败\n"
                 f"  错误信息: {e}\n"
                 f"  市场A: {market_a.question[:50]}...\n"
                 f"  市场B: {market_b.question[:50]}...\n"
-                f"  原始响应: {content[:200] if 'content' in dir() else 'N/A'}..."
+                f"  完整响应已保存到: output/llm_errors/"
             )
             logger.error(error_msg)
-            print(f"    JSON解析失败: {e}")
+            print(f"    JSON解析失败: {e} (完整响应已保存)")
             return self._analyze_with_rules(market_a, market_b)
         except Exception as e:
             error_msg = (
@@ -1317,6 +1385,7 @@ class LLMAnalyzer:
         }
 
         return normalized
+
     
     def _analyze_with_rules(self, market_a: Market, market_b: Market) -> Dict:
         """使用规则匹配分析（备用方案）"""
@@ -1449,6 +1518,66 @@ class LLMAnalyzer:
                     )
 
         return True, ""
+
+    def _save_llm_error_response(self, market_a: Market, market_b: Market,
+                                 raw_response: str, extracted_content: str,
+                                 error_msg: str):
+        """
+        保存LLM解析失败的完整响应用于调试
+
+        Args:
+            market_a: 市场A
+            market_b: 市场B
+            raw_response: LLM原始完整响应
+            extracted_content: 提取出的JSON内容（可能是错误的）
+            error_msg: JSON解析错误信息
+        """
+        import os
+        from datetime import datetime
+
+        # 创建错误目录
+        error_dir = "output/llm_errors"
+        os.makedirs(error_dir, exist_ok=True)
+
+        # 生成文件名（包含时间戳和市场ID）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        safe_id_a = market_a.question[:30].replace(" ", "_").replace("/", "_") if market_a.question else "unknown"
+        safe_id_b = market_b.question[:30].replace(" ", "_").replace("/", "_") if market_b.question else "unknown"
+        filename = f"{timestamp}_{safe_id_a}_{safe_id_b}.txt"
+        filepath = os.path.join(error_dir, filename)
+
+        # 准备日志内容
+        log_content = f"""=== LLM JSON解析错误日志 ===
+时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+错误信息: {error_msg}
+
+=== 市场A ===
+ID: {market_a.id or 'N/A'}
+问题: {market_a.question}
+YES价格: {market_a.yes_price}
+Event ID: {market_a.event_id or 'N/A'}
+
+=== 市场B ===
+ID: {market_b.id or 'N/A'}
+问题: {market_b.question}
+YES价格: {market_b.yes_price}
+Event ID: {market_b.event_id or 'N/A'}
+
+=== LLM原始响应 ===
+{raw_response}
+
+=== 提取的JSON内容（解析失败） ===
+{extracted_content}
+
+=== 结束 ===
+"""
+
+        # 写入文件
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(log_content)
+        except Exception as write_error:
+            logger.warning(f"无法保存LLM错误日志: {write_error}")
 
     def close(self):
         """关闭LLM客户端"""
@@ -3784,6 +3913,136 @@ class ArbitrageScanner:
 
         return opportunities
 
+    def scan_monotonicity(
+        self,
+        domain: str = "crypto",
+        subcategories: List[str] = None,
+        force_refresh: bool = False
+    ) -> List[ArbitrageOpportunity]:
+        """
+        单调性违背扫描（Sprint 0）
+        
+        检测加密货币阈值市场的价格倒挂现象：
+        - 当高阈值合约价格 > 低阈值合约价格时，存在套利机会
+        - 例如: BTC>100k 价格 0.45 > BTC>95k 价格 0.40（价格倒挂）
+        
+        Args:
+            domain: 市场领域（目前主要支持 "crypto"）
+            subcategories: 子类别筛选（如 ["bitcoin", "ethereum"]）
+            force_refresh: 强制刷新缓存
+            
+        Returns:
+            套利机会列表
+        """
+        logging.info("[START] 单调性违背扫描")
+        logging.info(f"        领域: {domain}, 子类别: {subcategories or '全部'}")
+        
+        # Step 1: 获取市场数据
+        logging.info("[Step 1] 获取市场数据...")
+        all_markets = self._fetch_domain_markets(domain, subcategories, force_refresh)
+        
+        if not all_markets:
+            logging.warning("[ERROR] 未获取到市场数据")
+            return []
+        
+        logging.info(f"[OK] 获取到 {len(all_markets)} 个市场")
+        
+        # Step 2: 创建单调性检查器并执行扫描
+        logging.info("[Step 2] 执行单调性检查...")
+        checker = MonotonicityChecker()
+        violations = checker.scan(all_markets)
+
+        logging.info(f"[OK] 检测到 {len(violations)} 个潜在单调性违背")
+
+        # Step 2.5: 获取 NO 订单簿数据（单调性套利修复）
+        # 只对检测到违背的市场获取 NO 订单簿，避免不必要的 API 调用
+        if violations:
+            logging.info("[Step 2.5] 获取 NO 订单簿数据以验证真实套利机会...")
+            for violation in violations:
+                # 获取低阈值市场的 NO 订单簿
+                low_market = violation.low_market.market
+                self.client.enrich_with_no_orderbook(low_market)
+                violation.low_market.no_best_bid = low_market.best_bid_no
+                violation.low_market.no_best_ask = low_market.best_ask_no
+
+                # 获取高阈值市场的 NO 订单簿
+                high_market = violation.high_market.market
+                self.client.enrich_with_no_orderbook(high_market)
+                violation.high_market.no_best_bid = high_market.best_bid_no
+                violation.high_market.no_best_ask = high_market.best_ask_no
+
+            logging.info(f"[OK] NO 订单簿获取完成")
+
+        # Step 3: 过滤真正有利可图的套利机会
+        opportunities = []
+        for violation in violations:
+            # 使用真实 NO 价格重新计算套利详情
+            arb_details = checker.calculate_arbitrage(
+                violation.low_market,
+                violation.high_market
+            )
+
+            # 过滤：只保留利润为正的机会
+            if arb_details['profit'] <= 0:
+                logging.info(f"  [跳过] {violation.asset} ${violation.low_threshold}-${violation.high_threshold}: "
+                           f"总成本 ${arb_details['total_cost']:.3f} >= $1.00，非真实套利")
+                continue
+
+            # 创建套利机会对象
+            opp = ArbitrageOpportunity(
+                id=f"mono_{violation.asset}_{violation.low_threshold}_{violation.high_threshold}",
+                type="MONOTONICITY_VIOLATION",
+                markets=[
+                    {"question": violation.low_market.market.question,
+                     "yes_price": violation.low_market.market.yes_price,
+                     "threshold": violation.low_threshold},
+                    {"question": violation.high_market.market.question,
+                     "yes_price": violation.high_market.market.yes_price,
+                     "threshold": violation.high_threshold}
+                ],
+                relationship=f"{violation.asset} 阈值单调性违背",
+                confidence=0.95,  # 数学确定性高
+                total_cost=violation.total_cost,
+                guaranteed_return=violation.guaranteed_return,
+                profit=violation.profit,
+                profit_pct=violation.profit_pct * 100,
+                action=f"买入 {violation.low_market.market.question} YES @ ${violation.low_market.market.yes_price:.3f}, "
+                       f"卖出 {violation.high_market.market.question} YES @ ${violation.high_market.market.yes_price:.3f}",
+                reasoning=checker.format_violation(violation),
+                edge_cases=violation.warnings,
+                needs_review=["验证市场结算规则一致性", "检查流动性"],
+                timestamp=datetime.now().isoformat()
+            )
+            opportunities.append(opp)
+            
+            # 打印详情
+            logging.info(f"\n{'='*60}")
+            logging.info(checker.format_violation(violation))
+            logging.info(f"{'='*60}")
+        
+        # Step 4: 生成报告
+        if opportunities:
+            logging.info("[Step 3] 生成报告...")
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"monotonicity_scan_{timestamp}.json"
+            output_path = Path(self.config.output.output_dir) / filename
+            
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump([asdict(opp) for opp in opportunities], f, indent=2, ensure_ascii=False)
+            
+            logging.info(f"[OK] 报告已保存: {output_path}")
+        
+        # 打印总结
+        logging.info(f"\n[DONE] 单调性扫描完成")
+        logging.info(f"       总市场数: {len(all_markets)}")
+        logging.info(f"       违背数量: {len(violations)}")
+        if violations:
+            total_profit = sum(v.price_inversion for v in violations)
+            logging.info(f"       总价差: ${total_profit:.4f}")
+        
+        return opportunities
+
     def close(self):
         """清理资源"""
         self.analyzer.close()
@@ -3975,6 +4234,10 @@ def main():
   # 基础扫描（向量化模式）
   python local_scanner_v2.py --domain crypto
 
+  # 单调性违背扫描（检测价格倒挂）
+  python local_scanner_v2.py --domain crypto --monotonicity-check
+  python local_scanner_v2.py -d crypto --monotonicity-check --subcat btc,eth
+
   # 验证模式（发现机会后暂停确认）
   python local_scanner_v2.py -d crypto --verify
 
@@ -4089,6 +4352,13 @@ def main():
         type=str,
         choices=["debug", "production"],
         help="运行模式 (debug=暂停确认, production=自动保存)"
+    )
+
+    # 🆕 单调性违背检测（Sprint 0）
+    parser.add_argument(
+        "--monotonicity-check",
+        action="store_true",
+        help="启用单调性违背检测：检测加密货币阈值市场的价格倒挂"
     )
 
     args = parser.parse_args()
@@ -4273,7 +4543,16 @@ def main():
 
     try:
         # 根据模式选择扫描方法
-        if use_semantic:
+        if args.monotonicity_check:
+            # 🆕 单调性违背扫描（Sprint 0）
+            subcat_info = f", 子类别: {subcategories}" if subcategories else ""
+            logging.info(f"[START] 单调性违背扫描 - 领域: {domain}{subcat_info}")
+            opportunities = scanner.scan_monotonicity(
+                domain=domain,
+                subcategories=subcategories,
+                force_refresh=force_refresh
+            )
+        elif use_semantic:
             subcat_info = f", 子类别: {subcategories}" if subcategories else ""
             logging.info(f"[START] 向量化模式 - 领域: {domain}{subcat_info}, 阈值: {args.threshold}")
             opportunities = scanner.scan_semantic(

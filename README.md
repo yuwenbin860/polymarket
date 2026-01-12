@@ -20,18 +20,19 @@
 polymarket_arb/
 ├── PROJECT_BIBLE.md         # 📖 项目完整文档（必读）
 ├── local_scanner_v2.py      # 主程序（支持多LLM + 订单簿价格）
-├── tag_manager.py           # 🏷️ Tag管理模块
-├── interval_parser.py       # 🔢 区间解析器
+├── monotonicity_checker.py  # 📉 单调性违背检测模块
+├── interval_parser_v2.py    # 🔢 区间解析器
 ├── semantic_cluster.py      # 🧠 语义聚类模块
 ├── llm_providers.py         # LLM提供商抽象层
 ├── llm_config.py            # LLM配置管理器
 ├── prompts.py               # Prompt工程模块（含时间验证）
 ├── validators.py            # 数学验证层（时间一致性验证）
-├── similarity.py            # 向量相似度计算
-├── dual_verification.py     # 双模型交叉验证
-├── simulation.py            # 模拟执行跟踪
 ├── config.py                # 配置管理
 ├── config.example.json      # 配置文件示例
+├── scripts/
+│   └── tag_validator.py     # 🏷️ 标签验证和更新工具
+├── data/
+│   └── tag_categories.json  # 🏷️ 标签分类配置
 ├── test_prompts.py          # Prompt测试脚本
 ├── test_new_features.py     # 🧪 新功能验证测试
 ├── polymarket_arb_mvp.py    # MVP版本（模拟数据）
@@ -133,6 +134,18 @@ python local_scanner_v2.py
 |------|------|--------|
 | `--full-fetch` | 启用全量获取（覆盖配置文件） | False |
 
+#### 运行模式参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--mode` | 运行模式 (debug=暂停确认, production=自动保存) | - |
+
+#### 单调性检测参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--monotonicity-check` | 启用单调性违背检测（检测价格倒挂） | False |
+
 **使用示例**:
 ```bash
 # 启用全量获取
@@ -190,6 +203,15 @@ python local_scanner_v2.py --use-cache
 # 组合使用
 python local_scanner_v2.py --profile ollama -d sports -t 0.90
 
+# 单调性违背扫描（检测价格倒挂）
+python local_scanner_v2.py --domain crypto --monotonicity-check
+python local_scanner_v2.py -d crypto --monotonicity-check --subcat btc,eth
+
+# 标签验证和更新
+python scripts/tag_validator.py --check
+python scripts/tag_validator.py --update --min-markets 10
+python scripts/tag_validator.py --report --output tag_report.md
+
 # 列出所有可用配置
 python local_scanner_v2.py --list-profiles
 ```
@@ -232,14 +254,16 @@ $ python local_scanner_v2.py
 
 | 分组 | 包含标签 |
 |------|----------|
-| **Bitcoin** | bitcoin-prices, bitcoin-volatility, bitcoin-conference, strategic-bitcoin-reserve |
-| **Ethereum** | ethereum-prices, ethereum-dencun, ethgas, ethbtc, ether-rock, etherfi, ethena |
-| **Solana** | solana-prices, sol, solana |
-| **主要币种** | xrp, xrp-prices, ada, bnb, litecoin |
-| **稳定币/DeFi** | tether, usdc, uniswap, defi-app, chainlink |
+| **Bitcoin** | bitcoin, bitcoin-prices, bitcoin-volatility, bitcoin-conference, strategic-bitcoin-reserve |
+| **Ethereum** | ethereum, ethereum-dencun, ethgas, ethbtc, ether-rock, etherfi, ethena, megaeth |
+| **Solana** | solana, solana-prices, sol |
+| **主要币种** | xrp, xrp-prices, ripple, cardano, bnb, litecoin, dogecoin |
+| **稳定币/DeFi** | tether, usdc, uniswap, defi-app, chainlink, stablecoins |
 | **NFT/meme** | nft, cryptopunks, pepe |
-| **平台/项目** | binance, megaeth, token-launch, token-price |
-| **综合/其他** | crypto, crypto-prices, cryptocurrency, crypto-summit, crypto-policy, 等 |
+| **平台/项目** | binance, token-launch, token-price, hyperliquid, coinbase |
+| **综合/其他** | crypto, crypto-prices, cryptocurrency, airdrops, 等 |
+
+**注意**：标签配置已更新，`bitcoin` 和 `ethereum` 核心标签已添加。使用 `scripts/tag_validator.py` 可验证和更新标签配置。
 
 ### 命令行参数
 
@@ -711,6 +735,80 @@ python test_new_features.py
 - 买 "共和党赢" YES @ $0.50
 - 买 "特朗普赢" NO @ $0.45
 总成本: $0.95，保证回报 $1.00，利润 5.3%
+```
+
+## 🏷️ 标签验证工具
+
+系统提供了标签验证工具 `scripts/tag_validator.py`，用于检测和更新标签配置。
+
+### 功能说明
+
+1. **检查配置** - 对比当前配置与API实际标签，找出差异
+2. **更新配置** - 自动添加缺失的有效标签，移除空标签
+3. **生成报告** - 输出完整的标签市场数统计报告
+
+### 使用方法
+
+```bash
+# 检查当前配置状态
+python scripts/tag_validator.py --check
+
+# 预览更新（不实际修改）
+python scripts/tag_validator.py --update --dry-run
+
+# 执行更新（自动备份原配置）
+python scripts/tag_validator.py --update --min-markets 10
+
+# 生成完整报告
+python scripts/tag_validator.py --report --output tag_report.md
+
+# 指定领域
+python scripts/tag_validator.py --check --domain crypto
+```
+
+### 参数说明
+
+| 参数 | 说明 |
+|------|------|
+| `--check` | 检查当前配置 |
+| `--update` | 更新配置文件 |
+| `--min-markets` | 最小市场数阈值，只添加市场数>=此值的标签 |
+| `--dry-run` | 预览变更，不实际修改 |
+| `--keep-empty` | 保留空标签不移除 |
+| `--report` | 生成完整报告 |
+
+## 📉 单调性违背检测
+
+单调性违背检测用于发现加密货币阈值市场的价格倒挂机会。
+
+### 什么是单调性违背？
+
+对于同一标的（如BTC）的两个阈值市场：
+- 如果阈值A < 阈值B，则价格A应该 >= 价格B（YES价格）
+- 当出现价格A < 价格B时，存在单调性违背
+
+### 使用场景
+
+```
+市场A: BTC > $100k  YES价格 = 0.40
+市场B: BTC > $90k   YES价格 = 0.50  ← 违背单调性！
+
+套利策略: 买A的YES @ 0.40, 买B的NO @ 0.50
+如果BTC > $100k: A YES = $1, B NO = $0.5 → 总收益 $1.5
+如果BTC <= $100k: A NO = $1, B YES = $1 → 总收益 $2
+```
+
+### 运行单调性检测
+
+```bash
+# 基础扫描
+python local_scanner_v2.py --domain crypto --monotonicity-check
+
+# 指定子类别
+python local_scanner_v2.py -d crypto --monotonicity-check --subcat btc,eth
+
+# 组合参数
+python local_scanner_v2.py -d crypto --monotonicity-check --refresh
 ```
 
 ## ⚠️ 风险提示

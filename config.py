@@ -291,11 +291,3 @@ def create_default_config(path: str = "config.json"):
     print(f"✅ 已创建配置文件: {path}")
 
 
-if __name__ == "__main__":
-    # 测试配置加载
-    config = Config.load()
-    print("当前配置:")
-    print(f"  LLM Provider: {config.llm.provider}")
-    print(f"  LLM Model: {config.llm.model or '(默认)'}")
-    print(f"  Min Profit: {config.scan.min_profit_pct}%")
-    print(f"  Log Level: {config.output.log_level}")

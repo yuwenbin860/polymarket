@@ -153,8 +153,12 @@ Config loading priority: `--config` argument > `config.json` > environment varia
 - 避免一次性做太多，保持每步可验证
 
 ### 2. 进度持久化 (Progress Persistence)
-- 每完成一个目标，验证无误后更新进度到 `docs/PROGRESS.md`
-- 使用 `docs/PROGRESS.md` 记录详细工作日志（如果需要）
+- **里程碑和阶段进度** → 更新到 `docs/WORK_PLAN.md`
+  - 阶段完成度、版本节点、任务状态
+  - 用于查看下一步工作方向
+- **详细工作日志** → 记录到 `docs/PROGRESS.md`
+  - 每次会话的具体变更
+  - Bug修复、代码变更等明细
 - 确保可以在任何时间、任何地点恢复工作上下文
 
 ### 3. 开放创新 (Open Innovation)
@@ -221,6 +225,7 @@ When making decisions about features, architecture changes, or priorities, alway
 ## References
 
 - `docs/PROJECT_BIBLE.md` - Comprehensive project documentation (authoritative guide)
-- `docs/PROGRESS.md` - Project progress tracking and work logs
+- `docs/WORK_PLAN.md` - Work plan, milestones, and phase status (check for next steps)
+- `docs/PROGRESS.md` - Detailed work logs and session records
 - `README.md` - Quick start guide
 - `config.example.json` - Configuration template
