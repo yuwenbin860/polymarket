@@ -211,6 +211,68 @@ for m in markets:
     # 将rules传递给LLM和向量化系统
 ```
 
+### 9. 交互优先 (Interactive-First)
+- 进入程序后默认显示交互式菜单，方便用户选择操作
+- 命令行参数作为高级用法或自动化脚本使用
+- 使用 `--no-interactive` 禁用交互式菜单进入CLI模式
+- 交互流程：主菜单 → 领域选择 → 策略多选 → 子类别 → 确认
+
+### 10. 渐进披露 (Progressive Disclosure)
+- 主菜单只显示核心操作（扫描、配置、帮助、退出）
+- 高级选项按需展开，不在首页显示全部参数
+- 默认值对新手友好，高级用户可通过命令行自定义
+- 复杂配置使用分步引导而非一次性表单
+
+### 11. 即时反馈 (Immediate Feedback)
+- 每个步骤清楚显示正在做什么（获取哪些市场、执行哪个策略）
+- 进度条显示耗时操作，让用户知道系统在运行
+- 发现套利机会时立即高亮显示，不等到扫描结束
+- 错误信息具有指导性，告诉用户如何解决而非只报错
+
+### 12. 可扩展架构 (Extensible Architecture)
+- 新增套利策略只需实现 `BaseArbitrageStrategy` 接口并使用 `@StrategyRegistry.register` 装饰器注册
+- 输出格式统一通过 `cli/output.py:ScannerOutput` 处理
+- 策略优先级、领域过滤通过 `StrategyMetadata` 配置
+- 菜单系统自动发现已注册策略，无需手动维护选项列表
+
+**策略注册示例**：
+```python
+from strategies import BaseArbitrageStrategy, StrategyMetadata, StrategyRegistry
+
+@StrategyRegistry.register
+class MyNewStrategy(BaseArbitrageStrategy):
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            id="my_strategy",
+            name="我的新策略",
+            name_en="My New Strategy",
+            description="策略描述",
+            priority=6,
+            requires_llm=False,
+            domains=["crypto"],
+            risk_level=RiskLevel.LOW,
+            min_profit_threshold=2.0
+        )
+
+    def scan(self, markets, config, progress_callback=None):
+        # 实现扫描逻辑
+        pass
+```
+
+## CLI Module Architecture
+
+### cli/ 模块
+- `cli/menu.py` - 交互式菜单系统 (`InteractiveMenu` 类)
+- `cli/output.py` - 规范化输出格式 (`ScannerOutput` 类)
+- 使用 `rich` 库进行终端格式化
+- 使用 `questionary` 库进行交互式提示
+
+### strategies/ 模块
+- `strategies/base.py` - 策略基类和元数据定义
+- `strategies/registry.py` - 策略注册表
+- `strategies/*.py` - 各策略实现（monotonicity, exhaustive, implication, equivalent, interval）
+
 ## Project Guidance
 
 **`docs/PROJECT_BIBLE.md` is the authoritative guide** for all project work. It contains:

@@ -1757,7 +1757,7 @@ class ArbitrageDetector:
         real_total = sum(m.effective_buy_price for m in markets)
         mid_total = sum(m.yes_price for m in markets)
 
-        if real_total < 0.98:
+        if real_total < 0.99:
             real_profit = 1.0 - real_total
             real_profit_pct = (real_profit / real_total) * 100 if real_total > 0 else 0
             mid_profit_pct = ((1.0 - mid_total) / mid_total) * 100 if mid_total > 0 else 0
@@ -1821,8 +1821,52 @@ class ArbitrageDetector:
                 timestamp=datetime.now().isoformat()
             )
 
+        # =====================================
+        # 边界案例检测：0.99 <= sum < 1.0
+        # =====================================
+        if real_total < 1.0:
+            real_profit = 1.0 - real_total
+            real_profit_pct = (real_profit / real_total) * 100 if real_total > 0 else 0
+
+            # 边界案例也需要LLM验证
+            print(f"    [LLM] 验证边界案例完备集语义...")
+            llm_verification = self.verify_exhaustive_set_with_llm(markets)
+
+            if not llm_verification.get("is_valid", False):
+                print(f"    [SKIP] 边界案例LLM验证失败")
+                return None
+
+            action_lines = [
+                f"买 '{m.question[:60]}...' YES @ ${m.effective_buy_price:.3f} (ask)"
+                for m in markets
+            ]
+
+            return ArbitrageOpportunity(
+                id=f"exhaustive_borderline_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                type="EXHAUSTIVE_SET_BORDERLINE",
+                markets=[{"id": m.id, "question": m.question, "yes_price": m.yes_price,
+                          "best_ask": m.best_ask, "spread": m.spread, "liquidity": m.liquidity,
+                          "orderbook": m.orderbook} for m in markets],
+                relationship="exhaustive",
+                confidence=0.7,
+                total_cost=real_total,
+                guaranteed_return=1.0,
+                profit=real_profit,
+                profit_pct=real_profit_pct,
+                action="\n".join(action_lines),
+                reasoning="边界案例：完备集总价接近1，利润空间较小",
+                edge_cases=["利润可能被手续费和滑点吃掉"],
+                needs_review=[
+                    "⚠️ 边界案例：利润空间 < 1%，需仔细评估",
+                    "计算实际手续费后的净利润",
+                    "评估滑点影响（大单会推高价格）",
+                    f"理论利润: {real_profit_pct:.2f}%",
+                ],
+                timestamp=datetime.now().isoformat()
+            )
+
         return None
-    
+
     def _check_implication(self, implying: Market, implied: Market,
                            analysis: Dict, direction: str) -> Optional[ArbitrageOpportunity]:
         """检查包含关系套利"""

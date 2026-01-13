@@ -26,19 +26,30 @@
 
 ## 1.1 项目现状
 
-**当前版本**: v2.1.4 (2026-01-07)
+**当前版本**: v2.1.6 (2026-01-12)
 
 **最新进展**:
+- 🚀 **v2.1.6 单调性违背套利系统扩展完成** - 多级违背检测、区间-阈值混合、跨日期时间蕴含
+  - ✅ Task 1.1: 多级违背检测算法 - 检测所有非相邻对
+  - ✅ Task 1.2: 区间市场支持 - 区间-阈值混合检测
+  - ✅ Task 1.3: 最优组合算法 - 动态规划找最大利润
+  - ✅ Task 2.2: 跨日期时间蕴含检测
+  - ✅ Task 3.1: 增强阈值解析 - 扩展格式支持 (20+ patterns)
+  - ✅ Task 3.2: format_violation() 更新 - 支持4种违背类型
+  - ⏳ Task 2.1: 订单簿深度集成
+  - ⏳ Task 4.1: 单元测试
+  - ⏳ Task 4.2: 真实数据验证 - 发现3个新案例
+- 🧹 **v2.1.5 代码清理完成** - 删除冗余MVP版本、清理临时文件
 - 基于深度研究报告《语义Alpha》，新增 **Sprint 0** 专注**单调性违背套利**
 - 领域聚焦调整为**加密货币优先**
 - 策略优先级重排：单调性违背 > 区间划分 > 其他
 
 **完成度概览**:
 ```
-Sprint 0 (单调性违背)   ████████████████████ 100%  ✅ 全部完成！
+Sprint 0 (单调性违背)   ████████████████████ 100%  ✅ 核心算法完成！
 Phase 1 (MVP验证)      ████████████████████ 100%
 Phase 2 (真实数据)      ██████████████████░░  90%
-Phase 2.5 (风控精度)    ██████░░░░░░░░░░░░░░  30%
+Phase 2.5 (风控精度)    ███░░░░░░░░░░░░░░░░░  15%  🔄 单调性扩展进行中
 Phase 3 (策略扩展)      ██░░░░░░░░░░░░░░░░░░  10%
 Phase 4 (半自动执行)    ░░░░░░░░░░░░░░░░░░░░   0%
 ```
@@ -55,20 +66,36 @@ Phase 4 (半自动执行)    ░░░░░░░░░░░░░░░░░
 
 ## 1.3 下一阶段重点
 
-**Sprint 0 单调性违背套利** 是当前最紧迫的工作（P0最高优先级），聚焦加密货币领域。
+**Phase 2.5 风控基础设施建设** 是当前最紧迫的工作（P0最高优先级）。
 
-**Sprint 0 核心交付物**:
-1. `MonotonicityChecker` - 单调性违背检测算法
-2. `ThresholdMarketIdentifier` - 阈值型市场自动识别
-3. `CryptoFocusedScanner` - 加密货币领域专用扫描
-4. `LadderMarketGrouper` - 阶梯行权价市场分组
-5. 至少 **1个真实单调性违背案例**
+**Phase 2.5 核心交付物**:
+1. `APYCalculator` - 年化收益率计算器（最低阈值15%）
+2. `OracleComparator` - 预言机对齐检查器（resolution_source一致性）
+3. `DepthCalculator` - 订单簿深度/VWAP计算器（滑点估算）
+4. `ValidationEngine` - 五层验证框架整合
+5. `ArbitrageOpportunity` 扩展 - 添加11个缺失字段
 
-**后续（Sprint 1）风控基础设施**:
-1. `APYCalculator` - 年化收益率计算器
-2. `OracleComparator` - 预言机对齐检查器
-3. `DepthCalculator` - 订单簿深度/VWAP计算器
-4. `ValidationEngine` - 五层验证框架
+**Sprint计划**:
+- Sprint 1: APYCalculator (1-2天)
+- Sprint 2: OracleComparator (1-2天)
+- Sprint 3: DepthCalculator (2-3天)
+- Sprint 4: ValidationEngine (1-2天)
+- Sprint 5: ArbitrageOpportunity 扩展 (1天)
+
+**已完成（Sprint 0 + v2.1.6 扩展）**:
+1. `MonotonicityChecker` - 单调性违背检测算法 ✅
+   - ✅ 多级违背检测 - 检测所有非相邻对（不再限于相邻阈值）
+   - ✅ 区间-阈值混合违背检测
+   - ✅ 区间-区间违背检测
+   - ✅ 跨日期时间蕴含违背检测
+2. `ThresholdMarketIdentifier` - 阈值型市场自动识别 ✅
+   - ✅ 扩展阈值解析支持20+ patterns (surpass, exceed, at least, triple digits等)
+   - ✅ M/B/T 单位后缀支持
+3. `CryptoFocusedScanner` - 加密货币领域专用扫描 ✅
+4. `LadderMarketGrouper` - 阶梯行权价市场分组 ✅
+   - ✅ 最优套利组合算法（动态规划找最大利润）
+5. 1个真实单调性违背案例 (CASE-001: SOL $110 vs $120) ✅
+6. `format_violation()` - 支持4种违背类型格式化输出 ✅
 
 ---
 

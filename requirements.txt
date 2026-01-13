@@ -17,6 +17,10 @@ httpx>=0.24.0
 sentence-transformers>=2.2.0   # 语义相似度计算
 numpy>=1.24.0                  # 向量计算
 
+# 交互式CLI
+rich>=13.0.0                   # 终端格式化、进度条、表格
+questionary>=2.0.0             # 交互式提示菜单
+
 # 可选：向量数据库（大规模市场时使用）
 # chromadb>=0.4.0
 
