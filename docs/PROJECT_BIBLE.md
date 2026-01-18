@@ -1,12 +1,17 @@
 # Polymarket 组合套利系统
 
-## 项目圣经 v3.0
+## 项目圣经 v5.4
 
-> **战略升级版本** - 基于深度研究报告的全面策略重构
-> 本文档是项目的核心参考，包含需求定义、策略说明、风险控制、技术设计和开发路线图。
-> 所有开发决策应参照本文档执行。
+> **文档版本**: v5.4
+> **当前状态**: v5.4 - Production Ready
+> **创建日期**: 2026-01-08
+> **所有开发决策应参照本文档执行。**
 >
-> 🆕 **v3.0 核心更新**：新增4类套利策略、明确禁区策略、LLM三大赋能场景、3个真实案例复盘
+> 🆕 **v5.4 核心更新**：
+> 1. **容器化部署 (Phase 9)**: 提供 `Dockerfile` 和 `docker-compose.yml`，封装 Python 环境与依赖，实现一键启动。
+> 2. **进程管理**: 集成 `supervisord`，支持 Web UI (Streamlit) 和 Scanner Daemon 在同一容器内并发运行，具备自动重启能力。
+> 3. **实时数据流 (Phase 8)**: 集成 Polymarket CLOB WebSocket (`/ws/market`)，实现亚秒级订单簿更新。
+> 4. **Web UI 交互式看板 (Phase 7)**: 实现基于 Streamlit 的全功能仪表盘，集成套利雷达、PnL 分析及策略实验室。
 
 ---
 
@@ -101,16 +106,17 @@
 - [x] 验证核心策略可行性
 - [x] 构建MVP原型
 - [x] 支持多种LLM提供商
-- [ ] **发现并人工验证至少 3 个真实套利机会**
-- [ ] **实现完整验证框架（五层验证）**
-- [ ] **完成至少 5 次模拟执行跟踪**
+- [x] **发现并人工验证至少 3 个真实套利机会** (CASE-001, 002, 003)
+- [x] **实现完整验证框架（六层验证）**
+- [x] **完成至少 5 次模拟执行跟踪**
 
-### 中期目标（Phase 3）
-- [ ] 实现年化收益率（APY）计算器
-- [ ] 实现预言机对齐检查
-- [ ] 实现订单簿深度分析
-- [ ] 达到单月 3 次以上有效机会发现
-- [ ] 实现小额（$100-500）手动执行的完整工作流
+### 中期目标（Phase 3-4）
+- [x] 实现年化收益率（APY）计算器
+- [x] 实现预言机对齐检查
+- [x] 实现订单簿深度分析 (VWAP)
+- [x] 实现实时通知系统 (Telegram/WeChat)
+- [x] 实现半自动执行引擎 (Layer 6)
+- [ ] 达到单月 3 次以上高价值（APY>30%）机会发现
 
 ### 长期目标（Phase 4+）
 - [ ] 建立历史回测系统
@@ -1252,27 +1258,30 @@ def detect_monotonicity_violation(markets: List[Market], asset: str):
 
 > **v2.0 核心新增**：建立系统化的五层验证体系
 
-## 6.1 五层验证架构
+## 6.1 六层验证架构 (v3.6 升级)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    五层验证架构                              │
+│                    六层验证架构                              │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  Layer 5: 人工复核                                          │
-│  └─ 阅读结算规则、检查边界情况、最终决策                      │
+│  Layer 6: 执行前价格确认 (Pre-flight Check)                 │
+│  └─ 下单瞬间抓取最新订单簿，验证利润是否依然存在              │
 │                                                             │
-│  Layer 4: APY 验证                                          │
-│  └─ 年化收益率 ≥ 15%？锁仓时间可接受？                       │
+│  Layer 5: 人工复核清单 (Human Review)                       │
+│  └─ 生成 Markdown 复核报告，最终决策执行方向                 │
 │                                                             │
-│  Layer 3: 数学验证                                          │
-│  └─ 利润计算、滑点估算、成本精算                             │
+│  Layer 4: APY 收益评估 (Yield Validation)                  │
+│  └─ 年化收益率 ≥ 15%？评估锁仓期间的时间成本                 │
 │                                                             │
-│  Layer 2: 规则验证                                          │
-│  └─ Oracle 对齐、时间一致性、阈值方向                        │
+│  Layer 3: 数学验证 (精算层)                                 │
+│  └─ 基于 VWAP 的真实利润计算、滑点损耗、Gas 成本             │
 │                                                             │
-│  Layer 1: LLM 关系识别                                      │
-│  └─ 逻辑关系类型、置信度、边界情况提示                       │
+│  Layer 2: 规则一致性 (Rule Validation)                     │
+│  └─ Oracle 对齐、时间戳 UTC 校验、阈值逻辑闭环               │
+│                                                             │
+│  Layer 1: LLM 语义识别 (Discovery)                         │
+│  └─ 语义聚类、批量逻辑分析、跨市场蕴含与等价发现              │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -1611,89 +1620,45 @@ def validate_apy(opportunity):
 
 | 组件 | 职责 | 关键方法 |
 |------|------|----------|
-| **DataFetcher** | 获取市场数据 | `get_markets()`, `get_events()` |
-| **CLOBClient** | 获取订单簿数据 | `get_order_book()`, `get_spread()` |
-| **SimilarityFilter** | 筛选相似市场对 | `find_similar_pairs()` |
-| **SemanticClusterer** | 语义聚类分析 | `get_embeddings()`, `cluster_markets()` |
-| **LLMAnalyzer** | 分析逻辑关系 | `analyze_pair()`, `batch_analyze()` |
-| **ValidationEngine** | 五层验证 | `validate()` |
-| **OracleComparator** | 预言机对齐检查 | `check_alignment()` |
-| **APYCalculator** | 年化收益计算 | `calculate_apy()`, `validate_apy()` |
-| **DepthCalculator** | 订单簿深度分析 | `calculate_vwap()`, `estimate_slippage()` |
-| **ArbitrageDetector** | 检测套利机会 | `check_exhaustive_set()`, `check_implication()` |
+| **DataFetcher** | 异步获取市场及订单簿 | `enrich_market_with_orderbook()` |
+| **SemanticClusterer** | 向量化聚类 (BGE-M3) | `cluster_markets()` |
+| **LLMAnalyzer** | 批量逻辑分析 | `analyze_cluster()` |
+| **ValidationEngine** | 五层级风控核验 | `validate_all_layers()` |
+| **ExecutionEngine** | Layer 6 终极验证与执行 | `pre_flight_check()`, `execute_mock()` |
+| **ArbitrageNotifier** | 实时多端通知 | `send_notification()` |
+| **DepthCalculator** | 精确 VWAP 与滑点预估 | `calculate_vwap()` |
 
-## 7.3 数据流
+## 7.3 数据流 (六层验证闭环)
 
-```
-                    扫描流程数据流
-                    
-    ┌────────────┐
-    │  开始扫描   │
-    └─────┬──────┘
-          │
-          ▼
-    ┌────────────┐     ┌─────────────────────┐
-    │ DataFetcher │────▶│ List[Market]        │
-    └─────┬──────┘     │ + 订单簿数据         │
-          │            └─────────────────────┘
-          ▼
-    ┌────────────┐     ┌─────────────────────┐
-    │ Similarity │────▶│ List[(M1, M2, score)]│
-    │   Filter   │     │ (相似市场对)          │
-    └─────┬──────┘     └─────────────────────┘
-          │
-          ▼
-    ┌────────────┐     ┌─────────────────────┐
-    │LLMAnalyzer │────▶│ RelationshipAnalysis │
-    │ (Layer 1)  │     │ + 置信度 + 边界情况   │
-    └─────┬──────┘     └─────────────────────┘
-          │
-          ▼
-    ┌────────────┐     ┌─────────────────────┐
-    │Validation  │────▶│ ValidationResult     │
-    │Engine L2-4 │     │ Oracle + Time + APY  │
-    └─────┬──────┘     └─────────────────────┘
-          │
-          ▼
-    ┌─────────────────────────────────────┐
-    │       List[ArbitrageOpportunity]    │
-    │       - 通过全部验证的套利机会        │
-    │       - 包含 APY、滑点、复核清单      │
-    └─────────────────┬───────────────────┘
-                      │
-                      ▼
-    ┌─────────────────────────────────────┐
-    │           生成报告                   │
-    │   - JSON 详细数据                   │
-    │   - 人工复核清单                     │
-    │   - 操作建议                        │
-    └─────────────────────────────────────┘
-```
+1. **Layer 1 (Discovery)**: LLM 通过语义聚类发现逻辑违背。
+2. **Layer 2 (Rules)**: 规则引擎检查 Oracle 来源和时间戳对齐。
+3. **Layer 3 (Math)**: `DepthCalculator` 根据目标规模计算真实 VWAP。
+4. **Layer 4 (Return)**: `APYCalculator` 评估年化收益是否满足门槛。
+5. **Layer 5 (Human)**: 生成 Markdown 复核清单供手动核验。
+6. **Layer 6 (Pre-flight)**: 下单瞬间重新抓取价格，确认套利空间存在。
 
 ## 7.4 配置管理
 
 ```python
 @dataclass
 class ScanSettings:
-    """扫描配置"""
-    market_limit: int = 200
-    similarity_threshold: float = 0.3
-    
-    # 利润阈值
-    min_profit_pct: float = 2.0
-    min_apy: float = 0.15  # 15% 年化
-    max_days_to_resolution: int = 180
-    
-    # 流动性阈值
-    min_liquidity: float = 10000
-    max_position_ratio: float = 0.10  # 仓位不超过流动性的 10%
-    
-    # 验证阈值
-    min_confidence: float = 0.8
-    require_oracle_alignment: bool = True
-    
-    # LLM 配置
-    max_llm_calls: int = 30
+    """扫描配置 (v3.6 生产级)"""
+    market_limit: int = 1000
+
+    # 🆕 利润与风控门槛
+    min_profit_pct: float = 2.0        # 最小利润率 (%)
+    min_apy: float = 15.0              # 最小年化收益率 (%)
+    target_size_usd: float = 500.0     # 模拟交易规模 (用于精算)
+    max_days_to_resolution: int = 180  # 最大锁仓时间
+
+    # 🆕 策略增强配置
+    use_semantic_clustering: bool = True
+    enable_orderbook: bool = True
+    exclude_resolved: bool = True
+
+    # 🆕 运行模式
+    loop_mode: bool = False            # 是否开启高频轮询
+    interval_seconds: int = 300        # 扫描间隔
 
 @dataclass
 class RiskSettings:
@@ -1707,7 +1672,122 @@ class RiskSettings:
     max_slippage_pct: float = 3.0
 ```
 
-## 7.5 语义路由器架构（Semantic Router Architecture）
+## 7.5 CLI 交互式架构 (v3.1 新增)
+
+> 本系统的交互式用户界面设计遵循"交互优先、渐进披露、即时反馈"三大原则。
+
+### 7.5.1 交互式菜单系统
+
+**入口**: `cli/menu.py:InteractiveMenu`
+
+```
+主菜单
+├── 开始扫描 → 领域选择 → 策略多选 → 子类别 → 运行模式 → 确认
+├── 配置设置
+├── 查看历史
+├── 帮助文档
+└── 退出
+```
+
+**特性**:
+- 使用 `questionary` 提供交互式提示
+- 支持策略多选（checkbox）
+- 自动显示策略元数据（风险等级、描述）
+- 配置确认表格展示
+
+### 7.5.2 规范化输出系统
+
+**入口**: `cli/output.py:ScannerOutput`
+
+**输出格式示例**:
+```
+[1/4] 获取市场数据...
+  OK 获取到 156 个 crypto (ETH, SOL) 市场
+
+[2/4] 执行单调性违背套利...
+  ✓ 发现 2 个机会
+
+┌──────────────── #1 套利机会 ────────────────┐
+│ MONOTONICITY_VIOLATION                      │
+│ 利润: 3.45%  成本: $0.9655  回报: $1.0000   │
+└─────────────────────────────────────────────┘
+```
+
+**特性**:
+- 使用 `rich` 库进行终端格式化
+- 进度条显示耗时操作
+- 机会发现时立即高亮显示
+- 支持 fallback 到简单输出模式（非TTY环境）
+
+### 7.5.3 策略注册表
+
+**入口**: `strategies/registry.py:StrategyRegistry`
+
+**已注册策略**:
+
+| ID | 名称 | 优先级 | 需LLM | 风险等级 |
+|----|------|--------|-------|----------|
+| `monotonicity` | 单调性违背套利 | 1 | 否 | LOW |
+| `interval` | 区间套利 | 2 | 否 | LOW |
+| `exhaustive` | 完备集套利 | 3 | 否 | MEDIUM |
+| `implication` | 蕴含关系套利 | 4 | 是 | MEDIUM |
+| `equivalent` | 等价市场套利 | 5 | 是 | MEDIUM |
+
+**策略元数据结构**:
+```python
+@dataclass
+class StrategyMetadata:
+    id: str                      # 唯一标识
+    name: str                    # 中文名称
+    name_en: str                 # 英文名称
+    description: str             # 简述
+    priority: int                # 优先级（越小越高）
+    requires_llm: bool           # 是否需要LLM
+    domains: List[str]           # 适用领域
+    risk_level: RiskLevel        # 风险等级
+    min_profit_threshold: float  # 最低利润阈值
+```
+
+**新增策略示例**:
+```python
+from strategies import BaseArbitrageStrategy, StrategyMetadata, StrategyRegistry
+
+@StrategyRegistry.register
+class MyNewStrategy(BaseArbitrageStrategy):
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            id="my_strategy",
+            name="我的新策略",
+            name_en="My New Strategy",
+            description="策略描述",
+            priority=6,
+            requires_llm=False,
+            domains=["crypto"],
+            risk_level=RiskLevel.LOW,
+            min_profit_threshold=2.0
+        )
+
+    def scan(self, markets, config, progress_callback=None):
+        # 实现扫描逻辑
+        pass
+```
+
+### 7.5.4 命令行模式
+
+系统支持命令行参数模式，适用于自动化脚本：
+
+```bash
+# 非交互模式运行
+python local_scanner_v2.py --no-interactive --domain crypto --monotonicity-check
+
+# 所有现有参数保持兼容
+python local_scanner_v2.py --domain crypto --subcat btc,eth --threshold 0.80
+```
+
+---
+
+## 7.6 语义路由器架构（Semantic Router Architecture）
 
 > **v3.0 新增** - 基于《语义Alpha》深度研究报告的技术架构
 
@@ -1810,47 +1890,34 @@ class RelationType(Enum):
     UNRELATED = "unrelated"
 ```
 
-### ArbitrageOpportunity（套利机会）
+### ArbitrageOpportunity（套利机会 - v3.6 补完版）
 
 ```python
 @dataclass
 class ArbitrageOpportunity:
     id: str
-    type: str  # EXHAUSTIVE_SET | IMPLICATION_VIOLATION | EQUIVALENT_SPREAD | INTERVAL
-    
-    # 市场信息
-    markets: List[dict]
+    type: str                # MONOTONICITY | IMPLICATION | ...
+    markets: List[dict]      # 包含 ID, Question, Price, TokenID
     relationship: str
-    
-    # 收益分析
-    total_cost: float
-    guaranteed_return: float
-    
-    # 利润分析（v2.0 增强）
-    mid_price_profit: float      # 中间价利润（参考）
-    effective_profit: float      # 考虑滑点后的利润
-    profit_pct: float
-    
-    # APY 分析（v2.0 新增）
-    days_to_resolution: int
-    apy: float
-    apy_rating: str  # 优秀/良好/可接受/不推荐
-    
-    # 风险分析（v2.0 新增）
-    oracle_alignment: str  # ALIGNED/COMPATIBLE/MISALIGNED
-    slippage_estimate: float
-    gas_estimate: float
-    
-    # 操作建议
-    action: str
-    confidence: float
-    
-    # 验证状态
-    validation_results: dict
-    needs_review: List[str]
-    
-    # 时间戳
-    discovered_at: str
+
+    # 收益与风控度量 (Phase 2.5/4.1 核心字段)
+    total_cost: float        # 组合成本
+    profit_pct: float        # 净利润率
+    apy: float               # 年化收益率
+    apy_rating: str          # EXCELLENT | GOOD | LOW
+
+    mid_price_profit: float  # 理论中间价利润
+    effective_profit: float  # VWAP 实际成交利润
+    slippage_cost: float     # 预估滑点损耗 (USD)
+
+    days_to_resolution: int  # 预估锁仓天数
+    oracle_alignment: str    # ALIGNED | MISALIGNED
+
+    # 执行与验证
+    validation_results: dict # 各层级详细评分
+    checklist_path: str      # 本地复核清单路径
+    gas_estimate: float      # Polygon 执行成本
+    max_position_usd: float  # 建议最大仓位 (Liquidity * 10%)
 ```
 
 ## 8.2 持久化设计
@@ -2283,7 +2350,12 @@ ERROR: 错误情况，如 API 失败、解析异常
 
 > 🆕 **v3.0 新增**：通过真实案例学习套利策略的应用
 
-## 13.1 案例1：乌克兰矿产协议争议（2025.3）
+## 13.1 [NEW] 2026 生产级实战案例
+1. **[CASE-001: BTC 价格阶梯单调性违背](./cases/CASE-001_BTC_Monotonicity.md)** (APY: 184.3%)
+2. **[CASE-002: ETH 价格阶梯单调性违背](./cases/CASE-002_ETH_Monotonicity.md)** (高流动性 Alpha)
+3. **[CASE-003: 风险拦截案例（时间戳冲突）](./cases/CASE-003_Risk_Interception.md)** (风控引擎实证)
+
+## 13.2 案例1：乌克兰矿产协议争议（2025.3）
 
 ### 背景
 市场问题："乌克兰是否会在 4 月前同意特朗普的矿产协议？"
@@ -2657,7 +2729,92 @@ python local_scanner_v2.py --use-cache
 
 ---
 
-# 版本历史
+# 16. 回测与执行系统 (Phase 6)
+
+> **v3.6 新增** - 支持历史数据回溯与真实交易签名
+
+## 16.1 数据记录架构 (The Recorder)
+
+为了验证策略在不同市场环境下的表现，系统引入了时间序列记录器。
+
+### 存储设计 (SQLite)
+```sql
+CREATE TABLE market_snapshots (
+    market_id TEXT,
+    timestamp TEXT,      -- ISO8601 UTC
+    yes_price REAL,
+    best_bid REAL,       -- 真实买单深度
+    best_ask REAL,       -- 真实卖单深度
+    best_bid_no REAL,    -- NO 合约最佳买价
+    best_ask_no REAL,    -- NO 合约最佳卖价
+    liquidity REAL,
+    PRIMARY KEY (market_id, timestamp)
+);
+
+CREATE TABLE market_metadata (
+    market_id TEXT PRIMARY KEY,
+    question TEXT,
+    description TEXT,
+    outcomes TEXT,
+    event_id TEXT,
+    end_date TEXT,
+    group_item_title TEXT,
+    first_seen TEXT
+);
+
+CREATE TABLE opportunity_history (
+    opp_id TEXT PRIMARY KEY,
+    type TEXT,
+    first_seen TEXT,     -- 首次发现时间
+    last_seen TEXT,      -- 最后有效时间
+    max_profit_pct REAL, -- 存续期内最大利润
+    details_json TEXT
+);
+
+CREATE TABLE execution_history (
+    exec_id TEXT PRIMARY KEY,
+    opp_id TEXT,
+    timestamp TEXT,      -- 执行时间 (UTC)
+    mode TEXT,           -- 'MOCK' (模拟) 或 'REAL' (真实)
+    status TEXT,         -- 'SUCCESS', 'FAILED', 'REJECTED_L6', 'SETTLED'
+    expected_profit_pct REAL,
+    total_cost_usd REAL, -- 实际执行时的 VWAP 成本
+    details_json TEXT,   -- 指令快照与 API 响应
+    realized_pnl REAL,   -- 已实现盈亏 (USD)
+    settled_at TEXT,     -- 结算时间
+    FOREIGN KEY (opp_id) REFERENCES opportunity_history (opp_id)
+);
+```
+
+**采集策略**:
+- **高频模式**: 在 `loop` 模式下，每隔 N 秒自动快照所有活跃市场。
+- **差异存储**: 仅当价格变化超过阈值（如 0.1%）时才写入新快照（待优化）。
+
+## 16.2 回测引擎 (The Time Machine)
+
+**核心逻辑**:
+1. **时间重放**: 将 SQLite 中的快照按时间顺序重放。
+2. **状态还原**: 在每个时间点，重构 `List[Market]` 对象。
+3. **策略注入**: 将还原的市场数据注入 `ArbitrageScanner`，执行完全相同的策略逻辑。
+4. **绩效评估**: 统计策略在历史数据上的 发现率、最大回撤、平均存续时间。
+
+## 16.3 真实执行与签名 (The Executor)
+
+> ⚠️ **安全警告**: 私钥仅在内存中通过环境变量加载，严禁写入磁盘。
+
+### 签名机制 (EIP-712)
+Polymarket CLOB API 要求对每个订单进行 EIP-712 签名。
+
+**流程**:
+1. **构建 Order 结构体**: 包含 Token ID, Price, Size, Side, Nonce 等。
+2. **计算 Domain Separator**: 标识 Polymarket 合约域。
+3. **私钥签名**: 使用 `eth_account` 对结构化数据进行签名。
+4. **提交 API**: 发送包含签名的 POST 请求到 `/order` 端点。
+
+### 安全熔断 (Kill Switch)
+- **单笔限额**: 任何单笔交易不得超过 $100 (可配置)。
+- **日亏损限额**: 当日累计亏损 > 5% 时自动停止。
+- **干运行 (Dry Run)**: 默认开启，仅在显式确认后才发送真实签名。
 
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
@@ -2736,6 +2893,95 @@ python local_scanner_v2.py --use-cache
 
 ---
 
-**免责声明**: 
+**免责声明**:
 本项目仅供学习研究使用。预测市场交易有风险，套利策略也存在执行风险。
 请自行评估风险并承担后果。本文档不构成投资建议。
+
+---
+
+# 16. 回测与执行系统 (Phase 6)
+
+> **v3.6 新增** - 支持历史数据回溯与真实交易签名
+
+## 16.1 数据记录架构 (The Recorder)
+
+为了验证策略在不同市场环境下的表现，系统引入了时间序列记录器。
+
+### 存储设计 (SQLite)
+```sql
+CREATE TABLE market_snapshots (
+    market_id TEXT,
+    timestamp TEXT,      -- ISO8601 UTC
+    yes_price REAL,
+    best_bid REAL,       -- 真实买单深度
+    best_ask REAL,       -- 真实卖单深度
+    best_bid_no REAL,    -- NO 合约最佳买价
+    best_ask_no REAL,    -- NO 合约最佳卖价
+    liquidity REAL,
+    PRIMARY KEY (market_id, timestamp)
+);
+
+CREATE TABLE market_metadata (
+    market_id TEXT PRIMARY KEY,
+    question TEXT,
+    description TEXT,
+    outcomes TEXT,
+    event_id TEXT,
+    end_date TEXT,
+    group_item_title TEXT,
+    first_seen TEXT
+);
+
+CREATE TABLE opportunity_history (
+    opp_id TEXT PRIMARY KEY,
+    type TEXT,
+    first_seen TEXT,     -- 首次发现时间
+    last_seen TEXT,      -- 最后有效时间
+    max_profit_pct REAL, -- 存续期内最大利润
+    details_json TEXT
+);
+
+CREATE TABLE execution_history (
+    exec_id TEXT PRIMARY KEY,
+    opp_id TEXT,
+    timestamp TEXT,      -- 执行时间 (UTC)
+    mode TEXT,           -- 'MOCK' (模拟) 或 'REAL' (真实)
+    status TEXT,         -- 'SUCCESS', 'FAILED', 'REJECTED_L6', 'SETTLED'
+    expected_profit_pct REAL,
+    total_cost_usd REAL, -- 实际执行时的 VWAP 成本
+    details_json TEXT,   -- 指令快照与 API 响应
+    realized_pnl REAL,   -- 已实现盈亏 (USD)
+    settled_at TEXT,     -- 结算时间
+    FOREIGN KEY (opp_id) REFERENCES opportunity_history (opp_id)
+);
+```
+
+**采集策略**:
+- **高频模式**: 在 `loop` 模式下，每隔 N 秒自动快照所有活跃市场。
+- **差异存储**: 仅当价格变化超过阈值（如 0.1%）时才写入新快照（待优化）。
+
+## 16.2 回测引擎 (The Time Machine)
+
+**核心逻辑**:
+1. **时间重放**: 将 SQLite 中的快照按时间顺序重放。
+2. **状态还原**: 在每个时间点，重构 `List[Market]` 对象。
+3. **策略注入**: 将还原的市场数据注入 `ArbitrageScanner`，执行完全相同的策略逻辑。
+4. **绩效评估**: 统计策略在历史数据上的 发现率、最大回撤、平均存续时间。
+
+## 16.3 真实执行与签名 (The Executor)
+
+> ⚠️ **安全警告**: 私钥仅在内存中通过环境变量加载，严禁写入磁盘。
+
+### 签名机制 (EIP-712)
+Polymarket CLOB API 要求对每个订单进行 EIP-712 签名。
+
+**流程**:
+1. **构建 Order 结构体**: 包含 Token ID, Price, Size, Side, Nonce 等。
+2. **计算 Domain Separator**: 标识 Polymarket 合约域。
+3. **私钥签名**: 使用 `eth_account` 对结构化数据进行签名。
+4. **提交 API**: 发送包含签名的 POST 请求到 `/order` 端点。
+
+### 安全熔断 (Kill Switch)
+- **单笔限额**: 任何单笔交易不得超过 $100 (可配置)。
+- **日亏损限额**: 当日累计亏损 > 5% 时自动停止。
+- **干运行 (Dry Run)**: 默认开启，仅在显式确认后才发送真实签名。

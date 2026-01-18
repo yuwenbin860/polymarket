@@ -34,6 +34,26 @@ from pathlib import Path
 
 
 # ============================================================
+# 场景常量
+# ============================================================
+
+class LLMScenario:
+    """
+    LLM使用场景常量
+
+    定义系统中使用LLM的不同场景，可以为每个场景配置专用模型。
+    """
+    # Tag分类场景 - 使用思考模型进行智能分类
+    TAG_CLASSIFICATION = "tag_classification"
+    # 策略扫描场景 - 使用快速模型进行套利策略分析
+    STRATEGY_SCAN = "strategy_scan"
+    # 语义分析场景 - 使用快速模型进行语义相似度分析
+    SEMANTIC_ANALYSIS = "semantic_analysis"
+    # 关系检测场景 - 使用思考模型进行市场关系推理
+    RELATIONSHIP_DETECTION = "relationship_detection"
+
+
+# ============================================================
 # 配置数据结构
 # ============================================================
 
@@ -43,22 +63,95 @@ class LLMProfile:
     name: str                    # 配置名称
     provider: str                # 提供商类型
     api_base: str                # API地址
-    api_key_env: str             # API Key环境变量名（不直接存储key）
-    model: str                   # 默认模型
+    api_key_env: str = ""        # API Key环境变量名（不直接存储key）
+    api_key: str = ""            # 直接配置的API Key（可选，用于config.json）
+    model: str = ""              # 默认模型
     description: str = ""        # 描述
     models_available: List[str] = field(default_factory=list)  # 可用模型列表
     max_tokens: int = 2000
     temperature: float = 0.7
-    
+    # 场景化模型配置：为不同任务场景指定专用模型
+    scenario_models: Dict[str, str] = field(default_factory=dict)
+
     def get_api_key(self) -> Optional[str]:
-        """从环境变量获取API Key"""
-        return os.getenv(self.api_key_env)
-    
+        """获取API Key - 优先使用直接配置的key，否则从环境变量读取"""
+        # 优先返回直接配置的api_key（来自config.json）
+        if self.api_key:
+            return self.api_key
+        # 否则从环境变量读取
+        if self.api_key_env:
+            return os.getenv(self.api_key_env)
+        return None
+
     def is_configured(self) -> bool:
         """检查是否已配置API Key"""
         if self.provider == "ollama":
             return True  # Ollama不需要key
         return bool(self.get_api_key())
+
+    def get_model_for_scenario(self, scenario: str) -> str:
+        """
+        获取指定场景的模型
+
+        如果场景没有配置专用模型，则返回默认模型。
+
+        Args:
+            scenario: 场景名称，如 "tag_classification", "strategy_scan"
+
+        Returns:
+            该场景使用的模型名称
+        """
+        return self.scenario_models.get(scenario, self.model)
+
+    def is_reasoning_model(self, model: Optional[str] = None) -> bool:
+        """
+        判断指定模型是否为思考模型
+
+        Args:
+            model: 模型名称，如果为None则使用默认模型
+
+        Returns:
+            是否为思考模型
+        """
+        from llm_providers import is_reasoning_model
+        model_name = model or self.model
+        return is_reasoning_model(model_name)
+
+    def get_reasoning_model(self) -> Optional[str]:
+        """
+        获取可用的思考模型
+
+        返回第一个可用的思考模型名称，如果没有则返回None。
+
+        Returns:
+            思考模型名称或None
+        """
+        from llm_providers import is_reasoning_model
+        for m in self.models_available:
+            if is_reasoning_model(m):
+                return m
+        # 检查默认模型
+        if is_reasoning_model(self.model):
+            return self.model
+        return None
+
+    def get_fast_model(self) -> Optional[str]:
+        """
+        获取可用的快速模型
+
+        返回第一个可用的非思考模型名称，如果没有则返回None。
+
+        Returns:
+            快速模型名称或None
+        """
+        from llm_providers import is_reasoning_model
+        for m in self.models_available:
+            if not is_reasoning_model(m):
+                return m
+        # 检查默认模型
+        if not is_reasoning_model(self.model):
+            return self.model
+        return None
 
 
 # ============================================================
@@ -72,20 +165,24 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
         provider="openai_compatible",
         api_base="https://api.siliconflow.cn/v1",
         api_key_env="SILICONFLOW_API_KEY",
-        model="Qwen/Qwen2.5-72B-Instruct",
+        model="deepseek-ai/DeepSeek-V3",
         description="SiliconFlow - 国内聚合平台，速度快",
         models_available=[
             "Qwen/Qwen2.5-72B-Instruct",
-            "Qwen/Qwen2.5-32B-Instruct", 
+            "Qwen/Qwen2.5-32B-Instruct",
             "Qwen/Qwen2.5-7B-Instruct",
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-R1",
             "Pro/deepseek-ai/DeepSeek-R1",
             "THUDM/glm-4-9b-chat",
             "Pro/zai-org/GLM-4.7",
-        ]
+        ],
+        scenario_models={
+            LLMScenario.TAG_CLASSIFICATION: "deepseek-ai/DeepSeek-R1",  # Tag分类用思考模型
+            LLMScenario.STRATEGY_SCAN: "deepseek-ai/DeepSeek-V3",       # 策略扫描用快速模型
+        }
     ),
-    
+
     # DeepSeek官方
     "deepseek": LLMProfile(
         name="deepseek",
@@ -97,7 +194,11 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
         models_available=[
             "deepseek-chat",
             "deepseek-reasoner",
-        ]
+        ],
+        scenario_models={
+            LLMScenario.TAG_CLASSIFICATION: "deepseek-reasoner",    # Tag分类用思考模型
+            LLMScenario.STRATEGY_SCAN: "deepseek-chat",            # 策略扫描用快速模型
+        }
     ),
     
     # OpenAI
@@ -167,7 +268,7 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
         provider="ollama",
         api_base="http://localhost:11434",
         api_key_env="",
-        model="llama3.1:8b",
+        model="qwen2.5:7b",
         description="本地Ollama - 免费离线",
         models_available=[
             "llama3.1:8b",
@@ -177,7 +278,11 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
             "qwen2.5:32b",
             "deepseek-r1:7b",
             "deepseek-r1:14b",
-        ]
+        ],
+        scenario_models={
+            LLMScenario.TAG_CLASSIFICATION: "deepseek-r1:7b",   # Tag分类用思考模型
+            LLMScenario.STRATEGY_SCAN: "qwen2.5:7b",           # 策略扫描用快速模型
+        }
     ),
     
     # OpenRouter - 国外聚合
@@ -211,7 +316,11 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
             "Qwen/Qwen2.5-7B-Instruct",
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-R1",
-        ]
+        ],
+        scenario_models={
+            LLMScenario.TAG_CLASSIFICATION: "deepseek-ai/DeepSeek-R1",  # Tag分类用思考模型
+            LLMScenario.STRATEGY_SCAN: "Qwen/Qwen2.5-32B-Instruct",     # 策略扫描用快速模型
+        }
     ),
 }
 
@@ -223,23 +332,50 @@ BUILTIN_PROFILES: Dict[str, LLMProfile] = {
 class LLMConfigManager:
     """LLM配置管理器"""
     
-    CONFIG_FILE = "llm_profiles.json"
-    
+    CONFIG_FILE = "config.json"
+
     def __init__(self):
         self.profiles: Dict[str, LLMProfile] = BUILTIN_PROFILES.copy()
         self._load_custom_profiles()
-    
+
     def _load_custom_profiles(self):
-        """加载用户自定义配置"""
+        """加载用户自定义配置 - 从config.json的llm_profiles区段读取"""
         config_path = Path(self.CONFIG_FILE)
         if config_path.exists():
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                for name, profile_data in data.get("profiles", {}).items():
-                    self.profiles[name] = LLMProfile(**profile_data)
+
+                # 从config.json的llm_profiles区段读取
+                llm_profiles = data.get("llm_profiles", {})
+
+                for name, profile_data in llm_profiles.items():
+                    # 过滤掉以_开头的注释字段和不支持的字段
+                    unsupported_fields = {'embedding_model'}
+                    filtered_data = {
+                        k: v for k, v in profile_data.items()
+                        if not k.startswith('_') and k not in unsupported_fields
+                    }
+
+                    # 创建LLMProfile，确保name字段存在
+                    if "name" not in filtered_data:
+                        filtered_data["name"] = name
+
+                    # 如果没有api_key_env，设置为空字符串（允许使用api_key）
+                    if "api_key_env" not in filtered_data:
+                        filtered_data["api_key_env"] = ""
+
+                    # 过滤scenario_models中的注释字段
+                    if "scenario_models" in filtered_data and isinstance(filtered_data["scenario_models"], dict):
+                        filtered_data["scenario_models"] = {
+                            k: v for k, v in filtered_data["scenario_models"].items()
+                            if not k.startswith('_')
+                        }
+
+                    self.profiles[name] = LLMProfile(**filtered_data)
             except Exception as e:
-                print(f"⚠️ 加载自定义配置失败: {e}")
+                # 使用简单的ASCII字符避免编码问题
+                print(f"[WARNING] Failed to load custom profiles: {e}")
     
     def save_custom_profile(self, profile: LLMProfile):
         """保存自定义配置"""

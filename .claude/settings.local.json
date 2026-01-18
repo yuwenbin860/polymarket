@@ -90,7 +90,28 @@
       "mcp__plugin_serena_serena__insert_after_symbol",
       "mcp__plugin_serena_serena__search_for_pattern",
       "mcp__plugin_serena_serena__think_about_whether_you_are_done",
-      "WebFetch(domain:docs.polymarket.com)"
+      "WebFetch(domain:docs.polymarket.com)",
+      "mcp__plugin_playwright_playwright__browser_navigate",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "Bash(git checkout:*)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs",
+      "Bash(C:Userslittlerain.localbinuv.exe run D:/work/polymarket/.venv/Scripts/python.exe D:workpolymarketlocal_scanner_v2.py --help)",
+      "Bash(uv run python:*)",
+      "Bash(cmd.exe /c \"echo 4 | python local_scanner_v2.py\")",
+      "mcp__zread__read_file",
+      "Bash(pytest:*)",
+      "Bash(jq --version)",
+      "Bash(pip show:*)",
+      "mcp__plugin_serena_serena__read_file",
+      "Bash(read_file:*)",
+      "Bash(sqlite3 \"D:/work/polymarket/output/market_history.db\" \"SELECT COUNT\\(*\\) FROM market_snapshots; SELECT COUNT\\(*\\) FROM opportunity_history;\")",
+      "mcp__plugin_serena_serena__execute_shell_command",
+      "Bash(sqlite3 \"D:/work/polymarket/output/market_history.db\" \"SELECT MIN\\(timestamp\\), MAX\\(timestamp\\) FROM market_snapshots;\")",
+      "Bash(sqlite3 output/market_history.db \".tables\")",
+      "Bash(sqlite3 output/market_history.db \".schema execution_history\")",
+      "Bash(sqlite3 output/market_history.db \".schema opportunities\")",
+      "Bash(timeout /t 30 /nobreak)"
     ]
   }
 }

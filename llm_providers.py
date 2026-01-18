@@ -79,6 +79,7 @@ class LLMResponse:
     model: str
     usage: Optional[Dict[str, int]] = None  # {"prompt_tokens": x, "completion_tokens": y}
     raw_response: Optional[Dict] = None
+    reasoning_content: Optional[str] = None  # 🆕 思考模型的推理内容
 
 
 # ============================================================
@@ -580,11 +581,32 @@ class OpenAICompatibleClient(BaseLLMClient):
             response.raise_for_status()
             data = response.json()
 
+            # 提取content - 增强对思考模型的支持
+            message = data["choices"][0]["message"]
+            content = message.get("content", "")
+            reasoning_content = message.get("reasoning_content", "")
+
+            # 🆕 智能合并策略
+            if not content and reasoning_content:
+                # 只有reasoning，使用它
+                content = reasoning_content
+            elif content and reasoning_content:
+                # 两者都有，进行智能判断
+                content_stripped = content.strip()
+
+                # 如果content是纯JSON格式，不合并reasoning（保持纯净）
+                if content_stripped.startswith('{') and content_stripped.endswith('}'):
+                    pass  # 保持content不变
+                # 如果reasoning不在content中，合并它们
+                elif reasoning_content not in content:
+                    content = f"{reasoning_content}\n\n{content}"
+
             return LLMResponse(
-                content=data["choices"][0]["message"]["content"],
+                content=content,
                 model=data.get("model", self.config.model),
                 usage=data.get("usage"),
-                raw_response=data
+                raw_response=data,
+                reasoning_content=reasoning_content or None  # 🆕 保留原始reasoning_content
             )
 
         except httpx.TimeoutException as e:
@@ -702,11 +724,32 @@ class ModelScopeClient(BaseLLMClient):
             response.raise_for_status()
             data = response.json()
 
+            # 提取content - 增强对思考模型的支持
+            message = data["choices"][0]["message"]
+            content = message.get("content", "")
+            reasoning_content = message.get("reasoning_content", "")
+
+            # 🆕 智能合并策略
+            if not content and reasoning_content:
+                # 只有reasoning，使用它
+                content = reasoning_content
+            elif content and reasoning_content:
+                # 两者都有，进行智能判断
+                content_stripped = content.strip()
+
+                # 如果content是纯JSON格式，不合并reasoning（保持纯净）
+                if content_stripped.startswith('{') and content_stripped.endswith('}'):
+                    pass  # 保持content不变
+                # 如果reasoning不在content中，合并它们
+                elif reasoning_content not in content:
+                    content = f"{reasoning_content}\n\n{content}"
+
             return LLMResponse(
-                content=data["choices"][0]["message"]["content"],
+                content=content,
                 model=data.get("model", self.config.model),
                 usage=data.get("usage"),
-                raw_response=data
+                raw_response=data,
+                reasoning_content=reasoning_content or None  # 🆕 保留原始reasoning_content
             )
 
         except httpx.TimeoutException as e:
@@ -930,6 +973,98 @@ def get_provider_info(provider: str) -> Dict[str, Any]:
         }
     except ValueError:
         return None
+
+
+# ============================================================
+# 思考模型识别
+# ============================================================
+
+def is_reasoning_model(model_name: str) -> bool:
+    """
+    判断模型是否为思考模型（推理模型）
+
+    思考模型通常具有更强的推理能力，适合复杂任务如Tag分类。
+    快速模型则更适合简单任务如策略扫描。
+
+    Args:
+        model_name: 模型名称
+
+    Returns:
+        是否为思考模型
+
+    识别规则：
+    1. 包含 "reasoner" (不区分大小写) - DeepSeek推理模型
+    2. 包含 "-R1" 或 ":R1" (不区分大小写) - DeepSeek R1系列
+    3. 以 "o1" 开头 (不区分大小写) - OpenAI o1推理系列
+
+    Examples:
+        >>> is_reasoning_model("deepseek-reasoner")
+        True
+        >>> is_reasoning_model("deepseek-ai/DeepSeek-R1")
+        True
+        >>> is_reasoning_model("deepseek-r1:7b")
+        True
+        >>> is_reasoning_model("o1-preview")
+        True
+        >>> is_reasoning_model("deepseek-chat")
+        False
+        >>> is_reasoning_model("gpt-4o")
+        False
+    """
+    if not model_name:
+        return False
+
+    model_lower = model_name.lower()
+
+    # 思考模型识别模式
+    reasoning_patterns = [
+        'reasoner',    # DeepSeek Reasoner
+        '-r1',         # DeepSeek R1 (URL格式)
+        ':r1',         # DeepSeek R1 (Ollama格式)
+        'o1',          # OpenAI o1系列
+    ]
+
+    return any(pattern in model_lower for pattern in reasoning_patterns)
+
+
+def get_model_display_name(model: str, show_marker: bool = True) -> str:
+    """
+    获取模型的显示名称（含思考模型标记）
+
+    Args:
+        model: 模型名称
+        show_marker: 是否显示类型标记
+
+    Returns:
+        带标记的显示名称，如 "deepseek-chat [FAST]" 或 "DeepSeek-R1 [THINK]"
+
+    Examples:
+        >>> get_model_display_name("deepseek-chat")
+        'deepseek-chat [FAST]'
+        >>> get_model_display_name("deepseek-reasoner")
+        'deepseek-reasoner [THINK]'
+        >>> get_model_display_name("DeepSeek-V3", show_marker=False)
+        'DeepSeek-V3'
+    """
+    if not show_marker:
+        return model
+
+    if is_reasoning_model(model):
+        return f"{model} [THINK]"
+    return f"{model} [FAST]"
+
+
+def get_model_icon(model: str) -> str:
+    """
+    获取模型的图标
+
+    Args:
+        model: 模型名称
+
+    Returns:
+        图标字符串：思考模型返回 "🧪"，快速模型返回 "⚡"
+    """
+    return "🧪" if is_reasoning_model(model) else "⚡"
 
 
 # ============================================================

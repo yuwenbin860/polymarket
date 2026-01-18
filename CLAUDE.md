@@ -4,290 +4,158 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Polymarket Combination Arbitrage System - An automated trading system that identifies pricing inefficiencies in prediction markets on Polymarket. The system uses LLMs to analyze logical relationships between markets and detect arbitrage opportunities.
+**Polymarket Combination Arbitrage System** - An automated trading system that identifies pricing inefficiencies in prediction markets on Polymarket. The system uses LLMs to analyze logical relationships between markets and detect arbitrage opportunities.
+
+**Current Version**: v5.5 (Production Ready)
 
 **Core Strategy Types:**
-- **Exhaustive Set Arbitrage**: Mutually exclusive outcomes that collectively form a complete set are underpriced (total < $1)
-- **Implication Arbitrage**: When Event A implies Event B (A -> B), but P(B) < P(A)
-- **Equivalent Market Arbitrage**: Different formulations of the same event have price discrepancies
+- **Monotonicity Violation**: Price inversions in threshold markets (e.g., BTC>100k vs BTC>95k)
+- **Interval Arbitrage**: Coverage relationships in interval markets
+- **Exhaustive Set**: Mutually exclusive outcomes underpriced (total < $1)
+- **Implication**: When Event A implies Event B (A → B), but P(B) < P(A)
+- **Equivalent Markets**: Different formulations of the same event have price discrepancies
+- **Temporal Arbitrage**: Time-based cumulative probability violations
 
-## Running the System
+## Quick Start
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Set LLM provider (choose one)
-export OPENAI_API_KEY="sk-..."      # OpenAI
-export DEEPSEEK_API_KEY="sk-..."    # DeepSeek (recommended, low cost)
-export LLM_PROVIDER=deepseek        # Or: openai, anthropic, aliyun, zhipu, ollama
-
-# Run main scanner
+# Interactive mode (default)
 python local_scanner_v2.py
 
-# Run MVP version (with simulated data)
-python polymarket_arb_mvp.py
+# With specific configuration
+python local_scanner_v2.py --profile deepseek --domain crypto
+
+# List all available strategies
+python local_scanner_v2.py --list-strategies
+
+# Debug mode (full pipeline without execution)
+python local_scanner_v2.py --mode debug --strategies monotonicity --domain crypto
+
+# Production mode (Real Execution)
+python local_scanner_v2.py --mode production --strategies interval --min-apy 20
 ```
 
-**Using config file instead of environment variables:**
+## Configuration
+
+**LLM Provider Setup:**
 ```bash
+# Method 1: Config file (recommended)
 cp config.example.json config.json
-# Edit config.json with your provider and api_key, then run:
-python local_scanner_v2.py
+# Edit config.json with your provider and api_key
+
+# Method 2: Environment variables
+export DEEPSEEK_API_KEY="sk-..."
+export LLM_PROVIDER=deepseek
+
+# Method 3: Command line
+python local_scanner_v2.py --profile deepseek
 ```
 
-**LLM配置加载优先级:**
-1. 命令行 `--profile` 参数 (最高优先级)
-2. `config.json` 中的 `llm.provider` + `llm.api_key`
-3. 环境变量自动检测 (DEEPSEEK_API_KEY, SILICONFLOW_API_KEY等)
-4. 默认值/规则匹配 (最低优先级)
+## Architecture Overview
 
-## Architecture
+### Modular Structure (v5.4)
 
-### Entry Points
-
-| File | Purpose |
-|------|---------|
-| `local_scanner_v2.py` | Main scanner with multi-LLM support |
-| `polymarket_arb_mvp.py` | MVP version with simulated data support |
-| `phase0_verify.py` | Phase 0 verification script |
+```
+polymarket/
+├── local_scanner_v2.py      # Main entry point (CLI & Orchestrator)
+├── web_app.py               # Streamlit Web Dashboard
+├── strategies/              # Pluggable strategy system
+│   ├── base.py              # Strategy base class
+│   ├── registry.py          # Strategy registration
+│   ├── monotonicity.py      # Monotonicity violation strategy
+│   ├── interval.py          # Interval arbitrage strategy
+│   ├── exhaustive.py        # Exhaustive set strategy
+│   ├── implication.py       # Implication violation strategy
+│   ├── equivalent.py        # Equivalent markets strategy
+│   └── temporal.py          # Temporal arbitrage strategy
+├── validation_engine.py     # 6-Layer Validation Engine (Risk Control)
+├── validators.py            # Mathematical & Oracle validators
+├── llm_providers.py         # Multi-LLM abstraction layer
+├── semantic_cluster.py      # Vector similarity clustering
+├── execution_engine.py      # Transaction execution & Pre-flight check
+├── backtest_engine.py       # Historical backtesting system
+├── notifier.py              # Telegram/WeChat notification system
+└── config.py                # Configuration management
+```
 
 ### Core Components
 
+**Scanner Flow:**
 ```
-ArbitrageScanner (local_scanner_v2.py:562)
-    ├── PolymarketClient - Fetches market data from Gamma API
-    ├── LLMAnalyzer - Analyzes logical relationships using LLM
-    ├── ArbitrageDetector - Detects arbitrage opportunities
-    └── SimilarityFilter - Finds similar market pairs
+PolymarketClient → Market Data (Gamma API + CLOB API)
+    ↓
+Strategy Selection (user choice)
+    ↓
+Strategy.scan() → Opportunities
+    ↓
+Validation Engine (6 Layers)
+    1. LLM Semantic Analysis
+    2. Oracle/Rule Consistency
+    3. Math/VWAP/Slippage
+    4. APY Calculation
+    5. Human Review Checklist
+    6. Pre-flight Check
+    ↓
+Execution Engine (if mode=production)
+    ↓
+Output → JSON Report / Notification / DB
 ```
 
-### LLM Provider Abstraction
+## Development Principles
 
-`llm_providers.py` provides a unified interface for multiple LLM providers:
+This project follows **11 core development principles** documented in:
+- **`.claude/skills/polymarket-dev-guidelines/SKILL.md`** - Complete 11 principles
+- **`docs/PROJECT_BIBLE.md` Chapter 2** - Detailed explanations
 
-```python
-from llm_providers import create_llm_client
+**Quick Reference:**
+1. 小步快跑 (Incremental Progress)
+2. 进度持久化 (Progress Persistence) → Update `docs/PROGRESS.md`
+3. 开放创新 (Open Innovation)
+4. 核心聚焦 (Core Focus) - Arbitrage discovery > Execution
+5. LLM赋能 (LLM Empowerment)
+6. 实证优先 (Evidence-First Approach)
+7. 策略迭代 (Strategy Evolution)
+8. Rules分析优先 (Rules-First Analysis)
+9. 交互优先 (Interactive-First)
+10. 渐进披露 (Progressive Disclosure)
+11. 即时反馈 (Immediate Feedback)
+12. 可扩展架构 (Extensible Architecture)
 
-# Auto-detects provider from environment variables
-client = create_llm_client()
+## Project Documentation
 
-# Or specify explicitly
-client = create_llm_client(provider="deepseek", model="deepseek-chat")
-```
+**Authoritative Guide:**
+- **`docs/PROJECT_BIBLE.md`** - Complete project documentation, strategy analysis, technical architecture
 
-**Supported providers**: OpenAI, Anthropic, DeepSeek, Aliyun (Qwen), Zhipu (GLM), Ollama, OpenAI-compatible endpoints
+**Work Planning:**
+- **`docs/WORK_PLAN.md`** - Milestones, phase status, next steps
+- **`docs/PROGRESS.md`** - Detailed work logs and session records
 
-### Data Flow
-
-1. **Fetch Markets** - `PolymarketClient.get_markets()` queries Gamma API
-2. **Group by Event** - Markets grouped by `event_id` for exhaustive set detection
-3. **Exhaustive Set Check** - `ArbitrageDetector.check_exhaustive_set()` finds underpriced complete sets
-4. **Similarity Filter** - `SimilarityFilter.find_similar_pairs()` uses Jaccard similarity
-5. **LLM Analysis** - `LLMAnalyzer.analyze()` determines logical relationships (IMPLIES_AB, IMPLIES_BA, EQUIVALENT, etc.)
-6. **Arbitrage Detection** - `ArbitrageDetector.check_pair()` validates price constraints
-7. **Report Generation** - JSON output to `./output/scan_*.json`
-
-### Configuration
-
-`config.py` defines three config classes:
-- `LLMSettings`: Provider, model, API keys, generation params
-- `ScanSettings`: Market limits, thresholds, filters
-- `OutputSettings`: Directories, logging
-
-Config loading priority: `--config` argument > `config.json` > environment variables > defaults
-
-### Key Data Structures
-
-- `Market` (local_scanner_v2.py:60): Core market entity with prices, liquidity, event info
-- `RelationType` (local_scanner_v2.py:50): Enum for logical relationships
-- `ArbitrageOpportunity` (local_scanner_v2.py:80): Detected arbitrage with execution instructions
-
-### Arbitrage Detection Logic
-
-**Exhaustive Set** (local_scanner_v2.py:386):
-- Condition: `sum(yes_prices) < 0.98` (allows 2% for slippage/gas)
-- Action: Buy YES on all markets in the set
-
-**Implication** (local_scanner_v2.py:428):
-- If A -> B, then P(B) >= P(A)
-- When violated: Buy B's YES, Buy A's NO
-- Cost: `P(B) + (1 - P(A))`, Return: $1.00 minimum
-
-**Equivalent Markets** (local_scanner_v2.py:468):
-- Spread threshold: 3%
-- Action: Buy YES on cheaper, Buy NO on expensive
-
-## Supported LLM Providers
-
-| Provider | Env Var | Cost | Best For |
-|----------|---------|------|----------|
-| OpenAI | `OPENAI_API_KEY` | Medium | High accuracy |
-| Anthropic | `ANTHROPIC_API_KEY` | Medium | Complex reasoning |
-| DeepSeek | `DEEPSEEK_API_KEY` | Low | Daily use (recommended) |
-| Aliyun | `DASHSCOPE_API_KEY` | Low | China network |
-| Zhipu | `ZHIPU_API_KEY` | Medium | China network |
-| Ollama | (local) | Free | Offline/testing |
-
-## Development Notes
-
-- All LLM providers implement `BaseLLMClient` with `chat()` and `chat_with_history()` methods
-- The system falls back to rule-based analysis if LLM initialization fails
-- Similarity calculation uses Jaccard index with stop-word filtering
-- Market data comes from Polymarket Gamma API: `https://gamma-api.polymarket.com`
-- Output reports are saved as JSON with timestamp: `scan_YYYYMMDD_HHMMSS.json`
+**Quick References:**
+- `README.md` - User guide and troubleshooting
+- `config.example.json` - Configuration template
 
 ## Important Constraints
 
-- Every arbitrage opportunity requires **manual review** before execution
-- LLM confidence threshold defaults to 0.8
-- Minimum profit percentage defaults to 2%
-- Markets are filtered by minimum liquidity (default: $10,000 USDC)
-- LLM calls are limited per scan (default: 30) to control costs
+- Every arbitrage opportunity requires **manual review** before execution (unless in highly trusted automated mode)
+- LLM confidence threshold: 0.8 (default)
+- Minimum profit percentage: 2% (default)
+- Minimum market liquidity: $10,000 USDC (default)
+- Minimum APY: 15% (default)
 
-## Development Principles / 开发准则
+## Key APIs
 
-### 1. 小步快跑 (Incremental Progress)
-- 将宏大目标拆分为小目标和具体实现步骤
-- 每个小目标独立验证后再进行下一步
-- 避免一次性做太多，保持每步可验证
+**Polymarket Data:**
+- Gamma API: `https://gamma-api.polymarket.com`
+- CLOB API: `https://clob.polymarket.com` (for order book depth & execution)
 
-### 2. 进度持久化 (Progress Persistence)
-- **里程碑和阶段进度** → 更新到 `docs/WORK_PLAN.md`
-  - 阶段完成度、版本节点、任务状态
-  - 用于查看下一步工作方向
-- **详细工作日志** → 记录到 `docs/PROGRESS.md`
-  - 每次会话的具体变更
-  - Bug修复、代码变更等明细
-- 确保可以在任何时间、任何地点恢复工作上下文
+**Output:**
+- Scan reports: `./output/scan_YYYYMMDD_HHMMSS.json`
+- Logs: Console output with rich formatting
 
-### 3. 开放创新 (Open Innovation)
-- 欢迎任何能改进套利系统的新点子
-- 新点子需经确认后记录到 `docs/PROJECT_BIBLE.md` 的扩展计划
-- 保持系统活力，不断迭代优化
+---
 
-### 4. 核心聚焦 (Core Focus)
-- **套利是核心中的核心** - 如何找到套利机会、如何利用LLM辅助发现套利关系
-- 第一步重心：组合套利（完备集、包含关系、等价市场）
-- 预留不同套利模式的接入口（跨平台、时间套利等）
-- 执行和下单可以暂时人工，发现机会才是关键
-
-### 5. LLM赋能 (LLM Empowerment)
-- 组合套利需要大量语义分析和逻辑分析
-- **最大化利用LLM** 来识别市场间的逻辑关系
-- 持续优化Prompt，提高关系识别准确率
-- 探索多模型协作、验证等高级用法
-
-### 6. 实证优先 (Evidence-First Approach)
-- **先验证真实套利机会存在，再设计识别算法**
-- 正确流程：人工发现案例 → 验证是套利 → 设计算法 → 实现测试
-- 每种新套利类型，必须先有至少1个真实案例
-- 避免"闭门造车"——实践出真知
-
-### 7. 策略迭代 (Strategy Evolution)
-- **发现新套利策略时，及时提出并更新到项目圣经**
-- 新发现先记录到创意池（PROJECT_BIBLE第15章）
-- 人工验证可行性后，正式更新到套利策略章节（第4章）
-- 保持项目圣经作为"活文档"，持续演进
-
-### 8. Rules分析优先 (Rules-First Analysis)
-- **在进行任何语义分析或向量化分析之前，必须先读取并理解Event的description字段**
-- Event的description包含完整的resolution rules（判定规则、数据源、特殊条件等）
-- 这些rules决定了市场的真正含义，忽略rules会导致错误分析和套利失败
-- 实现要求：
-  1. 使用`PolymarketClient.get_markets_by_tag()`获取包含完整event_description的市场数据
-  2. LLM分析时传入`event_description`字段
-  3. 向量化时结合question + description进行embedding
-  4. 检查rules兼容性（结算来源、日期、边界处理）
-
-**示例**：
-```python
-# 获取包含rules的市场数据
-markets = client.get_markets_by_tag_slug("crypto")
-
-# 访问rules信息
-for m in markets:
-    rules = m.full_description  # 优先使用event_description
-    # 将rules传递给LLM和向量化系统
-```
-
-### 9. 交互优先 (Interactive-First)
-- 进入程序后默认显示交互式菜单，方便用户选择操作
-- 命令行参数作为高级用法或自动化脚本使用
-- 使用 `--no-interactive` 禁用交互式菜单进入CLI模式
-- 交互流程：主菜单 → 领域选择 → 策略多选 → 子类别 → 确认
-
-### 10. 渐进披露 (Progressive Disclosure)
-- 主菜单只显示核心操作（扫描、配置、帮助、退出）
-- 高级选项按需展开，不在首页显示全部参数
-- 默认值对新手友好，高级用户可通过命令行自定义
-- 复杂配置使用分步引导而非一次性表单
-
-### 11. 即时反馈 (Immediate Feedback)
-- 每个步骤清楚显示正在做什么（获取哪些市场、执行哪个策略）
-- 进度条显示耗时操作，让用户知道系统在运行
-- 发现套利机会时立即高亮显示，不等到扫描结束
-- 错误信息具有指导性，告诉用户如何解决而非只报错
-
-### 12. 可扩展架构 (Extensible Architecture)
-- 新增套利策略只需实现 `BaseArbitrageStrategy` 接口并使用 `@StrategyRegistry.register` 装饰器注册
-- 输出格式统一通过 `cli/output.py:ScannerOutput` 处理
-- 策略优先级、领域过滤通过 `StrategyMetadata` 配置
-- 菜单系统自动发现已注册策略，无需手动维护选项列表
-
-**策略注册示例**：
-```python
-from strategies import BaseArbitrageStrategy, StrategyMetadata, StrategyRegistry
-
-@StrategyRegistry.register
-class MyNewStrategy(BaseArbitrageStrategy):
-    @property
-    def metadata(self) -> StrategyMetadata:
-        return StrategyMetadata(
-            id="my_strategy",
-            name="我的新策略",
-            name_en="My New Strategy",
-            description="策略描述",
-            priority=6,
-            requires_llm=False,
-            domains=["crypto"],
-            risk_level=RiskLevel.LOW,
-            min_profit_threshold=2.0
-        )
-
-    def scan(self, markets, config, progress_callback=None):
-        # 实现扫描逻辑
-        pass
-```
-
-## CLI Module Architecture
-
-### cli/ 模块
-- `cli/menu.py` - 交互式菜单系统 (`InteractiveMenu` 类)
-- `cli/output.py` - 规范化输出格式 (`ScannerOutput` 类)
-- 使用 `rich` 库进行终端格式化
-- 使用 `questionary` 库进行交互式提示
-
-### strategies/ 模块
-- `strategies/base.py` - 策略基类和元数据定义
-- `strategies/registry.py` - 策略注册表
-- `strategies/*.py` - 各策略实现（monotonicity, exhaustive, implication, equivalent, interval）
-
-## Project Guidance
-
-**`docs/PROJECT_BIBLE.md` is the authoritative guide** for all project work. It contains:
-- Complete strategy analysis and market background
-- Detailed technical architecture and API reference
-- Development roadmap (Phase 1-5) with task breakdown
-- Risk management guidelines and manual review checklist
-- All appendices and FAQs
-
-When making decisions about features, architecture changes, or priorities, always reference `docs/PROJECT_BIBLE.md` first.
-
-## References
-
-- `docs/PROJECT_BIBLE.md` - Comprehensive project documentation (authoritative guide)
-- `docs/WORK_PLAN.md` - Work plan, milestones, and phase status (check for next steps)
-- `docs/PROGRESS.md` - Detailed work logs and session records
-- `README.md` - Quick start guide
-- `config.example.json` - Configuration template
+**Version**: v5.5
+**Last Updated**: 2026-01-17

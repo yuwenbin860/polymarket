@@ -38,6 +38,8 @@ class StrategyMetadata:
     icon: str = ""                  # 显示图标
     help_text: str = ""             # 帮助文本
     tags: List[str] = field(default_factory=list)  # 标签
+    help_detail: str = ""           # 详细说明（检测原理、适用条件等）
+    example: str = ""               # 套利示例
 
 
 class BaseArbitrageStrategy(ABC):
@@ -116,6 +118,44 @@ class BaseArbitrageStrategy(ABC):
             步骤数
         """
         return 1
+
+    def filter_markets(self, markets: List['Market'], config: Dict[str, Any]) -> List['Market']:
+        """
+        标准市场过滤逻辑
+
+        过滤标准：
+        1. 排除已过期的市场
+        2. 排除流动性过低的市场
+        3. (可选) 排除价差过大的市场
+        """
+        # 从字典或对象中获取配置
+        scan_config = config.get("scan", {})
+        if hasattr(scan_config, "min_liquidity"):
+            min_liquidity = scan_config.min_liquidity
+            max_spread = getattr(scan_config, "max_spread_pct", 10.0) / 100.0
+        else:
+            min_liquidity = scan_config.get("min_liquidity", 0)
+            max_spread = scan_config.get("max_spread_pct", 10.0) / 100.0
+
+        filtered = []
+        for m in markets:
+            # 1. 过期检查
+            if hasattr(m, "is_expired") and m.is_expired:
+                continue
+
+            # 2. 流动性检查
+            if m.liquidity < min_liquidity:
+                continue
+
+            # 3. 价差检查 (如果有订单簿数据)
+            if hasattr(m, "best_bid") and m.best_bid > 0 and m.best_ask > 0:
+                spread_pct = (m.best_ask - m.best_bid) / m.best_ask
+                if spread_pct > max_spread:
+                    continue
+
+            filtered.append(m)
+
+        return filtered
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} id={self.metadata.id}>"

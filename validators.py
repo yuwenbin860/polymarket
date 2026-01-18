@@ -89,12 +89,30 @@ class MarketData:
     no_price: float
     liquidity: float
     volume: float = 0.0
-    end_date: str = ""  # 陷阱3修复: 增加结算日期字段
+    end_date: str = ""
+
+    # 🆕 订单簿数据
+    best_bid: float = 0.0     # YES 最佳买价
+    best_ask: float = 0.0     # YES 最佳卖价
+    best_bid_no: float = 0.0  # NO 最佳买价
+    best_ask_no: float = 0.0  # NO 最佳卖价
 
     @property
     def spread(self) -> float:
-        """买卖价差"""
+        """买卖价差 (YES)"""
+        if self.best_bid > 0 and self.best_ask > 0:
+            return self.best_ask - self.best_bid
         return abs(1.0 - self.yes_price - self.no_price)
+
+    @property
+    def effective_yes_buy(self) -> float:
+        """实际买入 YES 的价格"""
+        return self.best_ask if self.best_ask > 0 else self.yes_price
+
+    @property
+    def effective_no_buy(self) -> float:
+        """实际买入 NO 的价格"""
+        return self.best_ask_no if self.best_ask_no > 0 else (1.0 - self.yes_price)
 
 
 @dataclass
@@ -181,6 +199,182 @@ class IntervalData:
         else:
             # 重叠（已处理）
             return None
+
+
+class APYCalculator:
+    """
+    年化收益率计算器 (Layer 4 验证)
+
+    公式: APY = (利润 / 成本) * (365 / 剩余天数)
+    """
+
+    @staticmethod
+    def calculate_days_to_resolution(end_date_str: str) -> int:
+        """计算距离结算的天数"""
+        try:
+            from datetime import datetime, timezone
+            if not end_date_str:
+                return 30 # 默认30天
+
+            # 处理 ISO 格式
+            date_part = end_date_str.split('T')[0]
+            end_dt = datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            now_dt = datetime.now(timezone.utc)
+
+            days = (end_dt - now_dt).days
+            return max(1, days)
+        except Exception:
+            return 30
+
+    @staticmethod
+    def calculate_apy(profit_pct: float, days: int) -> float:
+        """计算年化收益率 (%)"""
+        if days <= 0: days = 1
+        return profit_pct * (365.0 / days)
+
+    @staticmethod
+    def get_rating(apy: float) -> str:
+        """获取收益评级"""
+        if apy >= 100: return "EXCELLENT"
+        if apy >= 50:  return "VERY_GOOD"
+        if apy >= 15:  return "ACCEPTABLE"
+        return "LOW"
+
+
+class OracleComparator:
+    """
+    预言机对齐检查器 (Layer 2 验证)
+
+    用于检测两个市场的结算来源是否一致。
+    返回状态:
+    - ALIGNED: 完全一致 (Source A == Source B)
+    - COMPATIBLE: 不同来源但权威度极高且通常同步 (如 AP vs Reuters)
+    - MISALIGNED: 来源不同且存在基差风险
+    """
+
+    # 预定义的权威来源关键词及其等级
+    AUTHORITY_MAP = {
+        "apnews.com": "primary",
+        "associated press": "primary",
+        "reuters": "primary",
+        "bloomberg": "primary",
+        "nytimes.com": "secondary",
+        "foxnews.com": "secondary",
+        "cnn.com": "secondary",
+        "binance.com": "crypto",
+        "coingecko.com": "crypto",
+        "etherscan.io": "crypto",
+        "electionbettingodds.com": "aggregator"
+    }
+
+    def check_alignment(self, source_a: str, source_b: str) -> Dict[str, Any]:
+        """检查两个来源的对齐状态"""
+        source_a = (source_a or "").lower().strip()
+        source_b = (source_b or "").lower().strip()
+
+        if not source_a or not source_b:
+            return {"status": "NEEDS_REVIEW", "reason": "缺少结算来源信息", "level": 0}
+
+        # 1. 完全对齐
+        if source_a == source_b:
+            return {"status": "ALIGNED", "reason": "来源完全一致", "level": 10}
+
+        # 2. 检查域名的主成分（如 https://www.binance.com/.. -> binance.com）
+        def get_domain(s):
+            if "binance" in s: return "binance.com"
+            if "apnews" in s: return "apnews.com"
+            if "reuters" in s: return "reuters"
+            return s
+
+        dom_a = get_domain(source_a)
+        dom_b = get_domain(source_b)
+
+        if dom_a == dom_b:
+            return {"status": "ALIGNED", "reason": "主域名一致", "level": 9}
+
+        # 3. 兼容性检查 (同为 primary 来源)
+        rank_a = self.AUTHORITY_MAP.get(dom_a, "unknown")
+        rank_b = self.AUTHORITY_MAP.get(dom_b, "unknown")
+
+        if rank_a == "primary" and rank_b == "primary":
+            return {"status": "COMPATIBLE", "reason": "均为顶级通讯社，风险极低", "level": 8}
+
+        return {
+            "status": "MISALIGNED",
+            "reason": f"来源不一致: {dom_a} vs {dom_b}",
+            "level": 3
+        }
+
+
+class DepthCalculator:
+    """
+    订单簿深度与滑点计算器 (Layer 3 验证)
+
+    通过模拟真实交易额，计算成交均价 (VWAP) 和预期滑点。
+    """
+
+    @staticmethod
+    def calculate_vwap(orderbook: Dict, amount_usd: float, side: str = "buy") -> Dict[str, Any]:
+        """
+        计算成交均价 (VWAP)
+
+        Args:
+            orderbook: 包含 'bids' 和 'asks' 的字典
+            amount_usd: 目标成交额 (USD)
+            side: "buy" (买入) 或 "sell" (卖出)
+
+        Returns:
+            {
+                "vwap": 均价,
+                "filled_usd": 实际填写的成交额,
+                "slippage": 滑点百分比,
+                "is_sufficient": 流动性是否足够
+            }
+        """
+        if not orderbook or not isinstance(orderbook, dict):
+            return {"vwap": 0, "filled_usd": 0, "slippage": 0, "is_sufficient": False}
+
+        # 买入看 asks (卖单)，卖出看 bids (买单)
+        entries = orderbook.get("asks" if side == "buy" else "bids", [])
+        if not entries:
+            return {"vwap": 0, "filled_usd": 0, "slippage": 0, "is_sufficient": False}
+
+        total_qty = 0
+        total_cost = 0
+        remaining_usd = amount_usd
+
+        # 排序：买入从低价到高价，卖出从高价到低价
+        sorted_entries = sorted(entries, key=lambda x: float(x["price"]), reverse=(side == "sell"))
+
+        best_price = float(sorted_entries[0]["price"]) if sorted_entries else 0
+
+        for entry in sorted_entries:
+            if remaining_usd <= 0:
+                break
+
+            price = float(entry["price"])
+            size = float(entry.get("size", 0))  # 这里的 size 通常是 token 数量
+
+            # 计算该档位的最大成交金额 (USD)
+            level_max_usd = price * size
+
+            fill_usd = min(remaining_usd, level_max_usd)
+            fill_qty = fill_usd / price if price > 0 else 0
+
+            total_qty += fill_qty
+            total_cost += fill_usd
+            remaining_usd -= fill_usd
+
+        vwap = total_cost / total_qty if total_qty > 0 else 0
+        slippage = (abs(vwap - best_price) / best_price * 100) if best_price > 0 else 0
+
+        return {
+            "vwap": vwap,
+            "filled_usd": total_cost,
+            "slippage": slippage,
+            "is_sufficient": remaining_usd <= 0,
+            "best_price": best_price
+        }
 
 
 class MathValidator:
@@ -391,11 +585,17 @@ class MathValidator:
 
         # === 检查3: 利润计算 ===
         # 操作：买 consequent 的 YES，买 antecedent 的 NO
-        cost_consequent_yes = p_consequent
-        cost_antecedent_no = 1.0 - p_antecedent
+        cost_consequent_yes = consequent.effective_yes_buy
+        cost_antecedent_no = antecedent.effective_no_buy
 
         total_cost = cost_consequent_yes + cost_antecedent_no
         guaranteed_return = 1.0  # 无论结果如何，至少收回 $1
+
+        # 如果没有订单簿数据，添加警告
+        if consequent.best_ask == 0:
+            report.warnings.append(f"市场 '{consequent.question[:30]}...' 无订单簿数据，使用参考价")
+        if antecedent.best_ask_no == 0:
+            report.warnings.append(f"市场 '{antecedent.question[:30]}...' 无 NO 订单簿数据，使用参考价")
 
         # 情况分析：
         # 1. antecedent 发生 → consequent 必发生 → 回报 = $1 (consequent YES)
@@ -672,10 +872,16 @@ class MathValidator:
         report.checks_passed.append("min_markets_check")
 
         # === 检查1: 价格总和 ===
-        total_yes_price = sum(m.yes_price for m in markets)
+        # 使用订单簿买入价计算实际成本
+        total_yes_price = sum(m.effective_yes_buy for m in markets)
 
         report.details["total_yes_price"] = total_yes_price
-        report.details["individual_prices"] = {m.question[:30]: m.yes_price for m in markets}
+        report.details["individual_prices"] = {m.question[:30]: m.effective_yes_buy for m in markets}
+
+        # 记录订单簿缺失警告
+        for m in markets:
+            if m.best_ask == 0:
+                report.warnings.append(f"市场 '{m.question[:30]}...' 无订单簿数据，使用参考价")
 
         if total_yes_price >= 1.0:
             report.reason = f"价格总和 {total_yes_price:.4f} >= 1.0，无套利空间"
@@ -799,11 +1005,17 @@ class MathValidator:
 
         # === 检查3: 利润计算 ===
         # 操作：买低价 YES，买高价 NO
-        cost_low_yes = low_market.yes_price
-        cost_high_no = 1.0 - high_market.yes_price
+        cost_low_yes = low_market.effective_yes_buy
+        cost_high_no = high_market.effective_no_buy
 
         total_cost = cost_low_yes + cost_high_no
         guaranteed_return = 1.0  # 两市场结果相同，必得 $1
+
+        # 记录订单簿缺失警告
+        if low_market.best_ask == 0:
+            report.warnings.append(f"低价市场 '{low_market.question[:30]}...' 无订单簿数据")
+        if high_market.best_ask_no == 0:
+            report.warnings.append(f"高价市场 '{high_market.question[:30]}...' 无 NO 订单簿数据")
 
         gross_profit = guaranteed_return - total_cost
 
@@ -1107,12 +1319,18 @@ class MathValidator:
         report.checks_passed.append("interval_completeness")
 
         # === 检查3: 价格总和 ===
-        total_yes_price = sum(iv.market.yes_price for iv in intervals)
+        # 使用订单簿买入价计算实际成本
+        total_yes_price = sum(iv.market.effective_yes_buy for iv in intervals)
         report.details["total_yes_price"] = total_yes_price
         report.details["individual_prices"] = {
-            iv.market.question[:30]: iv.market.yes_price
+            iv.market.question[:30]: iv.market.effective_yes_buy
             for iv in intervals
         }
+
+        # 记录订单簿缺失警告
+        for iv in intervals:
+            if iv.market.best_ask == 0:
+                report.warnings.append(f"区间市场 '{iv.market.question[:30]}...' 无订单簿数据")
 
         if total_yes_price >= 1.0:
             report.result = ValidationResult.FAILED

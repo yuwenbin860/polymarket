@@ -9,7 +9,22 @@
         ...
 """
 
-from .base import BaseArbitrageStrategy, StrategyMetadata
+from .base import BaseArbitrageStrategy, StrategyMetadata, RiskLevel
 from .registry import StrategyRegistry
 
-__all__ = ['BaseArbitrageStrategy', 'StrategyMetadata', 'StrategyRegistry']
+# 自动导入所有策略模块（使装饰器能执行）
+from . import (
+    monotonicity,
+    exhaustive,
+    implication,
+    equivalent,
+    interval,
+    temporal
+)
+
+__all__ = [
+    'BaseArbitrageStrategy',
+    'StrategyMetadata',
+    'StrategyRegistry',
+    'RiskLevel',
+]

@@ -242,45 +242,49 @@ class MonotonicityChecker:
         'atom': [r'\bcosmos\b', r'\batom\b'],
         'ltc': [r'\blitecoin\b', r'\bltc\b'],
         'uni': [r'\buniswap\b', r'\buni\b'],
+        # 🆕 新增热门资产和 L2
+        'megaeth': [r'\bmegaeth\b'],
+        'base': [r'\bbase\b'],
+        'aztec': [r'\baztec\b'],
+        'backpack': [r'\bbackpack\b'],
+        'mstr': [r'\bmicrostrategy\b', r'\bmstr\b'],
+        'gold': [r'\bgold\b'],
+        'sp500': [r'\bs&p\s*500\b', r'\bspx\b'],
     }
 
     # 阈值提取模式（扩展格式支持）
     THRESHOLD_PATTERNS = [
         # ==================== ABOVE 方向 ====================
         # "above $100,000" or "above 100,000" or "above $100k"
-        (r'above\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'above\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "over $100,000"
-        (r'over\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'over\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "greater than $100,000"
-        (r'greater\s+than\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'greater\s+than\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "> $100,000" or ">100k" or ">$100k"
-        (r'>\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'>\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "hit $100,000" / "reach $100,000"
-        (r'(?:hit|reach|hits|reaches)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'(?:hit|reach|hits|reaches)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "surpass $100,000" / "exceed $100,000"
-        (r'(?:surpass|exceed|exceeds|surpasses)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'(?:surpass|exceed|exceeds|surpasses)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "cross $100,000" / "tops $100,000"
-        (r'(?:cross|crosses|tops)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        (r'(?:cross|crosses|tops)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
         # "at least $100,000" / "$100,000 or higher"
-        (r'(?:at\s+least|or\s+higher)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
-        # "minimum $100,000" / "$100,000 minimum"
-        (r'(?:minimum|min)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
-        # "triple digits" (特殊: 价格达到3位数，即 >= $100)
-        (r'triple\s+digits?', ThresholdDirection.ABOVE),
-        # "four digits" (价格达到4位数，即 >= $1,000)
-        (r'four\s+digits?', ThresholdDirection.ABOVE),
+        (r'(?:at\s+least|or\s+higher)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.ABOVE),
+        # "all time high" (ATH) - 特殊处理，映射为一个极大的值用于逻辑比较
+        (r'all\s*time\s*high', ThresholdDirection.ABOVE),
 
         # ==================== BELOW 方向 ====================
         # "below $100,000"
-        (r'below\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
+        (r'below\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
         # "under $100,000"
-        (r'under\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
+        (r'under\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
         # "< $100,000" or "<100k"
-        (r'<\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
-        # "fall below $100,000" / "drop below $100,000"
-        (r'(?:fall|drop|drops|falls)\s+(?:below|under)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
+        (r'<\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
+        # "fall below $100,000" / "drop below $100,000" / "dip to $85,000"
+        (r'(?:fall|drop|drops|falls|dip|dips)\s+(?:below|under|to)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
         # "at most $100,000" / "$100,000 or less"
-        (r'(?:at\s+most|or\s+less)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
+        (r'(?:at\s+most|or\s+less)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
         # "maximum $100,000" / "$100,000 maximum"
         (r'(?:maximum|max)\s*\$?([\d,]+(?:\.\d+)?)\s*(?:k|K|m|M|b|B|t|T)?', ThresholdDirection.BELOW),
         # "single digits" (特殊: 价格跌到个位数，即 < $10)
@@ -476,62 +480,65 @@ class MonotonicityChecker:
         for pattern, direction in self.THRESHOLD_PATTERNS:
             match = re.search(pattern, text_lower)
             if match:
+                # 🆕 特殊处理：All Time High (ATH)
+                if 'all' in match.group(0) and 'high' in match.group(0):
+                    return (999999999.0, direction)
+
                 # 处理区间格式（两个值）
                 if direction is None and len(match.groups()) >= 2:
                     lower_str = match.group(1).replace(',', '') if match.group(1) else '0'
                     upper_str = match.group(2).replace(',', '') if match.group(2) else '0'
-                    # 区间格式特殊处理：返回区间信息
-                    # 这里我们简单处理，返回 (lower_value, RANGE)
-                    # 实际使用时，需要检测这是一个区间市场
+                    # 区间格式：正则中需要包含单位捕获组才能完美支持，这里暂用 context 补丁或增强正则
+                    # 简化处理：区间目前主要靠 API 解析
                     try:
-                        lower_val = self._parse_value_with_unit(lower_str, text_lower, match, 1)
-                        upper_val = self._parse_value_with_unit(upper_str, text_lower, match, 2)
-                        # 对于区间市场，我们返回 lower，并标记为 RANGE
+                        lower_val = float(lower_str)
+                        upper_val = float(upper_str)
                         return ((lower_val, upper_val), ThresholdDirection.RANGE)
                     except (ValueError, IndexError):
                         continue
 
-                value_str = match.group(1).replace(',', '') if match.group(1) else ''
+                # 🆕 容错处理：确保至少有一个捕获组
+                try:
+                    value_str = match.group(1).replace(',', '')
+                    # 尝试获取单位捕获组 (通常是第2组)
+                    unit_str = ""
+                    if len(match.groups()) >= 2:
+                        unit_str = match.group(2) or ""
+                except IndexError:
+                    continue
+
                 if not value_str:
                     continue
 
-                value = self._parse_value_with_unit(value_str, text_lower, match, 1)
+                value = self._parse_value_with_unit(value_str, unit_str)
                 return (value, direction)
 
         return None
 
-    def _parse_value_with_unit(self, value_str: str, text: str, match, group_idx: int) -> float:
+    def _parse_value_with_unit(self, value_str: str, unit_str: str = "") -> float:
         """
         解析带有单位的数值
 
         Args:
             value_str: 数值字符串
-            text: 完整文本
-            match: 正则匹配对象
-            group_idx: 组索引
+            unit_str: 单位字符串 (k, m, b, t)
 
         Returns:
             解析后的数值
         """
         try:
-            base_value = float(value_str)
+            # 移除逗号并转为浮点数
+            base_value = float(value_str.replace(',', ''))
         except ValueError:
             return 0.0
 
-        # 检查单位后缀
-        # 从匹配位置开始查找单位字符
-        match_end = match.end(group_idx) if hasattr(match, 'end') else len(value_str)
-        context = text[max(0, match_end - 5):match_end + 5]
+        if not unit_str:
+            return base_value
 
-        for unit, multiplier in self.UNIT_MULTIPLIERS.items():
-            if unit in context.lower():
-                return base_value * multiplier
+        unit = unit_str.lower().strip()
+        multiplier = self.UNIT_MULTIPLIERS.get(unit, 1)
 
-        # 默认检查 k 后缀（向后兼容）
-        if 'k' in context.lower():
-            return base_value * 1000
-
-        return base_value
+        return base_value * multiplier
 
     def _deduplicate_thresholds(self, threshold_infos: List[ThresholdInfo]) -> List[ThresholdInfo]:
         """

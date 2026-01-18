@@ -39,7 +39,24 @@ class ExhaustiveSetStrategy(BaseArbitrageStrategy):
             min_profit_threshold=2.0,
             icon="🎯",
             help_text="需要验证结果互斥且完备，适用于多选项市场",
-            tags=["multi-option", "event-based"]
+            tags=["multi-option", "event-based"],
+            help_detail="""检测原理: 互斥完备集的YES价格总和应等于1
+适用条件: 多选项市场（如选举候选人、比赛结果）
+风险等级: 中（需验证互斥性和完备性）
+
+完备集条件:
+- 互斥: 所有结果中最多只有一个发生
+- 完备: 所有结果中至少有一个发生
+- 当 sum(P(i)) < 1 时，买入所有YES可套利""",
+            example="""示例: 美国总统大选
+- 民主党获胜 价格 45¢
+- 共和党获胜 价格 42¢
+- 第三方获胜 价格 5¢
+总和: 0.45 + 0.42 + 0.05 = 0.92 < 1
+套利: 买入所有三个选项的YES，总成本 92¢
+收益: 三者必有一个赔付$1，利润 8¢（约8.7%）
+
+注意: 需要验证市场规则确保结果互斥且完备"""
         )
 
     def scan(
@@ -50,23 +67,28 @@ class ExhaustiveSetStrategy(BaseArbitrageStrategy):
     ) -> List['ArbitrageOpportunity']:
         """
         执行完备集套利扫描
-
-        此方法依赖 ArbitrageDetector.check_exhaustive_set
         """
         opportunities = []
 
         try:
+            # 🆕 步骤0: 基础过滤 (Phase 2)
+            filtered_markets = self.filter_markets(markets, config)
+            if not filtered_markets:
+                if progress_callback:
+                    progress_callback(1, 1, "无符合条件的有效市场")
+                return []
+
             # 按 event_id 分组
             from collections import defaultdict
             events: Dict[str, List] = defaultdict(list)
 
-            for m in markets:
+            for m in filtered_markets:
                 if hasattr(m, 'event_id') and m.event_id:
                     events[m.event_id].append(m)
 
             total_events = len(events)
             if progress_callback:
-                progress_callback(0, total_events + 1, "分析完备集...")
+                progress_callback(0, total_events + 1, f"分析 {total_events} 个完备集...")
 
             # 分析每个事件
             for idx, (event_id, event_markets) in enumerate(events.items()):
@@ -96,13 +118,9 @@ class ExhaustiveSetStrategy(BaseArbitrageStrategy):
     ) -> Optional['ArbitrageOpportunity']:
         """检查市场组是否形成可套利的完备集"""
         try:
-            # 尝试使用现有的检测器
-            # 这里我们暂时使用简化的逻辑
-            # 后续可以导入 ArbitrageDetector
-
-            # 计算YES价格总和
+            # 使用订单簿买入价计算实际成本
             total_yes = sum(
-                getattr(m, 'yes_price', 0) or getattr(m, 'effective_buy_price', 0.5)
+                getattr(m, 'effective_buy_price', 0.5)
                 for m in markets
             )
 
@@ -159,9 +177,13 @@ class ExhaustiveSetStrategy(BaseArbitrageStrategy):
         """验证机会有效性"""
         if not opportunity:
             return False
-        if hasattr(opportunity, 'profit_pct'):
-            return opportunity.profit_pct >= self.metadata.min_profit_threshold
-        return True
+
+        # 利润阈值验证 (修正：统一转换为百分数进行比较)
+        profit_pct = getattr(opportunity, 'profit_pct', 0.0)
+        if 0 < profit_pct < 1.0:
+            profit_pct *= 100.0
+
+        return profit_pct >= self.metadata.min_profit_threshold
 
     def get_progress_steps(self, market_count: int) -> int:
         """估算进度步骤"""

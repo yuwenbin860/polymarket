@@ -30,22 +30,28 @@ Polymarket 组合套利系统 - 本地完整版 v2
     python local_scanner_v2.py --profile siliconflow --model deepseek-ai/DeepSeek-V3
 """
 
+import logging
+import traceback
 import requests
 import json
 import os
 import sys
+import sqlite3
 import argparse
-from dataclasses import dataclass, asdict
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict, is_dataclass
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 from collections import defaultdict
+from enum import Enum
 
 # ============================================================
 # UTF-8编码配置 - 已通过emoji→ASCII替换解决编码问题
 # ============================================================
 # 注意：由于io.TextIOWrapper会导致stderr关闭问题，
 # 我们采用更简单的方案：所有emoji已替换为ASCII字符
-from datetime import datetime
+from datetime import datetime, UTC, timezone, timedelta
 from enum import Enum
 
 # 导入LLM提供商和配置
@@ -61,14 +67,29 @@ from prompts import (
 # ✅ 新增：导入验证层
 from validators import MathValidator
 
-# ✅ 新增：导入语义聚类模块
+# ✅ 新增：导入动态分类模块 (v3.1)
+from category_discovery import CategoryDiscovery, CategoryInfo
+
+# ✅ 新增：导入验证引擎 (v2.5)
+from validation_engine import ValidationEngine
+from notifier import ArbitrageNotifier
+from execution_engine import ExecutionEngine
 from semantic_cluster import SemanticClusterer
+from data_recorder import TimeSeriesRecorder
+from backtest_engine import BacktestEngine
+from secret_manager import secrets
+from ws_client import PolymarketWSClient
 
-# ✅ 新增：导入单调性检查器（Sprint 0）
-from monotonicity_checker import MonotonicityChecker
-
-import logging
-import traceback
+# ✅ 新增：导入 CLI 模块（v3.1）
+try:
+    from cli import InteractiveMenu, ScannerOutput
+    from strategies import StrategyRegistry, BaseArbitrageStrategy, StrategyMetadata
+    CLI_AVAILABLE = True
+except ImportError:
+    CLI_AVAILABLE = False
+    InteractiveMenu = None
+    ScannerOutput = None
+    StrategyRegistry = None
 
 # ============================================================
 # Logging 配置
@@ -98,24 +119,6 @@ SUBCATEGORY_ALIASES = {
     "aave": "aave",
     "comp": "compound",
     "link": "chainlink",
-}
-
-# 子类别分组配置（用于交互式选择）
-SUBCATEGORY_GROUPS = {
-    "crypto": [
-        ("Bitcoin", ["bitcoin", "bitcoin-prices", "bitcoin-volatility", "bitcoin-conference", "strategic-bitcoin-reserve"]),
-        ("Ethereum", ["ethereum", "ethereum-prices", "ethereum-dencun", "ethgas", "ethbtc", "ether-rock", "etherfi", "ethena", "megaeth"]),
-        ("Solana", ["solana", "solana-prices", "sol"]),
-        ("主要币种", ["xrp", "xrp-prices", "ripple", "cardano", "bnb", "litecoin", "dogecoin"]),
-        ("稳定币/DeFi", ["tether", "usdc", "uniswap", "defi-app", "chainlink", "stablecoins"]),
-        ("NFT/meme", ["nft", "cryptopunks", "pepe"]),
-        ("平台/项目", ["binance", "token-launch", "token-price", "hyperliquid", "coinbase"]),
-        ("综合/其他", ["crypto", "crypto-prices", "cryptocurrency", "airdrops", "crypto-summit", "crypto-policy", "token-sales", "public-sales", "pre-market", "finance", "business", "tech"]),
-    ],
-    # 其他领域可后续扩展
-    "politics": [],
-    "sports": [],
-    "other": [],
 }
 
 
@@ -250,13 +253,53 @@ class ArbitrageOpportunity:
     needs_review: List[str]
     timestamp: str
 
+    # 🆕 Phase 2.5 新增风控字段
+    mid_price_profit: float = 0.0      # 基于中间价的理论利润
+    effective_profit: float = 0.0      # 考虑订单簿深度后的实际利润
+    slippage_cost: float = 0.0         # 预估滑点损失 (USD)
+    days_to_resolution: int = 0        # 距离结算的预估天数
+    apy: float = 0.0                   # 年化收益率 (%)
+    apy_rating: str = "N/A"            # 收益评级 (EXCELLENT, GOOD, etc.)
+    oracle_alignment: str = "UNKNOWN"  # 预言机对齐状态 (ALIGNED, MISALIGNED)
+    validation_results: Dict = field(default_factory=dict)  # 五层验证的详细结果
+    checklist_path: str = ""           # 自动生成的 Markdown 复核清单路径
+    gas_estimate: float = 0.0          # 预估执行所需的 Gas 费 (USD)
+    max_position_usd: float = 0.0      # 建议的最大投入金额 (USD)
+
+
+# ============================================================
+# JSON序列化辅助函数
+# ============================================================
+
+def json_serialize(obj: Any) -> Any:
+    """
+    递归序列化对象为JSON兼容格式
+
+    处理:
+    - dataclass对象 -> dict
+    - Enum对象 -> value
+    - 其他不可序列化对象 -> str
+    """
+    if is_dataclass(obj):
+        return {k: json_serialize(v) for k, v in asdict(obj).items()}
+    elif isinstance(obj, Enum):
+        return obj.value
+    elif isinstance(obj, dict):
+        return {k: json_serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [json_serialize(item) for item in obj]
+    else:
+        return obj
+
 
 # ============================================================
 # 速率限制器
 # ============================================================
 
+import threading
+
 class RateLimiter:
-    """简单的速率限制器，控制API请求频率"""
+    """简单的速率限制器，控制API请求频率 (线程安全)"""
 
     def __init__(self, calls_per_second: float = 2.0):
         """
@@ -267,14 +310,16 @@ class RateLimiter:
         """
         self.min_interval = 1.0 / calls_per_second
         self.last_call = 0
+        self.lock = threading.Lock()
 
     def wait(self):
         """在发起请求前调用，确保不超过速率限制"""
         import time
-        elapsed = time.time() - self.last_call
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self.last_call = time.time()
+        with self.lock:
+            elapsed = time.time() - self.last_call
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_call = time.time()
 
 
 # ============================================================
@@ -298,6 +343,18 @@ class PolymarketClient:
         """
         self.base_url = api_base
         self.session = requests.Session()
+
+        # 🆕 配置重试策略 (Phase 5.3 稳定性增强)
+        from requests.adapters import HTTPAdapter
+        from urllib3.util import Retry
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            raise_on_status=False
+        )
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
         self.session.headers.update({
             "User-Agent": "PolymarketArbitrageScanner/2.0"
         })
@@ -447,6 +504,28 @@ class PolymarketClient:
         except Exception:
             return None
 
+    def get_market_details(self, market_id: str) -> Optional[Dict]:
+        """
+        [Phase 4.8] 获取单个市场的详细数据 (用于结算检查)
+        """
+        if not market_id:
+            return None
+
+        # 遵守速率限制
+        if hasattr(self, 'rate_limiter'):
+            self.rate_limiter.wait()
+
+        url = f"{self.base_url}/markets/{market_id}"
+        try:
+            response = self.session.get(url, timeout=15)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.debug(f"获取市场详情失败 {market_id}: {e}")
+            return None
+
     def fetch_orderbook(self, token_id: str) -> Dict:
         """
         从 CLOB API 获取订单簿数据
@@ -461,6 +540,10 @@ class PolymarketClient:
         """
         if not token_id:
             return {"best_bid": 0.0, "best_ask": 0.0, "spread": 0.0}
+
+        # ✅ 遵守速率限制
+        if hasattr(self, 'rate_limiter'):
+            self.rate_limiter.wait()
 
         clob_url = f"https://clob.polymarket.com/book"
         try:
@@ -557,7 +640,7 @@ class PolymarketClient:
         Returns:
             Event字典列表
         """
-        # 默认行为：max_results=None 时，使用 limit 作为最大数量（向后兼容）
+        # 默认行为：max_results=None 时，使用 limit 作为最大数量
         if max_results is None:
             max_results = limit
         elif max_results == 0:
@@ -1015,7 +1098,7 @@ class MarketCache:
     def _save_cache(self, cache_file: str, markets: List[Market]):
         """保存市场数据到缓存文件"""
         try:
-            data = [asdict(m) for m in markets]
+            data = [json_serialize(m) for m in markets]
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -1168,7 +1251,7 @@ class LLMAnalyzer:
 
     def _init_from_profile(self, profile_name: str, model_override: str = None):
         """从profile配置初始化"""
-        from llm_config import get_llm_config_by_name
+        from llm_config import get_llm_config_by_name, LLMScenario
         profile = get_llm_config_by_name(profile_name)
         if not profile:
             raise ValueError(f"未找到配置: {profile_name}")
@@ -1176,7 +1259,12 @@ class LLMAnalyzer:
         if not profile.is_configured():
             raise ValueError(f"配置 {profile_name} 未设置API Key (需要: {profile.api_key_env})")
 
-        model = model_override or profile.model
+        # 如果没有指定模型覆盖，使用策略扫描场景的模型
+        if model_override is None:
+            model = profile.get_model_for_scenario(LLMScenario.STRATEGY_SCAN)
+        else:
+            model = model_override
+
         self.client = create_llm_client(
             provider=profile.provider,
             api_base=profile.api_base,
@@ -1223,7 +1311,7 @@ class LLMAnalyzer:
 
     def _init_from_auto_detect(self, model_override: str = None):
         """自动检测可用的LLM配置"""
-        from llm_config import get_llm_config
+        from llm_config import get_llm_config, LLMScenario
         profile = get_llm_config()
 
         if not profile:
@@ -1234,7 +1322,12 @@ class LLMAnalyzer:
                 "  3. 在 config.json 中配置 llm.provider 和 llm.api_key"
             )
 
-        model = model_override or profile.model
+        # 如果没有指定模型覆盖，使用策略扫描场景的模型
+        if model_override is None:
+            model = profile.get_model_for_scenario(LLMScenario.STRATEGY_SCAN)
+        else:
+            model = model_override
+
         self.client = create_llm_client(
             provider=profile.provider,
             api_base=profile.api_base,
@@ -1579,6 +1672,58 @@ Event ID: {market_b.event_id or 'N/A'}
         except Exception as write_error:
             logger.warning(f"无法保存LLM错误日志: {write_error}")
 
+    def analyze_cluster(self, cluster_id: str, markets: List[Any]) -> Dict[str, Any]:
+        """
+        [Phase 5.2] 批量分析语义聚类簇
+        """
+        if not self.use_llm or not self.client:
+            return {"relationships": [], "synthetic_opportunities": []}
+
+        from prompts import CLUSTER_ANALYSIS_PROMPT
+
+        # 1. 准备市场列表摘要 (Phase 5.4 性能优化：大型簇采样)
+        max_analyze_size = 25
+        if len(markets) > max_analyze_size:
+            logging.info(f"簇规模过大 ({len(markets)})，仅分析前 {max_analyze_size} 个核心市场")
+            # 尝试按流动性排序（如果属性存在）
+            try:
+                target_markets = sorted(markets, key=lambda x: getattr(x, 'liquidity', 0), reverse=True)[:max_analyze_size]
+            except Exception:
+                target_markets = markets[:max_analyze_size]
+        else:
+            target_markets = markets
+
+        market_list_str = ""
+        avg_liquidity = 0
+        for m in target_markets:
+            market_list_str += f"- ID: {m.id} | Question: {m.question} | Price: ${m.yes_price:.3f} | End: {m.end_date}\n"
+            avg_liquidity += getattr(m, 'liquidity', 0)
+
+        avg_liquidity /= len(target_markets) if target_markets else 1
+
+        # 2. 填充并发送 Prompt
+        prompt = CLUSTER_ANALYSIS_PROMPT.format(
+            cluster_id=cluster_id,
+            cluster_size=len(target_markets),
+            avg_liquidity=avg_liquidity,
+            market_list=market_list_str
+        )
+
+        try:
+            # ✅ 修正：使用 chat 方法 (Phase 5.4 修复)
+            response = self.client.chat(prompt)
+            # 提取 JSON 内容
+            content = response.content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"批量聚类分析失败: {e}")
+            return {"relationships": [], "synthetic_opportunities": []}
+
     def close(self):
         """关闭LLM客户端"""
         if self.client:
@@ -1702,1248 +1847,6 @@ class ArbitrageDetector:
                 "reasoning": f"验证失败: {e}"
             }
 
-    def check_pair(self, market_a: Market, market_b: Market,
-                   analysis: Dict) -> Optional[ArbitrageOpportunity]:
-        """检查市场对是否存在套利"""
-        rel = analysis.get("relationship", "UNRELATED")
-        
-        if rel == "IMPLIES_AB":
-            return self._check_implication(market_a, market_b, analysis, "A→B")
-        elif rel == "IMPLIES_BA":
-            return self._check_implication(market_b, market_a, analysis, "B→A")
-        elif rel == "EQUIVALENT":
-            return self._check_equivalent(market_a, market_b, analysis)
-        
-        return None
-    
-    def check_exhaustive_set(self, markets: List[Market]) -> Optional[ArbitrageOpportunity]:
-        """检查完备集套利"""
-        if len(markets) < 2:
-            return None
-
-        # =====================================
-        # 关键验证：Event ID 一致性检查
-        # =====================================
-        # 真正的完备集必须来自同一个 event_id
-        # 例如：同一个选举的不同候选人，或同一资产的不同价格区间
-        event_ids = set(m.event_id for m in markets if m.event_id)
-        if len(event_ids) > 1:
-            print(f"    [SKIP] 完备集检测：event_id 不一致 ({len(event_ids)} 个不同的 event_id)")
-            return None  # 不同 event 的市场不可能构成完备集
-
-        # 如果没有 event_id，需要通过 LLM 验证
-        if len(event_ids) == 0:
-            print(f"    [SKIP] 完备集检测：缺少 event_id，无法验证完备集")
-            return None
-
-        # 验证1: 检查结算来源一致性
-        sources = set(m.resolution_source for m in markets if m.resolution_source)
-        if len(sources) > 1:
-            print(f"    [SKIP] 完备集检测：结算来源不一致 ({sources})")
-            return None  # 结算来源不一致，可能不是真正的完备集
-
-        # 验证2: 检查结算日期一致性（已在 _group_by_event 中处理，这里再次确认）
-        dates = set()
-        for m in markets:
-            if m.end_date:
-                date_part = m.end_date.split('T')[0] if 'T' in m.end_date else m.end_date
-                dates.add(date_part)
-        if len(dates) > 1:
-            print(f"    [SKIP] 完备集检测：结算日期不一致 ({dates})")
-            return None  # 结算日期不一致
-
-        # 陷阱1修复: 使用真实的 best_ask 计算成本
-        # 买入所有选项的 YES，使用各自的 best_ask
-        real_total = sum(m.effective_buy_price for m in markets)
-        mid_total = sum(m.yes_price for m in markets)
-
-        if real_total < 0.99:
-            real_profit = 1.0 - real_total
-            real_profit_pct = (real_profit / real_total) * 100 if real_total > 0 else 0
-            mid_profit_pct = ((1.0 - mid_total) / mid_total) * 100 if mid_total > 0 else 0
-
-            if real_profit_pct < self.min_profit_pct:
-                return None
-
-            # =====================================
-            # 验证3: LLM 完备集语义验证
-            # =====================================
-            print(f"    [LLM] 验证完备集语义...")
-            llm_verification = self.verify_exhaustive_set_with_llm(markets)
-
-            if not llm_verification.get("is_valid", False):
-                print(f"    [SKIP] LLM验证失败: {llm_verification.get('reasoning', '未知原因')}")
-                if llm_verification.get("missing_options"):
-                    print(f"       遗漏选项: {llm_verification.get('missing_options')}")
-                if llm_verification.get("overlap_risks"):
-                    print(f"       重叠风险: {llm_verification.get('overlap_risks')}")
-                return None
-
-            print(f"    [OK] LLM验证通过 (置信度: {llm_verification.get('confidence', 0):.0%})")
-
-            # 验证4: 利润率合理性检查
-            needs_extra_review = []
-            if real_profit_pct > 100:
-                needs_extra_review.append("!! 利润率超过100%，请重点验证数据准确性")
-
-            # 陷阱1修复: 检查是否有较大价差
-            high_spread_markets = [m for m in markets if m.spread > 0.02]
-            if high_spread_markets:
-                spread_info = ", ".join([f"{m.question[:30]}:{m.spread:.1%}" for m in high_spread_markets[:3]])
-                needs_extra_review.append(f"!! 部分市场价差较大: {spread_info}")
-
-            action_lines = [
-                f"买 '{m.question[:60]}...' YES @ ${m.effective_buy_price:.3f} (ask)"
-                for m in markets
-            ]
-
-            return ArbitrageOpportunity(
-                id=f"exhaustive_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                type="EXHAUSTIVE_SET_UNDERPRICED",
-                markets=[{"id": m.id, "question": m.question, "yes_price": m.yes_price,
-                          "best_ask": m.best_ask, "spread": m.spread, "liquidity": m.liquidity,
-                          "orderbook": m.orderbook} for m in markets],
-                relationship="exhaustive",
-                confidence=0.85,
-                total_cost=real_total,
-                guaranteed_return=1.0,
-                profit=real_profit,
-                profit_pct=real_profit_pct,
-                action="\n".join(action_lines),
-                reasoning="完备集市场总价小于1，买入所有选项可锁定利润",
-                edge_cases=["需确认这些选项真的构成完备集"],
-                needs_review=[
-                    "确认所有选项互斥且覆盖全部可能",
-                    "检查结算规则是否一致",
-                    "确认没有遗漏的选项",
-                    f"中间价利润: {mid_profit_pct:.1f}% vs 实际利润: {real_profit_pct:.1f}%",
-                ] + needs_extra_review,
-                timestamp=datetime.now().isoformat()
-            )
-
-        # =====================================
-        # 边界案例检测：0.99 <= sum < 1.0
-        # =====================================
-        if real_total < 1.0:
-            real_profit = 1.0 - real_total
-            real_profit_pct = (real_profit / real_total) * 100 if real_total > 0 else 0
-
-            # 边界案例也需要LLM验证
-            print(f"    [LLM] 验证边界案例完备集语义...")
-            llm_verification = self.verify_exhaustive_set_with_llm(markets)
-
-            if not llm_verification.get("is_valid", False):
-                print(f"    [SKIP] 边界案例LLM验证失败")
-                return None
-
-            action_lines = [
-                f"买 '{m.question[:60]}...' YES @ ${m.effective_buy_price:.3f} (ask)"
-                for m in markets
-            ]
-
-            return ArbitrageOpportunity(
-                id=f"exhaustive_borderline_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                type="EXHAUSTIVE_SET_BORDERLINE",
-                markets=[{"id": m.id, "question": m.question, "yes_price": m.yes_price,
-                          "best_ask": m.best_ask, "spread": m.spread, "liquidity": m.liquidity,
-                          "orderbook": m.orderbook} for m in markets],
-                relationship="exhaustive",
-                confidence=0.7,
-                total_cost=real_total,
-                guaranteed_return=1.0,
-                profit=real_profit,
-                profit_pct=real_profit_pct,
-                action="\n".join(action_lines),
-                reasoning="边界案例：完备集总价接近1，利润空间较小",
-                edge_cases=["利润可能被手续费和滑点吃掉"],
-                needs_review=[
-                    "⚠️ 边界案例：利润空间 < 1%，需仔细评估",
-                    "计算实际手续费后的净利润",
-                    "评估滑点影响（大单会推高价格）",
-                    f"理论利润: {real_profit_pct:.2f}%",
-                ],
-                timestamp=datetime.now().isoformat()
-            )
-
-        return None
-
-    def _check_implication(self, implying: Market, implied: Market,
-                           analysis: Dict, direction: str) -> Optional[ArbitrageOpportunity]:
-        """检查包含关系套利"""
-
-        # ✅ 新增：LLM 输出一致性检查
-        if not analysis.get("is_consistent", True):
-            print(f"    [WARNING] LLM 输出不一致，跳过套利检测")
-            print(f"       错误: {analysis.get('consistency_error', 'Unknown')}")
-            return None
-
-        # ✅ 新增：数据有效性检查
-        if not self._validate_market_data(implying, implied):
-            print(f"    [ERROR] 数据有效性检查失败，跳过套利检测")
-            return None
-
-        # ✅ 新增：调用 MathValidator 验证数学约束
-        relation_type = analysis.get("relationship", "")
-
-        # 将Market对象转换为MarketData
-        from validators import MarketData
-        implying_data = MarketData(
-            id=implying.id,
-            question=implying.question,
-            yes_price=implying.yes_price,
-            no_price=implying.no_price,
-            liquidity=implying.liquidity
-        )
-        implied_data = MarketData(
-            id=implied.id,
-            question=implied.question,
-            yes_price=implied.yes_price,
-            no_price=implied.no_price,
-            liquidity=implied.liquidity
-        )
-
-        validation_result = self.math_validator.validate_implication(
-            market_a=implying_data,
-            market_b=implied_data,
-            relation=relation_type  # 注意参数名是 relation 不是 relation_type
-        )
-
-        # 使用枚举比较，而不是字符串（修复大小写Bug）
-        from validators import ValidationResult as VR
-        if validation_result.result not in [VR.PASSED, VR.WARNING]:
-            print(f"    [ERROR] 数学验证失败: {validation_result.reason}")
-            print(f"       验证详情: {validation_result.details}")
-            return None
-        else:
-            print(f"    [OK] 数学验证通过: {validation_result.reason}")
-
-        # ✅ 阈值蕴含方向验证 (v2.0.5)
-        # 验证价格阈值类市场(如dip/above)的蕴含方向是否正确
-        threshold_validation = self.math_validator.validate_threshold_implication(
-            market_a=implying_data,
-            market_b=implied_data,
-            llm_relation=relation_type
-        )
-
-        if threshold_validation.result == VR.FAILED:
-            print(f"    [ERROR] 阈值方向验证失败: {threshold_validation.reason}")
-            if threshold_validation.details:
-                print(f"       详情: {threshold_validation.details}")
-            return None
-        elif threshold_validation.result == VR.NEEDS_REVIEW:
-            print(f"    [WARNING] 阈值验证需人工复核: {threshold_validation.reason}")
-        elif threshold_validation.reason and "跳过" not in threshold_validation.reason:
-            print(f"    [OK] 阈值方向验证: {threshold_validation.reason}")
-
-        # ✅ Priority 2: 时间一致性验证
-        if relation_type in ['IMPLIES_AB', 'IMPLIES_BA']:
-            # 导入 MarketData 用于类型转换
-            from validators import MarketData
-
-            # 转换 Market 对象为 MarketData
-            market_a_data = MarketData(
-                id=implying.id,
-                question=implying.question,
-                yes_price=implying.yes_price,
-                no_price=implying.no_price,
-                liquidity=implying.liquidity,
-                volume=implying.volume,
-                end_date=implying.end_date
-            )
-
-            market_b_data = MarketData(
-                id=implied.id,
-                question=implied.question,
-                yes_price=implied.yes_price,
-                no_price=implied.no_price,
-                liquidity=implied.liquidity,
-                volume=implied.volume,
-                end_date=implied.end_date
-            )
-
-            time_validation = self.math_validator.validate_time_consistency(
-                market_a=market_a_data,
-                market_b=market_b_data,
-                relation=relation_type
-            )
-
-            # 使用 .result.value 获取字符串值
-            if time_validation.result.value == 'FAILED':
-                print(f"    [ERROR] 时间一致性验证失败: {time_validation.reason}")
-                print(f"       结算时间: {implying.end_date} vs {implied.end_date}")
-                return None
-            elif time_validation.result.value == 'NEEDS_REVIEW':
-                print(f"    [WARNING] 时间一致性验证: {time_validation.reason}")
-                # 时间不一致的蕴含关系通常是误判，但仍返回 None
-                return None
-            else:
-                print(f"    [OK] 时间一致性验证通过: {time_validation.reason}")
-
-        # ✅ Priority 2: 语义验证
-        is_semantically_valid, semantic_msg = self._validate_arbitrage_semantics(
-            implying=implying,
-            implied=implied,
-            relation_type=relation_type
-        )
-
-        if not is_semantically_valid:
-            print(f"    [WARNING] 语义验证失败: {semantic_msg}")
-            print(f"       建议: 人工复核此机会")
-            # 语义验证失败时，降低置信度但不直接拒绝
-            confidence = analysis.get("confidence", 0.8) * 0.7
-            analysis["confidence"] = confidence
-            analysis["semantic_warning"] = semantic_msg
-        else:
-            print(f"    [OK] 语义验证通过: {semantic_msg}")
-
-        # 检查 LLM 响应是否存在不一致（原有逻辑，保留作为双重检查）
-        if analysis.get("inconsistency_detected", False):
-            return None  # 不一致的分析结果不可信，跳过
-
-        # 蕴含关系约束检查：如果 A → B，则 P(B) >= P(A)
-        # 套利条件：P(B) < P(A)（违反约束）
-        if implied.yes_price >= implying.yes_price - 0.01:
-            return None  # 约束满足，无套利
-
-        # 陷阱1修复: 使用真实的 best_ask 计算买入成本
-        # 买入 implied 的 YES: 使用 best_ask
-        implied_buy_cost = implied.effective_buy_price
-        # 买入 implying 的 NO: 使用 1 - best_bid (相当于卖出 YES)
-        implying_no_cost = 1 - implying.effective_sell_price if implying.best_bid > 0 else implying.no_price
-
-        # 使用真实成本计算利润
-        real_cost = implied_buy_cost + implying_no_cost
-        real_profit = 1.0 - real_cost
-        real_profit_pct = (real_profit / real_cost) * 100 if real_cost > 0 else 0
-
-        # 同时保留中间价计算（用于对比）
-        mid_cost = implied.yes_price + implying.no_price
-        mid_profit_pct = ((1.0 - mid_cost) / mid_cost) * 100 if mid_cost > 0 else 0
-
-        if real_profit_pct < self.min_profit_pct:
-            return None
-
-        if analysis.get("confidence", 0) < self.min_confidence:
-            return None
-
-        # 利润率合理性检查
-        needs_extra_review = []
-        if real_profit_pct > 100:
-            needs_extra_review.append("!! 利润率超过100%，请重点验证数据准确性和逻辑关系")
-
-        # 陷阱1修复: 如果有价差数据，显示滑点警告
-        if implied.spread > 0.02 or implying.spread > 0.02:
-            needs_extra_review.append(f"!! 价差较大 (implied:{implied.spread:.1%}, implying:{implying.spread:.1%})，注意滑点风险")
-
-        return ArbitrageOpportunity(
-            id=f"impl_{direction}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            type="IMPLICATION_VIOLATION",
-            markets=[
-                {"id": implied.id, "question": implied.question, "yes_price": implied.yes_price,
-                 "best_ask": implied.best_ask, "spread": implied.spread, "liquidity": implied.liquidity,
-                 "orderbook": implied.orderbook},
-                {"id": implying.id, "question": implying.question, "yes_price": implying.yes_price,
-                 "best_bid": implying.best_bid, "spread": implying.spread, "liquidity": implying.liquidity,
-                 "orderbook": implying.orderbook}
-            ],
-            relationship=f"implies_{direction.lower().replace('→', '_')}",
-            confidence=analysis.get("confidence", 0.5),
-            total_cost=real_cost,
-            guaranteed_return=1.0,
-            profit=real_profit,
-            profit_pct=real_profit_pct,
-            action=f"买 '{implied.question[:60]}...' YES @ ${implied_buy_cost:.3f} (ask)\n"
-                   f"买 '{implying.question[:60]}...' NO @ ${implying_no_cost:.3f}",
-            reasoning=analysis.get("reasoning", ""),
-            edge_cases=analysis.get("edge_cases", []),
-            needs_review=[
-                "验证逻辑关系确实成立",
-                "检查结算规则是否兼容",
-                f"中间价利润: {mid_profit_pct:.1f}% vs 实际利润: {real_profit_pct:.1f}%",
-            ] + needs_extra_review,
-            timestamp=datetime.now().isoformat()
-        )
-
-    def _validate_market_data(
-        self,
-        market_a: Market,
-        market_b: Market
-    ) -> bool:
-        """
-        验证市场数据的有效性
-
-        检查：
-        1. 价格字段是否有效（非 0.0，非 None）
-        2. 必需字段是否存在
-        3. 价格范围是否合理（0-1）
-
-        Args:
-            market_a, market_b: 待验证的市场
-
-        Returns:
-            True 表示数据有效，False 表示无效
-        """
-        # 检查价格有效性
-        for market, name in [(market_a, 'A'), (market_b, 'B')]:
-            # YES 价格检查
-            if market.yes_price == 0.0 or market.yes_price is None:
-                print(f"    [ERROR] 市场 {name} YES 价格无效: {market.yes_price}")
-                return False
-
-            if not (0.0 <= market.yes_price <= 1.0):
-                print(f"    [ERROR] 市场 {name} YES 价格超出范围: {market.yes_price}")
-                return False
-
-            # NO 价格检查
-            if market.no_price == 0.0 or market.no_price is None:
-                print(f"    [ERROR] 市场 {name} NO 价格无效: {market.no_price}")
-                return False
-
-            if not (0.0 <= market.no_price <= 1.0):
-                print(f"    [ERROR] 市场 {name} NO 价格超出范围: {market.no_price}")
-                return False
-
-            # 流动性检查
-            if market.liquidity <= 0:
-                print(f"    [ERROR] 市场 {name} 流动性为 0: {market.liquidity}")
-                return False
-
-            # Question 检查
-            if not market.question or market.question.strip() == '':
-                print(f"    [ERROR] 市场 {name} question 为空")
-                return False
-
-        print(f"    [OK] 数据有效性检查通过")
-        return True
-
-    def _validate_arbitrage_semantics(
-        self,
-        implying: Market,
-        implied: Market,
-        relation_type: str
-    ) -> tuple[bool, str]:
-        """
-        验证套利机会的语义合理性 (Priority 2)
-
-        检查价格关系是否符合逻辑直觉：
-        - 对于 IMPLIES_AB: 如果 P(A) = 0.9, P(B) = 0.1，这不太合理
-          （因为 A→B 要求 P(B) >= P(A)）
-        - 对于 EQUIVALENT: 价格应该接近，不应该差异巨大
-
-        Args:
-            implying: 蕴含市场（A）
-            implied: 被蕴含市场（B）
-            relation_type: 关系类型
-
-        Returns:
-            (is_valid, message)
-        """
-        p_a = implying.yes_price
-        p_b = implied.yes_price
-
-        if relation_type == 'IMPLIES_AB' or relation_type == 'IMPLIES_BA':
-            # 蕴含关系：P(B) 应该 >= P(A)
-            # 但我们检测的是 P(B) < P(A) 的情况
-            price_gap = p_a - p_b
-
-            # 如果价格差异过大（>50%），可能是误判
-            if price_gap > 0.5:
-                return False, (
-                    f"蕴含关系价格差异过大: P(A)={p_a:.3f}, P(B)={p_b:.3f}, "
-                    f"差距={price_gap:.1%}。这不太可能是真正的蕴含关系。"
-                )
-
-            # 如果 P(A) 极低但 P(B) 极高，也值得怀疑
-            if p_a < 0.1 and p_b > 0.9:
-                return False, (
-                    f"蕴含关系价格极端: P(A)={p_a:.3f} (极低), P(B)={p_b:.3f} (极高)。"
-                    f"请检查是否误判为蕴含关系。"
-                )
-
-        elif relation_type == 'EQUIVALENT':
-            # 等价关系：价格应该接近
-            price_diff = abs(p_a - p_b)
-
-            if price_diff > 0.2:  # 20% 差异
-                return False, (
-                    f"等价市场价格差异过大: P(A)={p_a:.3f}, P(B)={p_b:.3f}, "
-                    f"差异={price_diff:.1%}。等价市场应该有相似的价格。"
-                )
-
-        return True, "语义验证通过"
-
-    def _check_equivalent(self, market_a: Market, market_b: Market,
-                          analysis: Dict) -> Optional[ArbitrageOpportunity]:
-        """检查等价市场套利"""
-        spread = abs(market_a.yes_price - market_b.yes_price)
-
-        if spread < 0.03:
-            return None
-
-        if market_a.yes_price < market_b.yes_price:
-            cheap, expensive = market_a, market_b
-        else:
-            cheap, expensive = market_b, market_a
-
-        # 陷阱1修复: 使用真实的 best_ask/best_bid 计算成本
-        # 买入 cheap 的 YES: 使用 best_ask
-        cheap_buy_cost = cheap.effective_buy_price
-        # 买入 expensive 的 NO: 使用 1 - best_bid
-        expensive_no_cost = 1 - expensive.effective_sell_price if expensive.best_bid > 0 else expensive.no_price
-
-        # 使用真实成本计算利润
-        real_cost = cheap_buy_cost + expensive_no_cost
-        real_profit = 1.0 - real_cost
-        real_profit_pct = (real_profit / real_cost) * 100 if real_cost > 0 else 0
-
-        # 保留中间价计算（用于对比）
-        mid_cost = cheap.yes_price + expensive.no_price
-        mid_profit_pct = ((1.0 - mid_cost) / mid_cost) * 100 if mid_cost > 0 else 0
-
-        if real_profit_pct < self.min_profit_pct:
-            return None
-
-        # 陷阱1修复: 价差警告
-        needs_extra_review = []
-        if cheap.spread > 0.02 or expensive.spread > 0.02:
-            needs_extra_review.append(f"!! 价差较大 (cheap:{cheap.spread:.1%}, expensive:{expensive.spread:.1%})")
-
-        return ArbitrageOpportunity(
-            id=f"equiv_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            type="EQUIVALENT_MISPRICING",
-            markets=[
-                {"id": cheap.id, "question": cheap.question, "yes_price": cheap.yes_price,
-                 "best_ask": cheap.best_ask, "spread": cheap.spread, "liquidity": cheap.liquidity,
-                 "orderbook": cheap.orderbook},
-                {"id": expensive.id, "question": expensive.question, "yes_price": expensive.yes_price,
-                 "best_bid": expensive.best_bid, "spread": expensive.spread, "liquidity": expensive.liquidity,
-                 "orderbook": expensive.orderbook}
-            ],
-            relationship="equivalent",
-            confidence=analysis.get("confidence", 0.5),
-            total_cost=real_cost,
-            guaranteed_return=1.0,
-            profit=real_profit,
-            profit_pct=real_profit_pct,
-            action=f"买 '{cheap.question[:60]}...' YES @ ${cheap_buy_cost:.3f} (ask)\n"
-                   f"买 '{expensive.question[:60]}...' NO @ ${expensive_no_cost:.3f}",
-            reasoning="等价市场存在显著价差",
-            edge_cases=analysis.get("edge_cases", []),
-            needs_review=[
-                "确认两个市场真的等价",
-                "检查结算规则",
-                f"中间价利润: {mid_profit_pct:.1f}% vs 实际利润: {real_profit_pct:.1f}%",
-            ] + needs_extra_review,
-            timestamp=datetime.now().isoformat()
-        )
-
-    # ============================================================
-    # ✅ 新增: 区间套利检测
-    # ============================================================
-
-    def check_interval_arbitrage(
-        self,
-        market_a: Market,
-        market_b: Market,
-        interval_analysis: Dict = None
-    ) -> Optional[ArbitrageOpportunity]:
-        """
-        检测区间套利机会
-
-        Solana区间套利示例：
-            - 市场A: "Solana price on Jan 4?" (完备集事件)
-              - 子市场A1: "< 130" → YES = 4.6c
-            - 市场B: "Solana above 130 on Jan 4?"
-              - YES = 94.8c, NO = 5.2c
-            - 套利: 买A1的YES + 买B的YES = 4.6 + 94.8 = 99.4c → 保证回报$1
-
-        套利逻辑：
-            - 如果区间A和区间B形成覆盖关系（如A是[0,130]，B是[130,∞)）
-            - 买A的YES + 买B的YES，无论结果如何，至少一个会赢
-            - 成本 = P(A) + P(B)，如果 < 1，则存在套利
-
-        Args:
-            market_a: 市场A
-            market_b: 市场B
-            interval_analysis: 预先计算的区间分析结果（可选）
-
-        Returns:
-            套利机会或None
-        """
-        # 导入区间解析器
-        from interval_parser import IntervalParser, IntervalRelation
-
-        parser = IntervalParser()
-
-        # 解析区间
-        interval_a = parser.parse(
-            market_a.question,
-            market_a.full_description  # 使用full_description获取rules
-        )
-        interval_b = parser.parse(
-            market_b.question,
-            market_b.full_description
-        )
-
-        if not interval_a or not interval_b:
-            return None
-
-        # 比较区间关系
-        relation = parser.compare_intervals(interval_a, interval_b)
-
-        # 只处理覆盖关系（互补区间）
-        if relation not in [
-            IntervalRelation.A_COVERS_B,
-            IntervalRelation.B_COVERS_A
-        ]:
-            return None
-
-        # 检查套利条件：
-        # 对于互补区间（如A=[0,130], B=[130,∞)），买A的YES + 买B的YES
-        # 成本 = P(A) + P(B)，如果 < 1，则存在套利
-
-        price_a = market_a.effective_buy_price
-        price_b = market_b.effective_buy_price
-        total_cost = price_a + price_b
-
-        if total_cost >= 0.98:  # 允许2%的滑点
-            return None
-
-        profit = 1.0 - total_cost
-        profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
-
-        if profit_pct < self.min_profit_pct:
-            return None
-
-        # 确定哪个市场是覆盖区间，哪个是被覆盖区间
-        if relation == IntervalRelation.A_COVERS_B:
-            covering, covered = market_a, market_b
-            covering_interval, covered_interval = interval_a, interval_b
-        else:
-            covering, covered = market_b, market_a
-            covering_interval, covered_interval = interval_b, interval_a
-
-        # 生成套利机会
-        return ArbitrageOpportunity(
-            id=f"interval_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            type="INTERVAL_ARBITRAGE",
-            markets=[
-                {"id": market_a.id, "question": market_a.question, "yes_price": market_a.yes_price,
-                 "interval": str(interval_a), "best_ask": market_a.best_ask},
-                {"id": market_b.id, "question": market_b.question, "yes_price": market_b.yes_price,
-                 "interval": str(interval_b), "best_ask": market_b.best_ask}
-            ],
-            relationship="interval_complementary",
-            confidence=0.80,
-            total_cost=total_cost,
-            guaranteed_return=1.0,
-            profit=profit,
-            profit_pct=profit_pct,
-            action=f"买 '{market_a.question[:50]}...' YES @ ${price_a:.3f}\n"
-                   f"买 '{market_b.question[:50]}...' YES @ ${price_b:.3f}",
-            reasoning=f"区间互补套利：{covering_interval} 和 {covered_interval} 形成互补区间",
-            edge_cases=[
-                "检查边界值处理（恰好等于阈值时如何结算）",
-                "确认两个市场的结算规则一致",
-                "确认结算时间相同"
-            ],
-            needs_review=[
-                "验证区间边界不会导致两者同时为YES或NO",
-                f"中间价利润: {((1.0 - (market_a.yes_price + market_b.yes_price)) / (market_a.yes_price + market_b.yes_price) * 100):.1f}% vs 实际利润: {profit_pct:.1f}%",
-            ],
-            timestamp=datetime.now().isoformat()
-        )
-
-    def check_cross_event_equivalent(
-        self,
-        event1_slug: str,
-        event2_slug: str,
-        client: 'PolymarketClient'
-    ) -> List[ArbitrageOpportunity]:
-        """
-        检测跨Event的等价市场套利
-
-        例如：
-        - Event 1: "bitcoin-price-on-january-6" 有 ">98,000" 区间市场
-        - Event 2: "bitcoin-above-on-january-6" 有 ">98,000" 阈值市场
-        - 这两个市场问的是同一件事，如果价格不同则存在套利
-
-        Args:
-            event1_slug: 第一个event的slug
-            event2_slug: 第二个event的slug
-            client: PolymarketClient实例
-
-        Returns:
-            检测到的套利机会列表
-        """
-        opportunities = []
-
-        # 获取两个event的市场
-        markets1 = client.get_markets_in_event(event1_slug)
-        markets2 = client.get_markets_in_event(event2_slug)
-
-        if not markets1 or not markets2:
-            logger.warning(f"无法获取event市场: {event1_slug} 或 {event2_slug}")
-            return opportunities
-
-        # 使用规则匹配识别等价市场
-        for m1 in markets1:
-            for m2 in markets2:
-                if self._are_equivalent_markets(m1, m2):
-                    # 检查价差
-                    price1 = m1.effective_buy_price
-                    price2 = m2.effective_buy_price
-                    spread = abs(price1 - price2)
-
-                    # 价差阈值: 0.3%
-                    if spread > 0.003:
-                        # 确定买卖方向
-                        if price1 < price2:
-                            cheaper, expensive = m1, m2
-                        else:
-                            cheaper, expensive = m2, m1
-
-                        profit = spread
-                        profit_pct = (spread / expensive.effective_buy_price) * 100
-
-                        if profit_pct >= self.min_profit_pct:
-                            opportunities.append(ArbitrageOpportunity(
-                                id=f"cross_event_eq_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                                type="CROSS_EVENT_EQUIVALENT",
-                                markets=[
-                                    {"id": cheaper.id, "question": cheaper.question,
-                                     "yes_price": cheaper.yes_price, "event": event1_slug},
-                                    {"id": expensive.id, "question": expensive.question,
-                                     "yes_price": expensive.yes_price, "event": event2_slug}
-                                ],
-                                relationship="equivalent_cross_event",
-                                confidence=0.75,
-                                total_cost=expensive.effective_buy_price,
-                                guaranteed_return=cheaper.effective_buy_price,
-                                profit=profit,
-                                profit_pct=profit_pct,
-                                action=f"买 '{cheaper.question[:50]}...' YES @ ${cheaper.effective_buy_price:.3f}\n"
-                                       f"卖 '{expensive.question[:50]}...' YES @ ${expensive.effective_buy_price:.3f}",
-                                reasoning=f"跨Event等价市场套利：两个市场问同一问题但价格不同\n"
-                                         f"Event1 ({event1_slug}): {m1.question} @ ${price1:.3f}\n"
-                                         f"Event2 ({event2_slug}): {m2.question} @ ${price2:.3f}",
-                                edge_cases=[
-                                    "确认两个市场的结算规则完全一致",
-                                    "确认结算时间相同",
-                                    "检查边界值处理是否相同"
-                                ],
-                                needs_review=[
-                                    f"价差: {spread:.4f} ({spread*100:.2f} cents)",
-                                    f"Event1 slug: {event1_slug}",
-                                    f"Event2 slug: {event2_slug}"
-                                ],
-                                timestamp=datetime.now().isoformat()
-                            ))
-
-        return opportunities
-
-    def check_event_implication_arbitrage(
-        self,
-        event_slug: str,
-        client: 'PolymarketClient'
-    ) -> List[ArbitrageOpportunity]:
-        """
-        检测同一Event内的蕴含关系套利（单调性违反）
-
-        例如：在"Bitcoin above" event中
-        - P(>98k) 蕴含 P(>96k)
-        - 应该满足: P(>96k) >= P(>98k)
-        - 如果违反，则存在套利机会
-
-        Args:
-            event_slug: Event slug
-            client: PolymarketClient实例
-
-        Returns:
-            检测到的套利机会列表
-        """
-        opportunities = []
-
-        # 获取event的所有市场
-        markets = client.get_markets_in_event(event_slug)
-        if not markets:
-            return opportunities
-
-        # 识别阈值递增序列（如 ">78k", ">80k", ">82k" ...）
-        threshold_markets = self._extract_threshold_markets(markets)
-        if len(threshold_markets) < 2:
-            return opportunities
-
-        # 按阈值排序
-        threshold_markets.sort(key=lambda m: m.get("threshold_value", float("inf")))
-
-        # 检查单调性: P(>T1) >= P(>T2) if T1 < T2
-        for i in range(len(threshold_markets) - 1):
-            m_lower = threshold_markets[i]["market"]   # 较低阈值
-            m_higher = threshold_markets[i + 1]["market"]  # 较高阈值
-
-            price_lower = m_lower.effective_buy_price
-            price_higher = m_higher.effective_buy_price
-
-            # 单调性违反: 较低阈值的价格应该 >= 较高阈值的价格
-            if price_lower < price_higher:
-                # 违反！存在套利机会
-                # 策略：买较低的阈值（YES），卖较高的阈值（YES）
-                total_cost = price_higher + (1 - price_lower)
-                profit = 1.0 - total_cost
-                profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
-
-                if profit_pct >= self.min_profit_pct:
-                    t_lower = threshold_markets[i]["threshold_value"]
-                    t_higher = threshold_markets[i + 1]["threshold_value"]
-
-                    opportunities.append(ArbitrageOpportunity(
-                        id=f"event_implication_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                        type="EVENT_IMPLICATION_VIOLATION",
-                        markets=[
-                            {"id": m_lower.id, "question": m_lower.question,
-                             "yes_price": m_lower.yes_price, "threshold": t_lower},
-                            {"id": m_higher.id, "question": m_higher.question,
-                             "yes_price": m_higher.yes_price, "threshold": t_higher}
-                        ],
-                        relationship="implication_violation",
-                        confidence=0.85,
-                        total_cost=total_cost,
-                        guaranteed_return=1.0,
-                        profit=profit,
-                        profit_pct=profit_pct,
-                        action=f"买 '{m_lower.question[:50]}...' YES @ ${price_lower:.3f}\n"
-                               f"买 '{m_higher.question[:50]}...' NO @ ${(1 - price_higher):.3f}",
-                        reasoning=f"蕴含关系违反：P(>{t_lower}) = ${price_lower:.3f} < P(>{t_higher}) = ${price_higher:.3f}\n"
-                                 f"应该满足: P(>{t_lower}) >= P(>{t_higher})",
-                        edge_cases=[
-                            "确认两个市场的结算规则一致",
-                            "确认结算时间相同",
-                            "验证阈值提取正确"
-                        ],
-                        needs_review=[
-                            f"违反程度: {price_higher - price_lower:.4f}",
-                            f"Event: {event_slug}"
-                        ],
-                        timestamp=datetime.now().isoformat()
-                    ))
-
-        return opportunities
-
-    def _are_equivalent_markets(self, m1: Market, m2: Market) -> bool:
-        """
-        判断两个市场是否等价（问同一问题）
-
-        改进逻辑：
-        1. 相同的结算日期
-        2. 检查否定关系词对 - 如果存在则为互补市场，非等价
-        3. 数字和关键词相似度检查
-        4. 同义词识别（> / above, less / below等）
-
-        Args:
-            m1: 第一个市场
-            m2: 第二个市场
-
-        Returns:
-            是否等价
-        """
-        # 结算日期必须相同
-        if m1.end_date != m2.end_date:
-            return False
-
-        q1 = m1.question.lower()
-        q2 = m2.question.lower()
-
-        # 首先检查是否是互补（否定）关系
-        # 如果问题是互补的，则不等价
-        negation_pairs = [
-            ("less than", "above"),
-            ("less than", "greater than"),
-            ("below", "above"),
-            ("below", "greater than"),
-            ("under", "above"),
-            ("under", "over"),
-            ("<", ">"),
-            ("≤", "≥"),
-            ("<=", ">="),
-        ]
-
-        for neg1, neg2 in negation_pairs:
-            # 检查m1是否有neg1且m2有neg2，或反之
-            has_neg1_in_q1 = neg1 in q1
-            has_neg2_in_q1 = neg2 in q1
-            has_neg1_in_q2 = neg1 in q2
-            has_neg2_in_q2 = neg2 in q2
-
-            # 如果一个问题包含否定词对中的一个，另一个包含另一个
-            # 则它们是互补的，不等价
-            if (has_neg1_in_q1 and has_neg2_in_q2) or (has_neg2_in_q1 and has_neg1_in_q2):
-                return False
-
-        # 检查数字是否相同
-        import re
-        numbers1 = re.findall(r'\d+', q1)
-        numbers2 = re.findall(r'\d+', q2)
-
-        if not numbers1 or not numbers2 or numbers1 != numbers2:
-            return False
-
-        # 同义词映射 - 在相似度计算前进行标准化
-        synonym_map = {
-            ">": "above",
-            ">=": "at least",
-            "greater than": "above",
-            "over": "above",
-            "exceed": "above",
-            "<": "below",
-            "<=": "at most",
-            "less than": "below",
-            "under": "below",
-        }
-
-        # 标准化问题文本
-        q1_normalized = q1
-        q2_normalized = q2
-        for old, new in synonym_map.items():
-            q1_normalized = q1_normalized.replace(old, new)
-            q2_normalized = q2_normalized.replace(old, new)
-
-        # 进一步检查关键词相似度
-        keywords1 = set(re.findall(r'[a-z]+', q1_normalized))
-        keywords2 = set(re.findall(r'[a-z]+', q2_normalized))
-
-        # 移除停用词（常见但不具区分度的词）
-        stopwords = {'the', 'a', 'an', 'on', 'in', 'at', 'by', 'for', 'to', 'of', 'will', 'be', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'}
-        keywords1 -= stopwords
-        keywords2 -= stopwords
-
-        # 计算关键词相似度
-        intersection = keywords1 & keywords2
-        union = keywords1 | keywords2
-        similarity = len(intersection) / len(union) if union else 0
-
-        return similarity > 0.4  # 降低阈值到40%（因为标准化后关键词更少了）  # 50%相似度阈值
-
-    def _extract_threshold_markets(self, markets: List[Market]) -> List[Dict]:
-        """
-        从市场列表中提取阈值市场
-
-        阈值市场示例："Will BTC be above $98,000?"
-        提取阈值: 98000
-
-        Args:
-            markets: Market列表
-
-        Returns:
-            [{"threshold_value": 98000, "market": Market}, ...]
-        """
-        threshold_markets = []
-        import re
-
-        for market in markets:
-            # 查找问题中的数字
-            question = market.question.lower()
-
-            # 匹配 "above $X" 或 "above X" 或 "> X" 模式
-            match = re.search(r'above\s*\$?(\d+)', question)
-            if match:
-                threshold = int(match.group(1))
-                threshold_markets.append({
-                    "threshold_value": threshold,
-                    "market": market
-                })
-                continue
-
-            # 匹配 ">X,000" 模式
-            match = re.search(r'(\d+)k', question)
-            if match:
-                threshold = int(match.group(1)) * 1000
-                threshold_markets.append({
-                    "threshold_value": threshold,
-                    "market": market
-                })
-
-        return threshold_markets
-
-    # ============================================================
-    # ✅ 新增: 跨Event区间套利检测
-    # ============================================================
-
-    def check_cross_event_interval_arbitrage(
-        self,
-        all_markets: List[Market]
-    ) -> List[ArbitrageOpportunity]:
-        """
-        检测跨Event的区间套利机会
-
-        支持的套利类型：
-        1. 阈值-区间蕴含关系: P(>92k) vs P(92k-94k) + P(94k-96k) + P(>98k)
-        2. 等价市场: 阈值 ">98k" vs 区间 ">98k"
-        3. 跨Event完备集: 组合多个Event的市场形成完备集
-
-        Args:
-            all_markets: 所有市场列表
-
-        Returns:
-            套利机会列表
-        """
-        from interval_parser_v2 import IntervalParser
-        from collections import defaultdict
-
-        opportunities = []
-
-        # 1. 按标的资产分组（通过结算日期和关键词）
-        asset_groups = self._group_by_asset(all_markets)
-
-        for asset_key, markets in asset_groups.items():
-            # 分离区间型和阈值型市场
-            range_markets = [m for m in markets if m.interval_type == "range"]
-            above_markets = [m for m in markets if m.interval_type == "above"]
-            below_markets = [m for m in markets if m.interval_type == "below"]
-
-            # 至少需要一些区间市场才能进行套利分析
-            if len(range_markets) < 2 and len(above_markets) < 2:
-                continue
-
-            # 类型1: 阈值-区间蕴含关系套利
-            opps = self._check_implication_arbitrage(above_markets, range_markets)
-            opportunities.extend(opps)
-
-            # 类型2: 等价市场套利
-            opps = self._check_equivalent_markets(above_markets, range_markets)
-            opportunities.extend(opps)
-
-        return opportunities
-
-    def _group_by_asset(self, markets: List[Market]) -> Dict[str, List[Market]]:
-        """
-        按标的资产分组
-
-        通过结算日期和关键词将市场分组
-        """
-        groups = defaultdict(list)
-
-        for market in markets:
-            # 使用结算日期作为主要分组键
-            date_key = market.end_date.split('T')[0] if market.end_date else "unknown"
-
-            # 检测资产类型关键词
-            asset_type = "unknown"
-            keywords_lower = market.question.lower()
-            if "bitcoin" in keywords_lower or "btc" in keywords_lower:
-                asset_type = "btc"
-            elif "ethereum" in keywords_lower or "eth" in keywords_lower:
-                asset_type = "eth"
-            elif "solana" in keywords_lower or "sol" in keywords_lower:
-                asset_type = "sol"
-
-            # 组合键: date_asset
-            group_key = f"{date_key}_{asset_type}"
-            groups[group_key].append(market)
-
-        return dict(groups)
-
-    def _check_implication_arbitrage(
-        self,
-        above_markets: List[Market],
-        range_markets: List[Market]
-    ) -> List[ArbitrageOpportunity]:
-        """
-        检测阈值-区间蕴含关系套利
-
-        逻辑：阈值 ">X" 蕴含所有下界 >= X 的区间
-        例如：P(>92k) ≈ P(92k-94k) + P(94k-96k) + P(>98k)
-
-        如果实际价格偏离理论关系，可能存在套利机会
-        """
-        opportunities = []
-
-        for above_m in above_markets:
-            if above_m.interval_lower is None:
-                continue
-
-            # 找到所有下界 >= 阈值下界的区间市场（包括range和above类型）
-            relevant_ranges = [
-                m for m in range_markets
-                if m.interval_lower is not None and m.interval_lower >= above_m.interval_lower
-            ]
-
-            if len(relevant_ranges) < 1:
-                continue
-
-            # 计算区间市场的YES价格总和
-            range_sum = sum(m.yes_price for m in relevant_ranges)
-            above_price = above_m.yes_price
-
-            # 检查价格差异
-            # 理论上：P(>X) ≈ sum(所有下界>=X的区间)
-            # 如果 P(>X) > sum(区间)，可能存在套利：卖阈值YES，买区间YES组合
-            # 如果 P(>X) < sum(区间) - 容差，可能存在套利：买阈值YES，卖区间NO组合
-
-            diff = range_sum - above_price
-            tolerance = 0.02  # 2% 容差（降低阈值以提高灵敏度）
-
-            if abs(diff) > tolerance:
-                # 发现套利机会
-                profit_pct = abs(diff) / above_m.yes_price * 100
-
-                if profit_pct >= self.min_profit_pct:
-                    # 确定套利方向
-                    if above_price > range_sum:
-                        # 阈值被高估：卖阈值YES，买区间YES组合
-                        direction = "sell_above_buy_ranges"
-                        reasoning = (f"阈值 {above_m.group_item_title} (YES={above_price:.1%}) "
-                                    f"高于相关区间总和 (YES={range_sum:.1%})")
-                        action = (f"卖 '{above_m.question[:50]}...' YES\n"
-                                f"买相关区间的YES组合")
-                    else:
-                        # 阈值被低估：买阈值YES，卖区间NO组合
-                        direction = "buy_above_sell_ranges"
-                        reasoning = (f"阈值 {above_m.group_item_title} (YES={above_price:.1%}) "
-                                    f"低于相关区间总和 (YES={range_sum:.1%})")
-                        action = (f"买 '{above_m.question[:50]}...' YES\n"
-                                f"卖相关区间的NO组合")
-
-                    opp = ArbitrageOpportunity(
-                        id=f"interval_impl_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                        type="INTERVAL_IMPLICATION",
-                        markets=[
-                            {"id": above_m.id, "question": above_m.question, "yes_price": above_m.yes_price,
-                             "type": "above", "interval_lower": above_m.interval_lower}
-                        ] + [
-                            {"id": m.id, "question": m.question, "yes_price": m.yes_price,
-                             "type": "range", "interval_lower": m.interval_lower, "interval_upper": m.interval_upper}
-                            for m in relevant_ranges
-                        ],
-                        relationship="interval_implication",
-                        confidence=0.7,  # 基于规则的套利，置信度设为中等
-                        total_cost=range_sum,
-                        guaranteed_return=1.0,
-                        profit=abs(diff),
-                        profit_pct=profit_pct,
-                        action=action,
-                        reasoning=reasoning,
-                        edge_cases=[],
-                        needs_review=[
-                            "验证区间划分规则",
-                            "确认结算规则一致性",
-                            f"理论值差异: {diff:.1%}"
-                        ],
-                        timestamp=datetime.now().isoformat()
-                    )
-                    opportunities.append(opp)
-
-        return opportunities
-
-    def _check_equivalent_markets(
-        self,
-        above_markets: List[Market],
-        range_markets: List[Market]
-    ) -> List[ArbitrageOpportunity]:
-        """
-        检测等价市场套利
-
-        例如：
-        - 阈值 ">98k" vs 区间 ">98k" 应该价格相同
-        - 组合等价：P(>94k) - P(>96k) ≈ P(94k-96k)
-        """
-        opportunities = []
-
-        # 类型1: 完全等价（阈值 vs 阈值）
-        for above_m in above_markets:
-            if above_m.interval_lower is None:
-                continue
-
-            # 查找相同的above区间
-            for range_m in range_markets:
-                if (range_m.interval_type == "above" and
-                    range_m.interval_lower is not None and
-                    abs(range_m.interval_lower - above_m.interval_lower) < 1):  # 几乎相等
-
-                    # 检查价格差异
-                    price_diff = abs(above_m.yes_price - range_m.yes_price)
-                    if price_diff > 0.02:  # 2% 差异阈值
-                        profit_pct = price_diff / min(above_m.yes_price, range_m.yes_price) * 100
-
-                        if profit_pct >= self.min_profit_pct:
-                            # 买便宜的，卖贵的
-                            if above_m.yes_price < range_m.yes_price:
-                                cheaper, expensive = above_m, range_m
-                            else:
-                                cheaper, expensive = range_m, above_m
-
-                            opportunities.append(ArbitrageOpportunity(
-                                id=f"equiv_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-                                type="EQUIVALENT_MARKETS",
-                                markets=[
-                                    {"id": cheaper.id, "question": cheaper.question,
-                                     "yes_price": cheaper.yes_price, "type": cheaper.interval_type},
-                                    {"id": expensive.id, "question": expensive.question,
-                                     "yes_price": expensive.yes_price, "type": expensive.interval_type}
-                                ],
-                                relationship="equivalent",
-                                confidence=0.9,  # 等价市场套利置信度较高
-                                total_cost=cheaper.yes_price,
-                                guaranteed_return=expensive.yes_price,
-                                profit=price_diff,
-                                profit_pct=profit_pct,
-                                action=f"买 '{cheaper.question[:50]}...' YES @ {cheaper.yes_price:.1%}\n"
-                                       f"卖 '{expensive.question[:50]}...' YES @ {expensive.yes_price:.1%}",
-                                reasoning=f"等价市场存在价格差异: {price_diff:.1%}",
-                                edge_cases=[],
-                                needs_review=["验证结算规则完全一致"],
-                                timestamp=datetime.now().isoformat()
-                            ))
-
-        return opportunities
-
-
-# ============================================================
-# 相似度筛选器
-# ============================================================
-
-class SimilarityFilter:
-    """市场相似度筛选器"""
-    
-    def __init__(self, threshold: float = 0.3):
-        self.threshold = threshold
-    
-    def find_similar_pairs(self, markets: List[Market]) -> List[Tuple[Market, Market, float]]:
-        """找出相似的市场对"""
-        pairs = []
-        
-        for i, m1 in enumerate(markets):
-            for m2 in markets[i+1:]:
-                score = self._calculate_similarity(m1, m2)
-                if score >= self.threshold:
-                    pairs.append((m1, m2, score))
-        
-        pairs.sort(key=lambda x: x[2], reverse=True)
-        return pairs
-    
-    def _calculate_similarity(self, m1: Market, m2: Market) -> float:
-        """计算相似度"""
-        stop_words = {'will', 'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'by', 'be', 'is', 'are'}
-        
-        words1 = set(m1.question.lower().split()) - stop_words
-        words2 = set(m2.question.lower().split()) - stop_words
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        intersection = len(words1 & words2)
-        union = len(words1 | words2)
-        jaccard = intersection / union if union > 0 else 0
-        
-        # 同一事件加分
-        if m1.event_id and m1.event_id == m2.event_id:
-            jaccard = min(1.0, jaccard + 0.4)
-        
-        # 同结算日加分
-        if m1.end_date and m1.end_date == m2.end_date:
-            jaccard = min(1.0, jaccard + 0.1)
-        
-        return jaccard
 
 
 # ============================================================
@@ -2964,38 +1867,21 @@ class ArbitrageScanner:
         config: AppConfig,
         profile_name: str = None,
         model_override: str = None,
-        use_semantic: bool = True,
-        run_mode: RunMode = RunMode.PRODUCTION,
-        # @deprecated 使用 run_mode 代替
-        verify_mode: bool = False,
-        verify_auto_save: bool = False
+        run_mode: RunMode = RunMode.PRODUCTION
     ):
         """
         Args:
             config: 配置对象
             profile_name: LLM配置名称
             model_override: 模型覆盖
-            use_semantic: 是否启用向量化模式（默认True）
             run_mode: 运行模式 (DEBUG=暂停确认, PRODUCTION=自动保存)
-            verify_mode: @deprecated，使用 run_mode 代替
-            verify_auto_save: @deprecated，DEBUG模式下自动保存所有机会
         """
         self.config = config
         self.profile_name = profile_name
         self.model_override = model_override
-        self.use_semantic = use_semantic and hasattr(config.scan, 'use_semantic_clustering') and config.scan.use_semantic_clustering
 
-        # 🆕 运行模式（优先使用 run_mode，否则从 verify_mode 推断）
-        if run_mode != RunMode.PRODUCTION:
-            self.run_mode = run_mode
-        elif verify_mode:
-            self.run_mode = RunMode.DEBUG
-        else:
-            self.run_mode = RunMode.PRODUCTION
-
-        # 向后兼容：保留旧属性
-        self.verify_mode = (self.run_mode == RunMode.DEBUG)
-        self.verify_auto_save = verify_auto_save
+        # 运行模式
+        self.run_mode = run_mode
 
         # 成员变量
         self.false_positive_log = []   # 误报日志
@@ -3008,260 +1894,74 @@ class ArbitrageScanner:
         # ✅ 传入 LLM 分析器，用于完备集语义验证
         self.detector = ArbitrageDetector(config, llm_analyzer=self.analyzer)
 
-        # 🆕 向量化组件
-        if self.use_semantic:
-            self.semantic_clusterer = SemanticClusterer()
-            self.market_cache = MarketCache(
-                cache_dir=config.output.cache_dir,
-                cache_ttl=getattr(config.scan, 'cache_ttl', 3600)
-            )
-            self.domain_classifier = MarketDomainClassifier()
-            logging.info("✅ 向量化模式已启用")
-        else:
-            self.filter = SimilarityFilter(config.scan.similarity_threshold)
-            logging.info("⚠️ 传统模式（关键词搜索）")
-    
-    def scan(self) -> List[ArbitrageOpportunity]:
-        """执行完整扫描"""
-        opportunities = []
-
-        self._print_header()
-
-        # Step 1: 获取市场
-        print("\n[1/6] 获取市场数据...")
-        markets = self.client.get_markets(
-            limit=self.config.scan.market_limit,
-            min_liquidity=self.config.scan.min_liquidity
+        # 市场缓存和分类组件（策略系统需要）
+        self.market_cache = MarketCache(
+            cache_dir=config.output.cache_dir,
+            cache_ttl=getattr(config.scan, 'cache_ttl', 3600)
         )
-        print(f"      获取到 {len(markets)} 个高流动性市场")
+        self.domain_classifier = MarketDomainClassifier()
 
-        if not markets:
-            print("      ❌ 无法获取市场数据")
-            return []
+        # ✅ 新增：语义聚类器 (Phase 2.6)
+        try:
+            self.clusterer = SemanticClusterer()
+        except Exception as e:
+            logging.warning(f"无法初始化语义聚类器: {e}，将禁用语义聚类功能")
+            self.clusterer = None
 
-        # Step 2: 扫描区间市场套利 (跨Event区间关系套利)
-        print("\n[2/6] 扫描区间市场套利...")
-        interval_opps = self.detector.check_cross_event_interval_arbitrage(markets)
-        print(f"      发现 {len(interval_opps)} 个区间套利机会")
-        for opp in interval_opps:
-            print(f"        [ARBITRAGE] {opp.strategy_type}: 利润={opp.profit_pct:.2f}%")
+        # ✅ 新增：动态分类组件 (v3.1)
+        self.category_discovery = None
+        self.use_dynamic_categories = getattr(config.scan, 'use_dynamic_categories', False)
 
-            # 统一处理机会发现（根据模式决定是否暂停）
-            if not self._on_opportunity_found(opp, opportunities):
-                self._save_false_positive_log()
-                self._save_discovered_opportunities()
-                return opportunities
+        # ✅ 新增：验证引擎 (v2.5)
+        self.validation_engine = ValidationEngine(config)
 
-        # Step 3: 检查完备集
-        print("\n[3/6] 扫描完备集套利...")
-        event_groups = self._group_by_event(markets)
-        print(f"      发现 {len(event_groups)} 个事件组")
+        # ✅ 新增：通知系统 (Phase 3.3)
+        self.notifier = ArbitrageNotifier(config)
 
-        for event_id, group in event_groups.items():
-            if len(group) >= 2:
-                total = sum(m.yes_price for m in group)
-                if self.config.output.detailed_log:
-                    print(f"      - {event_id}: {len(group)}个市场, Σ={total:.3f}")
-
-                opp = self.detector.check_exhaustive_set(group)
-                if opp:
-                    print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
-
-                    # 统一处理机会发现（根据模式决定是否暂停）
-                    if not self._on_opportunity_found(opp, opportunities):
-                        self._save_false_positive_log()
-                        self._save_discovered_opportunities()
-                        return opportunities
-
-        # Step 4: 分析相似市场对
-        print("\n[4/6] 分析逻辑关系...")
-        similar_pairs = self.filter.find_similar_pairs(markets)
-        print(f"      发现 {len(similar_pairs)} 对相似市场")
-
-        analyzed = 0
-        max_calls = self.config.scan.max_llm_calls
-
-        for m1, m2, sim in similar_pairs:
-            if analyzed >= max_calls:
-                break
-
-            # 跳过同一事件的（已在完备集检查中处理）
-            if m1.event_id and m1.event_id == m2.event_id:
-                continue
-
-            analyzed += 1
-            if self.config.output.detailed_log:
-                print(f"      分析 #{analyzed}: {m1.question[:40]}... vs {m2.question[:40]}...")
-
-            analysis = self.analyzer.analyze(m1, m2)
-            rel = analysis.get("relationship", "UNRELATED")
-            conf = analysis.get("confidence", 0)
-
-            if self.config.output.detailed_log:
-                print(f"        关系={rel}, 置信度={conf:.2f}")
-
-            opp = self.detector.check_pair(m1, m2, analysis)
-            if opp:
-                print(f"        [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
-
-                # 统一处理机会发现（根据模式决定是否暂停）
-                if not self._on_opportunity_found(opp, opportunities):
-                    self._save_false_positive_log()
-                    self._save_discovered_opportunities()
-                    return opportunities
-
-        # Step 5: 生成报告
-        print("\n[5/6] 生成报告...")
-        self._save_report(opportunities)
-        self._print_summary(opportunities)
-
-        # 验证模式：保存误报日志和所有发现的机会
-        self._save_false_positive_log()
-        self._save_discovered_opportunities()
-
-        return opportunities
-
-    def scan_semantic(
-        self,
-        domain: str = "crypto",
-        semantic_threshold: float = 0.85,
-        subcategories: List[str] = None,
-        force_refresh: bool = False  # 🆕 新增参数（v2.1）
-    ) -> List[ArbitrageOpportunity]:
-        """
-        向量化驱动的套利扫描（新流程）
-
-        流程：
-        1. 获取领域内所有市场（带缓存）
-        2. 批量向量化
-        3. 语义聚类
-        4. 全自动聚类内套利分析
-        5. 生成报告
-
-        Args:
-            domain: 市场领域 ("crypto", "politics", "sports", "other")
-            semantic_threshold: 聚类相似度阈值 (0.0-1.0)
-            subcategories: 子类别筛选 (如 ["bitcoin", "ethereum"])，None表示获取全部
-            force_refresh: 强制刷新缓存，重新获取数据
-
-        Returns:
-            套利机会列表
-        """
-        logging.info(f"[START] 开始向量化套利扫描 - 领域: {domain}")
-        if subcategories:
-            logging.info(f"[START] 子类别筛选: {', '.join(subcategories)}")
-
-        # Step 1: 获取领域内所有市场（带缓存）
-        logging.info("[Step 1] 获取市场数据...")
-        all_markets = self._fetch_domain_markets(domain, subcategories, force_refresh)
-
-        if not all_markets:
-            logging.warning("[ERROR] 未获取到市场数据")
-            return []
-
-        logging.info(f"[OK] 获取到 {len(all_markets)} 个市场")
-
-        # Step 2: 批量向量化
-        logging.info(f"[Step 2] 向量化 {len(all_markets)} 个市场...")
-        questions = [m.question for m in all_markets]
-        embeddings = self.semantic_clusterer.get_embeddings(questions)
-        logging.info(f"[OK] 向量化完成")
-
-        # Step 3: 语义聚类
-        logging.info(f"[Step 3] 语义聚类 (threshold={semantic_threshold})...")
-        clusters = self.semantic_clusterer.cluster_markets(
-            all_markets,
-            similarity_threshold=semantic_threshold
+        # ✅ 新增：时间序列数据记录器 (Phase 6.1)
+        self.recorder = TimeSeriesRecorder(
+            db_path=Path(self.config.output.output_dir) / "market_history.db"
         )
-        logging.info(f"[OK] 生成 {len(clusters)} 个语义聚类")
 
-        # 打印聚类摘要
-        for i, cluster in enumerate(clusters):
-            if len(cluster) > 1:
-                logging.info(f"  聚类 {i+1}: {len(cluster)} 个市场")
-                if self.config.output.detailed_log and len(cluster) <= 5:
-                    for j, m in enumerate(cluster[:3]):
-                        logging.info(f"    {j+1}. {m.question[:50]}...")
+        # ✅ 新增：WebSocket 实时客户端 (Phase 8)
+        self.ws_client = PolymarketWSClient()
+        self._ws_task = None
 
-        # Step 4: 全自动聚类内套利分析
-        logging.info("🔍 Step 4: 聚类内套利分析...")
-        opportunities = []  # 初始化机会列表
-        llm_call_count = 0
-        max_llm_calls = self.config.scan.max_llm_calls
+        # ✅ 新增：执行引擎 (Phase 4.1)
+        # 🆕 传入 recorder 和 WebSocket 缓存 (Phase 8)
+        self.execution_engine = ExecutionEngine(self.client, config, self.recorder, self.ws_client.cache)
 
-        for i, cluster in enumerate(clusters):
-            if len(cluster) < 2:
-                continue
+        logging.info("✅ 策略系统组件、验证引擎、通知器、执行引擎、聚类器、记录器与 WS 客户端已初始化")
 
-            logging.info(f"  📦 聚类 {i+1}/{len(clusters)} ({len(cluster)} 个市场)")
+    def start_websocket(self, token_ids: List[str] = None):
+        """
+        [Phase 8] 启动 WebSocket 实时监听任务
+        """
+        import threading
+        import asyncio
 
-            # 4.1 聚类内完备集检测
-            # =====================================
-            # 关键改进：先按 event_id 分组，只对同一 event 的市场检测完备集
-            # 语义聚类只是基于文本相似度，不代表逻辑上的完备集
-            # =====================================
-            event_groups = {}
-            for m in cluster:
-                if m.event_id:
-                    event_groups.setdefault(m.event_id, []).append(m)
+        if self._ws_task and not self._ws_task.done():
+            if token_ids:
+                asyncio.run_coroutine_threadsafe(self.ws_client.subscribe(token_ids), self._loop)
+            return
 
-            # 对每个 event 组单独检测完备集
-            for event_id, event_markets in event_groups.items():
-                if len(event_markets) >= 2:
-                    logging.info(f"    检测完备集: event_id={event_id[:30]}... ({len(event_markets)} 个市场)")
-                    opps = self.detector.check_exhaustive_set(event_markets)
-                    if opps:
-                        # 确保opps是列表
-                        if isinstance(opps, list):
-                            for opp in opps:
-                                logging.info(f"    [ARBITRAGE] 完备集套利! 利润={opp.profit_pct:.2f}%")
-                                # 统一处理机会发现（根据模式决定是否暂停）
-                                if not self._on_opportunity_found(opp, opportunities):
-                                    self._save_false_positive_log()
-                                    self._save_discovered_opportunities()
-                                    return opportunities
-                        else:
-                            logging.info(f"    [ARBITRAGE] 完备集套利! 利润={opps.profit_pct:.2f}%")
-                            # 统一处理机会发现（根据模式决定是否暂停）
-                            if not self._on_opportunity_found(opps, opportunities):
-                                self._save_false_positive_log()
-                                self._save_discovered_opportunities()
-                                return opportunities
+        def run_ws_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            if token_ids:
+                self.ws_client.assets_ids.extend(token_ids)
+            self._loop.run_until_complete(self.ws_client.connect())
 
-            # 4.2 聚类内全对LLM分析
-            cluster_opps, should_continue = self._analyze_cluster_fully(
-                cluster,
-                cluster_id=i,
-                max_llm_calls=max_llm_calls - llm_call_count,
-                opportunities=opportunities  # 传入主列表，用于验证模式
-            )
-            # 注意：opportunities 已经在 _analyze_cluster_fully 中更新了
-            # 不需要再次 extend
-            llm_call_count += len(cluster) * (len(cluster) - 1) // 2  # 估算
+        self._ws_thread = threading.Thread(target=run_ws_loop, daemon=True)
+        self._ws_thread.start()
+        logging.info(f"WebSocket 监听线程已启动，预订阅 {len(token_ids) if token_ids else 0} 个资产")
 
-            # 🆕 检查是否应该继续（验证模式下用户可能选择退出）
-            if not should_continue:
-                # 用户选择退出，提前结束扫描
-                self._save_false_positive_log()
-                self._save_discovered_opportunities()
-                return opportunities
-
-            if llm_call_count >= max_llm_calls:
-                logging.warning(f"[WARNING] 达到LLM调用限制 ({max_llm_calls})")
-                break
-
-        # Step 5: 生成报告
-        logging.info("[Step 5] 生成报告...")
-        self._save_report(opportunities, domain=domain)
-        self._print_summary(opportunities)
-
-        # 🆕 验证模式：保存误报日志和所有发现的机会
-        self._save_false_positive_log()
-        self._save_discovered_opportunities()
-
-        logging.info(f"[DONE] 扫描完成: 发现 {len(opportunities)} 个套利机会")
-
-        return opportunities
+    def stop_websocket(self):
+        """停止 WebSocket 监听"""
+        self.ws_client.stop()
+        if hasattr(self, '_loop'):
+            self._loop.stop()
+        logging.info("WebSocket 监听已停止")
 
     def _load_tag_categories(self) -> Dict[str, List[str]]:
         """
@@ -3302,6 +2002,174 @@ class ArbitrageScanner:
 
         # 如果没有找到相关标签，至少返回原始输入（可能是无效的，后续会验证）
         return related if related else [subcat]
+
+    # ============================================================
+    # 🆕 动态分类管理方法 (v3.1新增)
+    # ============================================================
+
+    def get_category_discovery(self) -> CategoryDiscovery:
+        """
+        获取或初始化分类发现引擎
+
+        Returns:
+            CategoryDiscovery 实例
+        """
+        if self.category_discovery is None:
+            self.category_discovery = CategoryDiscovery(
+                polymarket_client=self.client,
+                llm_profile_name=self.profile_name,
+                output=ScannerOutput() if CLI_AVAILABLE else None
+            )
+        return self.category_discovery
+
+    def get_available_categories(self, force_refresh: bool = False) -> List[CategoryInfo]:
+        """
+        获取所有可用的扫描类别
+
+        Args:
+            force_refresh: 是否强制重新发现
+
+        Returns:
+            CategoryInfo 对象列表
+        """
+        if self.use_dynamic_categories:
+            try:
+                discovery = self.get_category_discovery()
+                cache = discovery.discover_categories(
+                    max_categories=getattr(self.config.scan, 'category_discovery_max', 12),
+                    min_tags_per_category=getattr(self.config.scan, 'category_discovery_min_tags', 5),
+                    force_refresh=force_refresh
+                )
+
+                # 转换为 CategoryInfo 对象列表
+                categories = []
+                for cat_dict in cache.categories:
+                    # 处理从 JSON 加载时的 set/list 转换
+                    included_tags = cat_dict.get('included_tags', set())
+                    if isinstance(included_tags, list):
+                        included_tags = set(included_tags)
+
+                    categories.append(CategoryInfo(
+                        id=cat_dict['id'],
+                        name_zh=cat_dict['name_zh'],
+                        name_en=cat_dict['name_en'],
+                        description=cat_dict['description'],
+                        representative_tags=cat_dict['representative_tags'],
+                        market_count=cat_dict['market_count'],
+                        discovery_confidence=cat_dict['discovery_confidence'],
+                        created_at=cat_dict['created_at'],
+                        included_tags=included_tags,
+                        icon=cat_dict.get('icon', ''),
+                        priority=cat_dict.get('priority', 999)
+                    ))
+                return sorted(categories, key=lambda x: x.priority)
+            except Exception as e:
+                logging.error(f"[ERROR] 动态分类发现失败: {e}")
+                logging.info("回退到固定分类模式")
+                return self._get_fixed_domain_categories()
+        else:
+            return self._get_fixed_domain_categories()
+
+    def _get_fixed_domain_categories(self) -> List[CategoryInfo]:
+        """
+        获取硬编码的固定分类（用于向后兼容）
+
+        Returns:
+            CategoryInfo 列表
+        """
+        tag_categories = self._load_tag_categories()
+        if not tag_categories:
+            return []
+
+        # 映射中文名称和图标
+        meta = {
+            "crypto": ("加密货币", "Cryptocurrency", "₿", 1),
+            "politics": ("政治", "Politics", "🏛️", 2),
+            "sports": ("体育", "Sports", "🏀", 3),
+            "economics": ("经济", "Economics", "📈", 4),
+            "entertainment": ("娱乐", "Entertainment", "🎬", 5),
+            "other": ("其他", "Other", "📦", 999)
+        }
+
+        categories = []
+        for domain, tags in tag_categories.items():
+            name_zh, name_en, icon, priority = meta.get(domain, (domain, domain.capitalize(), "📁", 100))
+            categories.append(CategoryInfo(
+                id=domain,
+                name_zh=name_zh,
+                name_en=name_en,
+                description=f"{name_zh}相关的预测市场",
+                representative_tags=tags[:10],
+                included_tags=set(tags),
+                market_count=0, # 固定模式不统计
+                discovery_confidence=1.0,
+                created_at=datetime.now(UTC).isoformat(),
+                icon=icon,
+                priority=priority
+            ))
+
+        return sorted(categories, key=lambda x: x.priority)
+
+    def fetch_markets_for_category(
+        self,
+        category: CategoryInfo,
+        limit: int = 500,
+        force_refresh: bool = False
+    ) -> List[Market]:
+        """
+        为指定类别获取市场数据
+
+        Args:
+            category: 类别对象
+            limit: 最大获取数量
+            force_refresh: 是否强制刷新缓存
+
+        Returns:
+            市场列表
+        """
+        # 如果是固定域，尝试使用现有的缓存机制
+        if not self.use_dynamic_categories:
+            return self._fetch_domain_markets(category.id, force_refresh=force_refresh)
+
+        # 动态分类的市场获取策略
+        def fetcher():
+            # 优先使用代表性标签获取
+            tag_slugs = category.representative_tags
+            if not tag_slugs:
+                # 如果没有代表性标签，使用全部标签的前20个（避免请求过多）
+                tag_slugs = sorted(list(category.included_tags))[:20]
+
+            logging.info(f"[FETCH] 正在获取动态分类 '{category.name_zh}' 的市场 (Tags: {len(tag_slugs)})")
+
+            all_markets = []
+            seen_ids = set()
+
+            for i, slug in enumerate(tag_slugs):
+                try:
+                    markets = self.client.get_markets_by_tag_slug(
+                        slug,
+                        active=True,
+                        limit=100,
+                        min_liquidity=self.config.scan.min_liquidity
+                    )
+                    for m in markets:
+                        if m.id not in seen_ids:
+                            all_markets.append(m)
+                            seen_ids.add(m.id)
+
+                    if (i + 1) % 5 == 0:
+                        logging.info(f"  进度: {i+1}/{len(tag_slugs)} tags, 已获取 {len(all_markets)} 个市场")
+                except Exception as e:
+                    logging.debug(f"  获取 tag '{slug}' 失败: {e}")
+                    continue
+
+            # 按流动性排序并截断
+            all_markets.sort(key=lambda x: x.liquidity, reverse=True)
+            return all_markets[:limit]
+
+        # 使用类别 ID 作为缓存键
+        cache_key = f"dynamic_cat_{category.id}"
+        return self.market_cache.load_or_fetch(cache_key, fetcher, force_refresh)
 
     def _fetch_domain_markets(self, domain: str, subcategories: List[str] = None, force_refresh: bool = False) -> List[Market]:
         """
@@ -3349,13 +2217,16 @@ class ArbitrageScanner:
                 expanded_tags = set()
 
                 for subcat in subcategories:
-                    # 验证子类别是否有效
-                    if subcat in all_tags:
-                        # 自动包含相关标签
-                        related = self._expand_subcategory(subcat, tag_slugs)
+                    # 使用模糊匹配查找相关标签
+                    related = self._expand_subcategory(subcat, tag_slugs)
+                    if related and related != [subcat]:
+                        # 找到了相关标签，添加到扩展集合
                         expanded_tags.update(related)
+                    elif subcat in all_tags:
+                        # 精确匹配，直接添加
+                        expanded_tags.add(subcat)
                     else:
-                        logging.warning(f"[WARNING] 无效的子类别将被忽略: {subcat}")
+                        logging.warning(f"[WARNING] 未找到匹配的标签: {subcat}")
 
                 tag_slugs = list(expanded_tags)
 
@@ -3400,10 +2271,59 @@ class ArbitrageScanner:
             unique_markets = []
             for m in all_markets:
                 if m.id not in seen_ids:
+                    # 🆕 市场状态和到期时间过滤 (Phase 2)
+                    if getattr(self.config.scan, 'exclude_resolved', True):
+                        # 如果没有状态字段，我们至少检查到期时间
+                        try:
+                            if m.end_date:
+                                end_dt = datetime.fromisoformat(m.end_date.replace('Z', '+00:00'))
+                                now_dt = datetime.now(UTC)
+                                hours_left = (end_dt - now_dt).total_seconds() / 3600
+                                if hours_left < getattr(self.config.scan, 'min_hours_to_expiration', 1):
+                                    continue
+                        except Exception:
+                            pass
+
                     seen_ids.add(m.id)
                     unique_markets.append(m)
 
-            logging.info(f"[DONE] 域 '{domain}' 获取到 {len(unique_markets)} 个唯一市场")
+            # 🆕 批量补充订单簿数据 (Phase 1) - 异步并发版
+            if getattr(self.config.scan, 'enable_orderbook', True):
+                logging.info(f"[ORDERBOOK] 正在为 {len(unique_markets)} 个市场并发获取实时订单簿数据...")
+
+                def fetch_task(market):
+                    try:
+                        # 获取 YES 订单簿
+                        self.client.enrich_market_with_orderbook(market)
+                        # 获取 NO 订单簿 (对单调性套利至关重要)
+                        self.client.enrich_with_no_orderbook(market)
+                        return True
+                    except Exception as e:
+                        logging.debug(f"获取订单簿失败 {market.id}: {e}")
+                        return False
+
+                # 使用线程池并发执行，RateLimiter (线程安全) 会控制实际请求频率
+                max_workers = 5
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(fetch_task, m): m for m in unique_markets}
+
+                    completed = 0
+                    for _ in as_completed(futures):
+                        completed += 1
+                        if completed % 50 == 0:
+                            logging.info(f"  进度: {completed}/{len(unique_markets)} 订单簿已同步")
+
+            logging.info(f"[DONE] 域 '{domain}' 获取到 {len(unique_markets)} 个有效市场")
+
+            # 🆕 启动 WebSocket 实时订阅 (Phase 8)
+            token_ids = []
+            for m in unique_markets:
+                if m.token_id: token_ids.append(m.token_id)
+                if m.no_token_id: token_ids.append(m.no_token_id)
+
+            if token_ids:
+                self.start_websocket(token_ids)
+
             return unique_markets
 
         # 🆕 构建缓存键：domain + subcategories（v2.1新增）
@@ -3414,75 +2334,6 @@ class ArbitrageScanner:
             cache_key = f"{domain}_{subcat_suffix}"
 
         return self.market_cache.load_or_fetch(cache_key, fetcher, force_refresh)
-
-    def _analyze_cluster_fully(
-        self,
-        cluster: List[Market],
-        cluster_id: int,
-        max_llm_calls: int = 100,
-        opportunities: List[ArbitrageOpportunity] = None
-    ) -> Tuple[List[ArbitrageOpportunity], bool]:
-        """
-        全自动聚类内分析
-
-        分析聚类内所有 C(n,2) 个市场对
-
-        Args:
-            cluster: 聚类内的市场列表
-            cluster_id: 聚类ID
-            max_llm_calls: 最大LLM调用次数
-            opportunities: 主机会列表（用于验证模式保存）
-
-        Returns:
-            (套利机会列表, 是否应该继续扫描)
-        """
-        if opportunities is None:
-            opportunities = []
-
-        local_opps = []
-        n = len(cluster)
-        llm_count = 0
-        should_continue = True
-
-        # 按流动性排序（优先分析高流动性市场）
-        cluster_sorted = sorted(cluster, key=lambda m: m.liquidity, reverse=True)
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                # 检查LLM调用限制
-                if llm_count >= max_llm_calls:
-                    logging.warning(f"    ⚠️ 达到LLM调用限制 ({max_llm_calls})")
-                    return local_opps, should_continue
-
-                m1, m2 = cluster_sorted[i], cluster_sorted[j]
-
-                # LLM关系分析
-                analysis = self.analyzer.analyze(m1, m2)
-                llm_count += 1
-
-                rel = analysis.get("relationship", "UNRELATED")
-                conf = analysis.get("confidence", 0)
-
-                # 如果有逻辑关系，检测套利
-                if rel != "UNRELATED" and rel != "unrelated":
-                    if self.config.output.detailed_log:
-                        logging.info(
-                            f"    分析 {llm_count}: <{rel}> conf={conf:.2f} "
-                            f"{m1.question[:25]}... vs {m2.question[:25]}..."
-                        )
-
-                    opp = self.detector.check_pair(m1, m2, analysis)
-                    if opp:
-                        local_opps.append(opp)
-                        logging.info(f"    [ARBITRAGE] 发现套利! 利润={opp.profit_pct:.2f}%")
-
-                        # 统一处理机会发现（根据模式决定是否暂停）
-                        if not self._on_opportunity_found(opp, opportunities):
-                            # 用户选择退出
-                            should_continue = False
-                            return local_opps, should_continue
-
-        return local_opps, should_continue
 
 
     def _generate_polymarket_links(self, markets: List[Dict]) -> List[str]:
@@ -3506,40 +2357,6 @@ class ArbitrageScanner:
 
         return links
 
-    def _group_by_event(self, markets: List[Market]) -> Dict[str, List[Market]]:
-        """按事件分组（考虑结算日期，避免将不同日期的市场误归为完备集）"""
-        groups = {}
-        for m in markets:
-            event_key = m.event_id or m.event_title
-            if event_key:
-                # 关键改进: 同时考虑 event_id 和 end_date
-                # 确保只有同一天结算的市场才归为一组
-                date_part = ""
-                if m.end_date:
-                    date_part = m.end_date.split('T')[0] if 'T' in m.end_date else m.end_date
-                key = f"{event_key}_{date_part}" if date_part else event_key
-                groups.setdefault(key, []).append(m)
-        return groups
-    
-    def _print_header(self):
-        """打印标题"""
-        if self.analyzer.profile_name:
-            llm_info = f"{self.analyzer.profile_name} / {self.analyzer.model_name or 'default'}"
-        elif self.analyzer.client:
-            llm_info = f"{self.config.llm.provider} / {self.analyzer.client.config.model}"
-        else:
-            llm_info = "规则匹配 (无LLM)"
-        
-        print(f"""
-╔═══════════════════════════════════════════════════════════════╗
-║         Polymarket 组合套利扫描系统 v2.0                       ║
-║                                                               ║
-║  LLM配置: {llm_info:<50}║
-║  最小利润: {self.config.scan.min_profit_pct}%                                              ║
-║  最小流动性: ${self.config.scan.min_liquidity:,.0f}                                       ║
-╚═══════════════════════════════════════════════════════════════╝
-        """)
-    
     def _save_report(
         self,
         opportunities: List[ArbitrageOpportunity],
@@ -3569,7 +2386,7 @@ class ArbitrageScanner:
                 "min_confidence": self.config.scan.min_confidence
             },
             "opportunities_count": len(opportunities),
-            "opportunities": [asdict(opp) for opp in opportunities]
+            "opportunities": [json_serialize(opp) for opp in opportunities]
         }
 
         with open(output_file, "w", encoding="utf-8") as f:
@@ -3577,6 +2394,323 @@ class ArbitrageScanner:
 
         logging.info(f"[OK] 报告已保存到 {output_file}")
         print(f"      [OK] 报告已保存到 {output_file}")
+
+    def _analyze_cluster_fully(self, cluster: List[Market]) -> List[ArbitrageOpportunity]:
+        """
+        [Phase 5.2] 批量分析语义聚类簇并提取机会
+        """
+        if len(cluster) < 2:
+            return []
+
+        cluster_id = f"cluster_{cluster[0].id[:8]}"
+        results = self.analyzer.analyze_cluster(cluster_id, cluster)
+
+        valid_opportunities = []
+        market_map = {m.id: m for m in cluster}
+
+        # 1. 处理点对点关系 (蕴含、等价、互斥)
+        for rel in results.get("relationships", []):
+            m_a = market_map.get(rel.get("market_a_id"))
+            m_b = market_map.get(rel.get("market_b_id"))
+
+            if not m_a or not m_b:
+                continue
+
+            # 构造基础机会对象
+            relationship = rel.get("relationship", "unknown")
+            tmp_opp = {
+                "id": f"batch_{m_a.id}_{m_b.id}",
+                "type": f"BATCH_{relationship}",
+                "relationship": relationship,
+                "markets": [
+                    {"question": m_a.question, "id": m_a.id, "yes_price": m_a.yes_price},
+                    {"question": m_b.question, "id": m_b.id, "yes_price": m_b.yes_price}
+                ],
+                "confidence": rel.get("confidence", 0.8),
+                "reasoning": rel.get("reasoning", ""),
+                "action": "执行套利",
+                "edge_cases": [],
+                "needs_review": ["批量分析识别", "请人工核实逻辑"]
+            }
+
+            # 调用已有的深度验证流程
+            # 注意：我们需要模拟一个 ArbitrageOpportunity 对象结构
+            class SimpleNamespace:
+                def __init__(self, **kwargs):
+                    self.__dict__.update(kwargs)
+
+            validated_opp = self._validate_and_enrich_opportunity(SimpleNamespace(**tmp_opp), cluster)
+            if validated_opp:
+                valid_opportunities.append(validated_opp)
+
+        # 2. 处理组合/合成机会 (完备集等)
+        for sync_opp in results.get("synthetic_opportunities", []):
+            involved_ids = sync_opp.get("market_ids", [])
+            involved_markets = [market_map[mid] for mid in involved_ids if mid in market_map]
+
+            if len(involved_markets) < 2:
+                continue
+
+            # 特殊处理完备集
+            if sync_opp.get("type") == "EXHAUSTIVE_SET":
+                from datetime import datetime
+                # 使用 MathValidator 验证完备集
+                math_report = self.validation_engine.math_validator.validate_exhaustive_set(
+                    [MarketData(id=m.id, question=m.question, yes_price=m.yes_price, no_price=m.no_price,
+                                liquidity=m.liquidity, end_date=m.end_date, best_ask=m.best_ask)
+                     for m in involved_markets]
+                )
+
+                if math_report.is_valid():
+                    final_opp = ArbitrageOpportunity(
+                        id=f"sync_{datetime.now().strftime('%H%M%S')}",
+                        type="BATCH_EXHAUSTIVE_SET",
+                        relationship="exhaustive",
+                        markets=[{"question": m.question, "id": m.id, "yes_price": m.yes_price} for m in involved_markets],
+                        confidence=0.9,
+                        total_cost=math_report.total_cost,
+                        guaranteed_return=1.0,
+                        profit=math_report.expected_profit,
+                        profit_pct=math_report.profit_pct,
+                        action=sync_opp.get("action", "买入全集"),
+                        reasoning=sync_opp.get("logic", ""),
+                        edge_cases=[],
+                        needs_review=["验证完备性", "检查结算规则"],
+                        timestamp=datetime.now().isoformat(),
+                        apy=self.validation_engine.apy_calculator.calculate_apy(
+                            math_report.profit_pct,
+                            self.validation_engine.apy_calculator.calculate_days_to_resolution(involved_markets[0].end_date)
+                        )
+                    )
+                    valid_opportunities.append(final_opp)
+
+        return valid_opportunities
+
+    def _validate_and_enrich_opportunity(self, opp: Any, markets: List[Market]) -> Optional[ArbitrageOpportunity]:
+        """
+        使用 ValidationEngine 对发现的机会执行深度验证并补充字段
+        支持 MonotonicityViolation 和标准的 ArbitrageOpportunity
+        """
+        try:
+            involved_markets = []
+            relationship = "unknown"
+
+            # 1. 识别并提取涉及的市场对象 (Phase 4 兼容性增强)
+            if hasattr(opp, 'low_market') and hasattr(opp, 'high_market'):
+                # 处理单调性策略的 MonotonicityViolation 对象
+                involved_markets = [opp.low_market.market, opp.high_market.market]
+                if getattr(opp, 'violation_type', '') == "temporal":
+                    relationship = "IMPLIES_AB"
+                else:
+                    dir_val = opp.direction.value if hasattr(opp.direction, 'value') else str(opp.direction)
+                    relationship = "IMPLIES_BA" if dir_val == "above" else "IMPLIES_AB"
+            elif hasattr(opp, 'markets') and isinstance(opp.markets, list):
+                # 处理已包装好的机会对象
+                involved_questions = [m.get('question', '') if isinstance(m, dict) else getattr(m, 'question', '') for m in opp.markets]
+                involved_markets = [m for m in markets if m.question in involved_questions]
+                relationship = getattr(opp, 'relationship', 'unknown')
+
+            if len(involved_markets) < 2:
+                return opp if isinstance(opp, ArbitrageOpportunity) else None
+
+            # 🆕 [Phase 8] 注入 WebSocket 实时价格
+            # 在验证前，优先使用 WS 缓存中的盘口数据覆盖旧的 REST API 数据
+            for m in involved_markets:
+                if m.token_id:
+                    ws_price = self.ws_client.cache.get_price(m.token_id)
+                    if ws_price:
+                        m.best_bid = ws_price["best_bid"]
+                        m.best_ask = ws_price["best_ask"]
+                if m.no_token_id:
+                    ws_price_no = self.ws_client.cache.get_price(m.no_token_id)
+                    if ws_price_no:
+                        m.best_bid_no = ws_price_no["best_bid"]
+                        m.best_ask_no = ws_price_no["best_ask"]
+
+            # 2. 执行五层验证 (Layer 2-4)
+            target_size = getattr(self.config.scan, 'target_size_usd', 500.0)
+            v_result = self.validation_engine.validate_all_layers(
+                involved_markets,
+                relationship,
+                target_size_usd=target_size
+            )
+
+            # 如果深度验证未通过，过滤掉该机会
+            if not v_result["passed"]:
+                logging.info(f"[REJECTED] {v_result['rejection_layer']}: {v_result['reason']}")
+                return None
+
+            # 3. 构造或更新标准 ArbitrageOpportunity 对象 (Phase 4 核心转换)
+            if not isinstance(opp, ArbitrageOpportunity):
+                # 从违背对象转换为标准机会格式，包含执行引擎需要的 token_id
+                opp = ArbitrageOpportunity(
+                    id=getattr(opp, 'id', f"opp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"),
+                    type=getattr(opp, 'type', 'MONOTONICITY_VIOLATION'),
+                    relationship=relationship,
+                    markets=[{
+                        "question": m.question,
+                        "id": m.id,
+                        "yes_price": m.yes_price,
+                        "token_id": getattr(m, 'token_id', ''),
+                        "no_token_id": getattr(m, 'no_token_id', '')
+                    } for m in involved_markets],
+                    confidence=getattr(opp, 'confidence', 1.0),
+                    total_cost=v_result["metrics"].get("total_cost", 0.0),
+                    guaranteed_return=1.0,
+                    profit=v_result["metrics"].get("expected_profit", 0.0),
+                    profit_pct=v_result["metrics"].get("profit_pct", 0.0),
+                    action=getattr(opp, 'action', "执行对冲套利"),
+                    reasoning=getattr(opp, 'reasoning', v_result["reason"]),
+                    edge_cases=getattr(opp, 'edge_cases', []),
+                    needs_review=getattr(opp, 'needs_review', ["验证逻辑关系", "检查结算规则"]),
+                    timestamp=datetime.now().isoformat()
+                )
+
+            # 4. 填充 11 个风控字段 (Phase 2.5)
+            metrics = v_result.get("metrics", {})
+            opp.oracle_alignment = metrics.get("oracle_alignment", "UNKNOWN")
+            opp.days_to_resolution = metrics.get("days_to_resolution", 0)
+            opp.apy = metrics.get("apy", 0.0)
+            opp.apy_rating = metrics.get("apy_rating", "N/A")
+
+            # 利润与滑点度量
+            opp.mid_price_profit = getattr(opp, 'profit', 0.0)
+            opp.effective_profit = metrics.get("expected_profit", 0.0)
+            opp.slippage_cost = metrics.get("slippage_estimate", 0.0) * target_size / 100
+
+            # 资金容量与 Gas 估算
+            liquidity_list = [m.liquidity for m in involved_markets if hasattr(m, 'liquidity')]
+            opp.max_position_usd = min(liquidity_list) * 0.1 if liquidity_list else 0.0
+            opp.gas_estimate = 0.5  # 预估 Polygon 链执行成本
+
+            opp.validation_results = v_result
+
+            # 5. 生成复核清单 (Layer 5)
+            checklist_content = self.validation_engine.generate_human_checklist(opp)
+            checklist_dir = Path(self.config.output.output_dir) / "checklists"
+            checklist_dir.mkdir(parents=True, exist_ok=True)
+            checklist_path = checklist_dir / f"checklist_{opp.id}.md"
+
+            with open(checklist_path, "w", encoding="utf-8") as f:
+                f.write(checklist_content)
+
+            opp.checklist_path = str(checklist_path)
+            logging.info(f"[VALIDATED] 机会 {opp.id} 通过深度验证，APY: {opp.apy:.1f}%")
+
+            # ✅ 触发实时推送 (Phase 3.3)
+            if hasattr(self, 'notifier'):
+                self.notifier.send_notification(opp)
+
+            return opp
+        except Exception as e:
+            logging.error(f"验证机会时出错: {e}")
+            traceback.print_exc()
+            return opp if isinstance(opp, ArbitrageOpportunity) else None
+
+    def sync_settlements(self):
+        """
+        [Phase 4.8] 同步已完成交易的结算状态并计算实际 PnL
+        """
+        print("\n" + "=" * 65)
+        print("[SETTLEMENT] 正在同步交易结算状态...")
+        print("=" * 65)
+
+        pending = self.recorder.get_pending_settlements()
+        if not pending:
+            print("  暂无待结算的交易记录。")
+            return
+
+        print(f"  发现 {len(pending)} 条待处理记录。")
+
+        updated_count = 0
+        for exec_rec in pending:
+            exec_id = exec_rec['exec_id']
+            opp_id = exec_rec['opp_id']
+            details = json.loads(exec_rec['details_json'] or '{}')
+            instructions = details.get('instructions', [])
+
+            if not instructions:
+                continue
+
+            all_resolved = True
+            total_return = 0.0
+            results_summary = []
+
+            print(f"\n  检查执行 ID: {exec_id[:8]}... (机会: {opp_id})")
+
+            for inst in instructions:
+                market_id = inst.get('market_id') or inst.get('id') # 兼容不同格式
+                if not market_id:
+                    # 尝试从问题描述反查 (保底)
+                    continue
+
+                market_data = self.client.get_market_details(market_id)
+                if not market_data:
+                    all_resolved = False
+                    break
+
+                # 检查市场是否已结算
+                # Polymarket API: status="closed" 或 "resolved"
+                status = market_data.get('status', '').lower()
+                if status not in ['closed', 'resolved']:
+                    all_resolved = False
+                    print(f"    - 市场尚未结算: {inst.get('market')[:40]}...")
+                    break
+
+                # 获取中奖结果
+                winning_outcome = market_data.get('winningOutcome')
+                if winning_outcome is None:
+                    all_resolved = False
+                    print(f"    - 市场已关闭但尚未公布结果: {inst.get('market')[:40]}...")
+                    break
+
+                # 计算该笔订单的收益
+                # 我们假设目前只处理 YES 合约买入 (instructions 中 token="YES")
+                is_win = False
+                if inst.get('token') == "YES" and winning_outcome == "0": # 0 通常是 YES
+                    is_win = True
+                elif inst.get('token') == "NO" and winning_outcome == "1": # 1 通常是 NO
+                    is_win = True
+
+                leg_return = 1.0 if is_win else 0.0
+                total_return += leg_return
+                results_summary.append({
+                    "market": inst.get('market'),
+                    "outcome": winning_outcome,
+                    "is_win": is_win,
+                    "return": leg_return
+                })
+                print(f"    - {'[WIN]' if is_win else '[LOSS]'} {inst.get('market')[:40]}...")
+
+            if all_resolved:
+                # 计算 realized PnL
+                # PnL = Total Return - Total Cost
+                # 注意: total_cost_usd 在数据库中存的是组合总成本
+                realized_pnl = total_return - exec_rec['total_cost_usd']
+
+                # 更新数据库
+                self.recorder.update_execution(exec_id, "SETTLED", {
+                    "settlement_details": results_summary,
+                    "total_return": total_return,
+                    "realized_pnl": realized_pnl,
+                    "settled_at": datetime.now(timezone.utc).isoformat()
+                })
+
+                # 同时更新 realizes_pnl 专用字段
+                try:
+                    with sqlite3.connect(self.recorder.db_path) as conn:
+                        conn.execute(
+                            "UPDATE execution_history SET realized_pnl = ?, settled_at = ? WHERE exec_id = ?",
+                            (realized_pnl, datetime.now(timezone.utc).isoformat(), exec_id)
+                        )
+                except Exception as e:
+                    logging.error(f"更新结算字段失败: {e}")
+
+                print(f"  [OK] 结算完成! PnL: ${realized_pnl:.4f} USD")
+                updated_count += 1
+
+        print(f"\n  同步结束，已更新 {updated_count} 条记录。")
+        print("=" * 65 + "\n")
 
     def _on_opportunity_found(
         self,
@@ -3624,9 +2758,16 @@ class ArbitrageScanner:
             print(f"{'─' * 60}")
             print(f"机会 #{i}: {opp.type}")
             print(f"{'─' * 60}")
-            print(f"置信度: {opp.confidence:.0%}")
-            print(f"总成本: ${opp.total_cost:.4f}")
-            print(f"利润: ${opp.profit:.4f} ({opp.profit_pct:.2f}%)")
+
+            # 🔥 显示核心风控度量 (Phase 2.5/3.5 增强)
+            apy_val = getattr(opp, 'apy', 0.0)
+            rating = getattr(opp, 'apy_rating', 'N/A')
+            apy_str = f"{apy_val:.1f}% ({rating})"
+
+            print(f"🔥 年化收益 (APY): {apy_str:25} 🎯 置信度: {opp.confidence:.0%}")
+            print(f"💰 预期净利润: {opp.profit_pct:.2f}% ({opp.profit:.4f} USD)   ⏳ 预估锁仓: {getattr(opp, 'days_to_resolution', 0)} 天")
+            print(f"📡 预言机对齐: {getattr(opp, 'oracle_alignment', 'UNKNOWN'):25} 🛡️ 滑点损失: {getattr(opp, 'slippage_cost', 0):.4f} USD")
+            print(f"📈 建议最大仓位: ${getattr(opp, 'max_position_usd', 0):,.0f} USD")
             print(f"\n操作:")
             for line in opp.action.split('\n'):
                 print(f"  {line}")
@@ -3753,7 +2894,7 @@ class ArbitrageScanner:
         while True:
             try:
                 choice = input(
-                    "\n[验证模式] 操作 (Enter=继续,s=保存,f=误报,q=退出,d=详情,r=阈值,l=流动性,j=存文件,?=帮助): "
+                    "\n[验证模式] 操作 (Enter=继续,s=保存,e=执行(MOCK),f=误报,q=退出,d=详情,r=阈值,l=流动性,j=存文件,?=帮助): "
                 ).strip().lower()
 
                 if not choice or choice == 'enter':
@@ -3765,10 +2906,21 @@ class ArbitrageScanner:
                     print("  -> 已保存到结果列表，继续扫描...")
                     return True
 
+                elif choice == 'e':
+                    # ✅ 执行 Layer 6 终极验证与模拟执行 (Phase 4)
+                    check = self.execution_engine.pre_flight_check(opp)
+                    if check["can_execute"]:
+                        print(f"  [OK] Layer 6 验证通过: {check['reason']}")
+                        log_path = self.execution_engine.execute_mock(opp, check["instructions"])
+                        print(f"  🚀 模拟执行成功! 日志: {log_path}")
+                    else:
+                        print(f"  [REJECTED] Layer 6 验证失败: {check['reason']}")
+                    continue
+
                 elif choice == 'f':
                     reason = input("  -> 请输入误报原因: ").strip()
                     self.false_positive_log.append({
-                        'opportunity': asdict(opp),
+                        'opportunity': json_serialize(opp),
                         'reason': reason,
                         'timestamp': datetime.now().isoformat()
                     })
@@ -3813,7 +2965,7 @@ class ArbitrageScanner:
                     filepath = Path(self.config.output.output_dir) / filename
                     filepath.parent.mkdir(parents=True, exist_ok=True)
                     with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump(asdict(opp), f, indent=2, ensure_ascii=False)
+                        json.dump(json_serialize(opp), f, indent=2, ensure_ascii=False)
                     print(f"  -> 已保存到 {filepath}")
                     continue
 
@@ -3841,6 +2993,48 @@ class ArbitrageScanner:
                 print("\n  -> 检测到 EOF，退出扫描...")
                 return False
 
+    def _show_execution_stats(self):
+        """
+        [Phase 4.6/4.7/4.8] 显示交易执行统计和 PnL 数据
+        """
+        stats = self.recorder.get_execution_stats()
+
+        print("\n" + "=" * 65)
+        print("[STATS] 交易执行与收益统计 (PnL Dashboard)")
+        print("=" * 65)
+
+        if stats["total_count"] == 0:
+            print("\n暂无历史执行记录。")
+            return
+
+        # 1. 规模统计
+        print(f"\n[规模统计]")
+        print(f"  总执行尝试: {stats['total_count']} (MOCK: {stats['mock_count']}, REAL: {stats['real_count']})")
+        print(f"  Layer 6 拦截: {stats['rejected_l6_count']} (价格变动导致拒绝)")
+        print(f"  已结算交易: {stats['settled_count']}")
+
+        success_color = "\033[92m" if stats['success_rate'] > 80 else "\033[93m"
+        reset_color = "\033[0m"
+        print(f"  执行成功率: {success_color}{stats['success_rate']:.1f}%{reset_color} (不含 L6 拦截)")
+
+        # 2. 收益统计
+        print(f"\n[收益统计]")
+        print(f"  累计投入本金: ${stats['total_cost_usd']:.2f} USD")
+        print(f"  预期总利润:   ${stats['total_expected_profit_usd']:.2f} USD")
+
+        pnl_color = "\033[92m" if stats['realized_pnl_usd'] > 0 else ("\033[91m" if stats['realized_pnl_usd'] < 0 else "")
+        print(f"\n  已实现净损益 (Realized): {pnl_color}${stats['realized_pnl_usd']:.4f} USD{reset_color}")
+
+        pending_color = "\033[94m" # Blue for pending
+        print(f"  待结算预估 (Pending):  {pending_color}${stats['pending_pnl_usd']:.4f} USD{reset_color}")
+
+        if stats['total_cost_usd'] > 0:
+            total_pnl = stats['realized_pnl_usd'] + stats['pending_pnl_usd']
+            roi = (total_pnl / stats['total_cost_usd']) * 100
+            print(f"  综合投资回报 (ROI):    {pnl_color}{roi:.2f}%{reset_color}")
+
+        print("\n" + "=" * 65 + "\n")
+
     def _save_false_positive_log(self) -> None:
         """保存误报日志到文件"""
         if self.run_mode == RunMode.DEBUG and self.false_positive_log:
@@ -3854,413 +3048,21 @@ class ArbitrageScanner:
         """保存所有发现的机会
 
         - PRODUCTION 模式：自动保存所有机会
-        - DEBUG 模式：仅在 verify_auto_save=True 时保存
+        - DEBUG 模式：不自动保存
         """
-        should_save = (
-            self.run_mode == RunMode.PRODUCTION or
-            (self.run_mode == RunMode.DEBUG and self.verify_auto_save)
-        )
+        should_save = self.run_mode == RunMode.PRODUCTION
 
         if should_save and self.discovered_opportunities:
             filename = f"discovered_opportunities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             filepath = Path(self.config.output.output_dir) / filename
             filepath.parent.mkdir(parents=True, exist_ok=True)
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump([asdict(opp) for opp in self.discovered_opportunities], f, indent=2, ensure_ascii=False)
+                json.dump([json_serialize(opp) for opp in self.discovered_opportunities], f, indent=2, ensure_ascii=False)
             print(f"\n[OK] 所有发现的机会已保存: {filepath}")
-
-    def scan_cross_event(
-        self,
-        event1_slug: str = "bitcoin-price-on-january-6",
-        event2_slug: str = "bitcoin-above-on-january-6",
-        check_implication: bool = True
-    ) -> List[ArbitrageOpportunity]:
-        """
-        跨Event套利扫描
-
-        检测两个相关event之间的套利机会：
-        1. 等价市场套利：不同event中问同一问题的市场
-        2. 蕴含关系套利：同一event内阈值市场的单调性违反
-
-        Args:
-            event1_slug: 第一个event的slug
-            event2_slug: 第二个event的slug
-            check_implication: 是否检查蕴含关系套利
-
-        Returns:
-            套利机会列表
-
-        Example:
-            scanner = ArbitrageScanner(config)
-            opps = scanner.scan_cross_event(
-                event1_slug="bitcoin-price-on-january-6",
-                event2_slug="bitcoin-above-on-january-6"
-            )
-        """
-        opportunities = []
-
-        print("=" * 70)
-        print("跨Event套利扫描")
-        print("=" * 70)
-
-        # 检测跨Event等价市场套利
-        print(f"\n[1/2] 检测跨Event等价市场套利...")
-        print(f"      Event 1: {event1_slug}")
-        print(f"      Event 2: {event2_slug}")
-
-        cross_event_opps = self.detector.check_cross_event_equivalent(
-            event1_slug, event2_slug, self.client
-        )
-
-        if cross_event_opps:
-            opportunities.extend(cross_event_opps)
-            print(f"      发现 {len(cross_event_opps)} 个跨Event等价市场套利机会!")
-            for opp in cross_event_opps:
-                print(f"        - {opp.type}: 利润={opp.profit_pct:.2f}%")
-        else:
-            print(f"      未发现跨Event等价市场套利")
-
-        # 检测同Event内的蕴含关系套利
-        if check_implication:
-            print(f"\n[2/2] 检测同Event蕴含关系套利...")
-            print(f"      检查Event: {event2_slug} (阈值市场)")
-
-            implication_opps = self.detector.check_event_implication_arbitrage(
-                event2_slug, self.client
-            )
-
-            if implication_opps:
-                opportunities.extend(implication_opps)
-                print(f"      发现 {len(implication_opps)} 个蕴含关系套利机会!")
-                for opp in implication_opps:
-                    print(f"        - {opp.type}: 利润={opp.profit_pct:.2f}%")
-            else:
-                print(f"      未发现蕴含关系套利")
-
-        # 生成报告
-        if opportunities:
-            print("\n" + "=" * 70)
-            print(f"总计发现 {len(opportunities)} 个套利机会")
-            print("=" * 70)
-
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"cross_event_scan_{timestamp}.json"
-            output_path = Path(self.config.output.output_dir) / filename
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump([asdict(opp) for opp in opportunities], f, indent=2, ensure_ascii=False)
-
-            print(f"报告已保存: {output_path}")
-        else:
-            print("\n未发现套利机会")
-
-        return opportunities
-
-    def scan_monotonicity(
-        self,
-        domain: str = "crypto",
-        subcategories: List[str] = None,
-        force_refresh: bool = False
-    ) -> List[ArbitrageOpportunity]:
-        """
-        单调性违背扫描（Sprint 0）
-        
-        检测加密货币阈值市场的价格倒挂现象：
-        - 当高阈值合约价格 > 低阈值合约价格时，存在套利机会
-        - 例如: BTC>100k 价格 0.45 > BTC>95k 价格 0.40（价格倒挂）
-        
-        Args:
-            domain: 市场领域（目前主要支持 "crypto"）
-            subcategories: 子类别筛选（如 ["bitcoin", "ethereum"]）
-            force_refresh: 强制刷新缓存
-            
-        Returns:
-            套利机会列表
-        """
-        logging.info("[START] 单调性违背扫描")
-        logging.info(f"        领域: {domain}, 子类别: {subcategories or '全部'}")
-        
-        # Step 1: 获取市场数据
-        logging.info("[Step 1] 获取市场数据...")
-        all_markets = self._fetch_domain_markets(domain, subcategories, force_refresh)
-        
-        if not all_markets:
-            logging.warning("[ERROR] 未获取到市场数据")
-            return []
-        
-        logging.info(f"[OK] 获取到 {len(all_markets)} 个市场")
-        
-        # Step 2: 创建单调性检查器并执行扫描
-        logging.info("[Step 2] 执行单调性检查...")
-        checker = MonotonicityChecker()
-        violations = checker.scan(all_markets)
-
-        logging.info(f"[OK] 检测到 {len(violations)} 个潜在单调性违背")
-
-        # Step 2.5: 获取 NO 订单簿数据（单调性套利修复）
-        # 只对检测到违背的市场获取 NO 订单簿，避免不必要的 API 调用
-        if violations:
-            logging.info("[Step 2.5] 获取 NO 订单簿数据以验证真实套利机会...")
-            for violation in violations:
-                # 获取低阈值市场的 NO 订单簿
-                low_market = violation.low_market.market
-                self.client.enrich_with_no_orderbook(low_market)
-                violation.low_market.no_best_bid = low_market.best_bid_no
-                violation.low_market.no_best_ask = low_market.best_ask_no
-
-                # 获取高阈值市场的 NO 订单簿
-                high_market = violation.high_market.market
-                self.client.enrich_with_no_orderbook(high_market)
-                violation.high_market.no_best_bid = high_market.best_bid_no
-                violation.high_market.no_best_ask = high_market.best_ask_no
-
-            logging.info(f"[OK] NO 订单簿获取完成")
-
-        # Step 3: 过滤真正有利可图的套利机会
-        opportunities = []
-        for violation in violations:
-            # 使用真实 NO 价格重新计算套利详情
-            arb_details = checker.calculate_arbitrage(
-                violation.low_market,
-                violation.high_market
-            )
-
-            # 过滤：只保留利润为正的机会
-            if arb_details['profit'] <= 0:
-                logging.info(f"  [跳过] {violation.asset} ${violation.low_threshold}-${violation.high_threshold}: "
-                           f"总成本 ${arb_details['total_cost']:.3f} >= $1.00，非真实套利")
-                continue
-
-            # 创建套利机会对象
-            opp = ArbitrageOpportunity(
-                id=f"mono_{violation.asset}_{violation.low_threshold}_{violation.high_threshold}",
-                type="MONOTONICITY_VIOLATION",
-                markets=[
-                    {"question": violation.low_market.market.question,
-                     "yes_price": violation.low_market.market.yes_price,
-                     "threshold": violation.low_threshold},
-                    {"question": violation.high_market.market.question,
-                     "yes_price": violation.high_market.market.yes_price,
-                     "threshold": violation.high_threshold}
-                ],
-                relationship=f"{violation.asset} 阈值单调性违背",
-                confidence=0.95,  # 数学确定性高
-                total_cost=violation.total_cost,
-                guaranteed_return=violation.guaranteed_return,
-                profit=violation.profit,
-                profit_pct=violation.profit_pct * 100,
-                action=f"买入 {violation.low_market.market.question} YES @ ${violation.low_market.market.yes_price:.3f}, "
-                       f"卖出 {violation.high_market.market.question} YES @ ${violation.high_market.market.yes_price:.3f}",
-                reasoning=checker.format_violation(violation),
-                edge_cases=violation.warnings,
-                needs_review=["验证市场结算规则一致性", "检查流动性"],
-                timestamp=datetime.now().isoformat()
-            )
-            opportunities.append(opp)
-            
-            # 打印详情
-            logging.info(f"\n{'='*60}")
-            logging.info(checker.format_violation(violation))
-            logging.info(f"{'='*60}")
-        
-        # Step 4: 生成报告
-        if opportunities:
-            logging.info("[Step 3] 生成报告...")
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"monotonicity_scan_{timestamp}.json"
-            output_path = Path(self.config.output.output_dir) / filename
-            
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump([asdict(opp) for opp in opportunities], f, indent=2, ensure_ascii=False)
-            
-            logging.info(f"[OK] 报告已保存: {output_path}")
-        
-        # 打印总结
-        logging.info(f"\n[DONE] 单调性扫描完成")
-        logging.info(f"       总市场数: {len(all_markets)}")
-        logging.info(f"       违背数量: {len(violations)}")
-        if violations:
-            total_profit = sum(v.price_inversion for v in violations)
-            logging.info(f"       总价差: ${total_profit:.4f}")
-        
-        return opportunities
 
     def close(self):
         """清理资源"""
         self.analyzer.close()
-
-
-# ============================================================
-# 交互式菜单函数
-# ============================================================
-
-def interactive_domain_select(default_domain: str = "crypto") -> str:
-    """交互式领域选择菜单
-
-    Args:
-        default_domain: 默认领域
-
-    Returns:
-        选择的领域名称
-    """
-    domains = {
-        "1": ("crypto", "加密货币"),
-        "2": ("politics", "政治"),
-        "3": ("sports", "体育"),
-        "4": ("other", "其他")
-    }
-
-    print("\n" + "=" * 55)
-    print("请选择要扫描的市场领域:")
-    print("=" * 55)
-    for num, (key, name) in domains.items():
-        default_mark = " (默认)" if key == default_domain else ""
-        print(f"  {num}. {key:10s} - {name}{default_mark}")
-    print("=" * 55)
-
-    while True:
-        prompt = f"请输入选项 [1-4，直接回车使用默认={default_domain}]: "
-        choice = input(prompt).strip()
-
-        # 默认选择
-        if not choice:
-            return default_domain
-
-        # 数字输入
-        if choice in domains:
-            return domains[choice][0]
-
-        # 直接输入领域名
-        for key, name in domains.values():
-            if choice.lower() == key:
-                return key
-
-        print("[错误] 无效选项，请重新输入")
-
-
-def interactive_subcategory_select(domain: str) -> List[str]:
-    """交互式子类别选择菜单
-
-    Args:
-        domain: 领域名称
-
-    Returns:
-        选中的子类别标签列表（扁平化）
-    """
-    groups = SUBCATEGORY_GROUPS.get(domain, [])
-    if not groups:
-        return []
-
-    print("\n" + "=" * 55)
-    print(f"请选择要扫描的 {domain} 子类别:")
-    print("=" * 55)
-
-    for i, (name, tags) in enumerate(groups, 1):
-        tag_str = ", ".join(tags[:3])
-        more = f" +{len(tags)-3}更多" if len(tags) > 3 else ""
-        print(f"  {i}. {name:12s} ({tag_str}{more})")
-    print("  0. 全部子类别")
-    print("=" * 55)
-
-    while True:
-        prompt = "请输入选项 [多个用逗号分隔，直接回车=全部]: "
-        choice = input(prompt).strip()
-
-        # 直接回车 = 全部
-        if not choice:
-            all_tags = []
-            for _, tags in groups:
-                all_tags.extend(tags)
-            print(f"[INFO] 已选择全部 {len(all_tags)} 个子类别")
-            return all_tags
-
-        # 解析输入
-        selected = []
-        try:
-            parts = choice.replace(" ", "").split(",")
-            for part in parts:
-                if "-" in part:
-                    # 范围选择: 1-3
-                    start, end = map(int, part.split("-"))
-                    selected.extend(range(start, end + 1))
-                else:
-                    num = int(part)
-                    selected.append(num)
-
-            # 验证范围
-            valid = set(range(0, len(groups) + 1))
-            if not set(selected).issubset(valid):
-                print("[错误] 编号超出范围，请重新输入")
-                continue
-
-            # 收集选中的标签
-            result = []
-            for num in selected:
-                if num == 0:
-                    for _, tags in groups:
-                        result.extend(tags)
-                elif 1 <= num <= len(groups):
-                    result.extend(groups[num - 1][1])
-
-            # 去重
-            result = list(set(result))
-            print(f"[INFO] 已选择 {len(result)} 个子类别")
-            return result
-
-        except ValueError:
-            print("[错误] 输入格式错误，请重新输入")
-
-
-def interactive_mode_select() -> RunMode:
-    """交互式运行模式选择菜单
-
-    Returns:
-        选中的运行模式
-    """
-    print("\n" + "=" * 55)
-    print("请选择运行模式:")
-    print("=" * 55)
-    print("  1. DEBUG 模式")
-    print("     - 发现套利机会后暂停，等待确认")
-    print("     - 可以逐个审查每个机会")
-    print("     - 支持保存/跳过/标记误报等操作")
-    print("     - 适合开发调试和学习")
-    print()
-    print("  2. PRODUCTION 模式")
-    print("     - 自动保存所有发现的套利机会")
-    print("     - 不暂停确认，无人值守运行")
-    print("     - 适合定期扫描和监控")
-    print("=" * 55)
-
-    while True:
-        try:
-            choice = input("请输入选项 [1-2，直接回车=PRODUCTION]: ").strip()
-
-            # 直接回车 = PRODUCTION 模式（默认）
-            if not choice:
-                print("[INFO] 已选择 PRODUCTION 模式")
-                return RunMode.PRODUCTION
-
-            num = int(choice)
-            if num == 1:
-                print("[INFO] 已选择 DEBUG 模式")
-                return RunMode.DEBUG
-            elif num == 2:
-                print("[INFO] 已选择 PRODUCTION 模式")
-                return RunMode.PRODUCTION
-            else:
-                print("[错误] 请输入 1 或 2")
-
-        except ValueError:
-            print("[错误] 输入格式错误，请输入 1 或 2")
-        except KeyboardInterrupt:
-            print("\n[INFO] 用户取消，退出程序")
-            sys.exit(0)
-        except EOFError:
-            print("\n[INFO] 检测到 EOF，使用默认 PRODUCTION 模式")
-            return RunMode.PRODUCTION
 
 
 # ============================================================
@@ -4278,22 +3080,17 @@ def main():
   # 基础扫描（向量化模式）
   python local_scanner_v2.py --domain crypto
 
-  # 单调性违背扫描（检测价格倒挂）
-  python local_scanner_v2.py --domain crypto --monotonicity-check
-  python local_scanner_v2.py -d crypto --monotonicity-check --subcat btc,eth
-
-  # 验证模式（发现机会后暂停确认）
-  python local_scanner_v2.py -d crypto --verify
+  # 使用特定策略扫描
+  python local_scanner_v2.py --domain crypto --strategies monotonicity
+  python local_scanner_v2.py -d crypto --strategies monotonicity,exhaustive --subcat btc,eth
 
   # 使用特定LLM配置
   python local_scanner_v2.py --profile siliconflow
   python local_scanner_v2.py --profile deepseek --model deepseek-reasoner
 
-  # 调整聚类阈值
-  python local_scanner_v2.py -d crypto -t 0.80
-
-  # 禁用向量化模式（使用传统关键词搜索）
-  python local_scanner_v2.py --no-semantic
+  # 使用指定策略
+  python local_scanner_v2.py --strategies monotonicity,interval
+  python local_scanner_v2.py --list-strategies  # 查看所有可用策略
 
 查看所有可用配置:
   python llm_config.py --list
@@ -4320,6 +3117,36 @@ def main():
         help="最小利润百分比 (默认: 2.0)"
     )
     parser.add_argument(
+        "--min-apy",
+        type=float,
+        help="最小年化收益率门槛 (默认: 15.0)"
+    )
+    parser.add_argument(
+        "--target-size",
+        type=float,
+        help="模拟交易规模 USD (默认: 500.0)"
+    )
+    parser.add_argument(
+        "--show-stats",
+        action="store_true",
+        help="显示历史交易执行统计和收益数据 (PnL)"
+    )
+    parser.add_argument(
+        "--sync-settlements",
+        action="store_true",
+        help="同步已完成交易的结算状态并更新 PnL"
+    )
+    parser.add_argument(
+        "--sensitivity-analysis",
+        action="store_true",
+        help="运行灵敏度分析，测试不同利润阈值对收益的影响 (Phase 5.1)"
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="以守护进程模式运行，持续监控并推送通知 (Phase 9)"
+    )
+    parser.add_argument(
         "--market-limit",
         type=int,
         help="获取市场数量 (默认: 200)"
@@ -4330,12 +3157,6 @@ def main():
         help="列出所有可用的LLM配置"
     )
 
-    # 🆕 向量化模式相关参数（默认启用）
-    parser.add_argument(
-        "--no-semantic",
-        action="store_true",
-        help="禁用向量化模式，使用传统关键词搜索"
-    )
     parser.add_argument(
         "--domain", "-d",
         type=str,
@@ -4343,11 +3164,16 @@ def main():
         choices=["crypto", "politics", "sports", "other"],
         help="市场领域 (默认: crypto)"
     )
+    # 🆕 动态分类控制 (v3.1新增)
     parser.add_argument(
-        "--threshold", "-t",
-        type=float,
-        default=0.85,
-        help="语义聚类相似度阈值 (默认: 0.85)"
+        "--use-dynamic-categories",
+        action="store_true",
+        help="启用 LLM 动态分类发现"
+    )
+    parser.add_argument(
+        "--list-categories",
+        action="store_true",
+        help="列出所有已发现的市场分类"
     )
     # 🆕 子类别筛选参数（v2.1新增）
     parser.add_argument(
@@ -4366,6 +3192,18 @@ def main():
         help="禁用交互式菜单，直接使用默认配置"
     )
 
+    # 🆕 回测参数 (Phase 6.3)
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="运行历史回测模式 (使用本地数据库)"
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="回测指定日期 (YYYY-MM-DD)，默认全部"
+    )
+
     # 🆕 缓存控制参数（v2.1新增）
     parser.add_argument(
         "--refresh", "-r",
@@ -4378,18 +3216,6 @@ def main():
         help="明确指定使用缓存（如果缓存有效）"
     )
 
-    # 🆕 验证模式相关参数
-    parser.add_argument(
-        "--verify", "-v",
-        action="store_true",
-        help="验证模式：发现套利机会后暂停，等待用户确认"
-    )
-    parser.add_argument(
-        "--verify-auto-save",
-        action="store_true",
-        help="验证模式下自动保存所有机会（包括未确认的）"
-    )
-
     # 🆕 运行模式参数（v2.2新增）
     parser.add_argument(
         "--mode",
@@ -4398,14 +3224,202 @@ def main():
         help="运行模式 (debug=暂停确认, production=自动保存)"
     )
 
-    # 🆕 单调性违背检测（Sprint 0）
+    # 🆕 策略选择参数（v3.1新增）
     parser.add_argument(
-        "--monotonicity-check",
+        "--strategies",
+        type=str,
+        help="选择套利策略（逗号分隔），如: monotonicity,exhaustive,implication,equivalent,interval。默认: 全部"
+    )
+    # 🆕 高频模式参数 (Phase 5.3)
+    parser.add_argument(
+        "--loop",
         action="store_true",
-        help="启用单调性违背检测：检测加密货币阈值市场的价格倒挂"
+        help="启用持续扫描模式"
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help="两次扫描之间的间隔秒数 (默认: 300)"
+    )
+    parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="列出所有可用的套利策略"
+    )
+
+    # 🆕 Tag分类管理参数（v3.2新增）
+    parser.add_argument(
+        "--refine-other",
+        action="store_true",
+        help="细分Other分类（对已标记为other的tags进行二次分类到finance/tech/entertainment/science/weather/misc）"
     )
 
     args = parser.parse_args()
+
+    # ============================================================
+    # 🆕 列出可用策略（v3.1新增）
+    # ============================================================
+    if args.list_strategies:
+        if CLI_AVAILABLE and StrategyRegistry:
+            print("\n=== 可用的套利策略 ===\n")
+            all_strategies = StrategyRegistry.get_all()
+            for s in all_strategies:
+                risk_str = s.risk_level.value if hasattr(s.risk_level, 'value') else s.risk_level
+                llm_str = "是" if s.requires_llm else "否"
+                domains_str = ", ".join(s.domains)
+                print(f"  ID: {s.id}")
+                print(f"    名称: {s.name} ({s.name_en})")
+                print(f"    描述: {s.description}")
+                print(f"    优先级: {s.priority} | 需要LLM: {llm_str} | 风险: {risk_str.upper()}")
+                print(f"    适用领域: {domains_str}")
+                print(f"    最低利润: {s.min_profit_threshold}%")
+                print()
+            print(f"共 {len(all_strategies)} 个策略可用")
+            print("\n使用 --strategies 参数选择策略，如:")
+            print("  python local_scanner_v2.py --strategies monotonicity,exhaustive")
+            return 0
+        else:
+            print("[ERROR] CLI 模块不可用，无法列出策略")
+            print("       请确保已安装 rich 和 questionary: pip install -r requirements.txt")
+            return 1
+
+    # ============================================================
+    # 🆕 细分Other分类 (v3.2新增)
+    # ============================================================
+    if args.refine_other:
+        try:
+            from cli.tag_classifier import classify_tags_interactive
+            print("\n=== 细分Other分类 ===\n")
+            print("将other类别的tags重新分类到细分类别：")
+            print("  - finance (传统金融)")
+            print("  - tech (科技/AI)")
+            print("  - entertainment (娱乐/文化)")
+            print("  - science (科学/研究)")
+            print("  - weather (天气/自然)")
+            print("  - misc (杂项)")
+            print()
+
+            success = classify_tags_interactive(
+                menu=None,
+                llm_profile=args.profile,
+                mode='refine'  # 传入refine模式
+            )
+            return 0 if success else 1
+        except Exception as e:
+            print(f"[ERROR] 细分分类失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+
+    # ============================================================
+    # 🆕 列出已发现分类 (v3.1新增)
+    # ============================================================
+    if args.list_categories:
+        # 加载配置
+        config = AppConfig.load(args.config)
+        scanner = ArbitrageScanner(config, profile_name=args.profile)
+        # 强制启用动态分类以便加载/发现
+        scanner.use_dynamic_categories = True
+        categories = scanner.get_available_categories()
+
+        print("\n=== 已发现的市场分类 ===\n")
+        if not categories:
+            print("  [提示] 尚未发现任何动态分类。请运行扫描并启用 --use-dynamic-categories。")
+        else:
+            for i, cat in enumerate(categories, 1):
+                icon = cat.icon or "📁"
+                print(f"  {i:2d}. {icon} {cat.name_zh} ({cat.name_en})")
+                print(f"      描述: {cat.description}")
+                print(f"      市场数: {cat.market_count} | 置信度: {cat.discovery_confidence:.0%}")
+                print(f"      Tags: {', '.join(cat.representative_tags)}")
+                print()
+            print(f"共 {len(categories)} 个分类可用")
+        return 0
+
+    # ============================================================
+    # 🆕 显示交易执行统计（Phase 4.6/4.7 新增）
+    # ============================================================
+    if getattr(args, 'show_stats', False):
+        config = AppConfig.load(args.config)
+        scanner = ArbitrageScanner(config, profile_name=args.profile)
+        scanner._show_execution_stats()
+        return 0
+
+    # ============================================================
+    # 🆕 守护进程模式 (Phase 9)
+    # ============================================================
+    if getattr(args, 'daemon', False):
+        print("[INFO] 启动守护进程模式 (Daemon Mode)...")
+        print("按 Ctrl+C 停止")
+
+        try:
+            config = AppConfig.load(args.config)
+            scanner = ArbitrageScanner(config, profile_name=args.profile)
+
+            # 启动 WebSocket (如果配置允许)
+            # 在全自动模式下，我们默认订阅热门资产或全部发现的资产
+            # 这里先执行一次全量扫描来初始化订阅列表
+            print("[DAEMON] 执行初始全量扫描...")
+            scanner.scan_semantic(
+                domain=args.domain,
+                subcategories=args.subcat.split(",") if args.subcat else None
+            )
+
+            print(f"[DAEMON] 进入持续监控循环 (间隔: {config.scan.scan_interval}s)...")
+
+            while True:
+                time.sleep(config.scan.scan_interval)
+                print(f"\n[DAEMON] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 开始定期扫描...")
+
+                # 重新扫描以发现新市场
+                scanner.scan_semantic(
+                    domain=args.domain,
+                    subcategories=args.subcat.split(",") if args.subcat else None
+                )
+
+        except KeyboardInterrupt:
+            print("\n[DAEMON] 接收到停止信号，正在退出...")
+            if hasattr(scanner, 'stop_websocket'):
+                scanner.stop_websocket()
+        except Exception as e:
+            logging.error(f"[DAEMON] 发生严重错误: {e}")
+            traceback.print_exc()
+            return 1
+
+        return 0
+
+    # ============================================================
+    # 🆕 灵敏度分析（Phase 5.1 新增）
+    # ============================================================
+    if getattr(args, 'sensitivity_analysis', False):
+        config = AppConfig.load(args.config)
+        scanner = ArbitrageScanner(config, profile_name=args.profile)
+        engine = BacktestEngine(scanner)
+
+        # 确定时间范围（默认回测最近 24 小时）
+        ts = engine.get_available_timestamps()
+        if not ts:
+            print("[ERROR] 数据库为空，无法进行灵敏度分析。请先运行扫描积累数据。")
+            return 1
+
+        end_time = ts[-1]
+        start_time = (datetime.fromisoformat(end_time) - timedelta(days=1)).isoformat()
+
+        # 定义测试阈值列表
+        thresholds = [0.005, 0.01, 0.015, 0.02, 0.03, 0.05]
+
+        engine.run_sensitivity_analysis(start_time, end_time, thresholds)
+        return 0
+
+    # ============================================================
+    # 🆕 同步结算状态（Phase 4.8 新增）
+    # ============================================================
+    if getattr(args, 'sync_settlements', False):
+        config = AppConfig.load(args.config)
+        scanner = ArbitrageScanner(config, profile_name=args.profile)
+        scanner.sync_settlements()
+        return 0
 
     # ============================================================
     # 🆕 列出子类别（v2.1新增）- 需要在交互式选择之前处理
@@ -4416,37 +3430,205 @@ def main():
         if tag_categories_file.exists():
             with open(tag_categories_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                tag_categories = data.get("categories", {})
         else:
             print(f"[ERROR] 标签分类文件不存在: {tag_categories_file}")
             return 1
 
-        if args.domain in tag_categories:
+        # 优先显示分组
+        groups = data.get("groups", {}).get(args.domain, {})
+        if groups:
+            print(f"\n=== {args.domain.upper()} 子类别分组 ===\n")
+            for group_name, tags in groups.items():
+                print(f"[{group_name}] ({len(tags)}个标签):")
+                for tag in sorted(tags):
+                    print(f"   - {tag}")
+                print()
+
+            all_tags = data.get("categories", {}).get(args.domain, [])
+            print(f"共 {len(all_tags)} 个标签，已分为 {len(groups)} 个分组")
+
+            print("\n提示: 在交互模式中选择分组后，会自动包含该分组下的所有标签")
+            print("      CLI模式可使用: --subcat bitcoin,ethereum")
+        elif args.domain in data.get("categories", {}):
             print(f"\n=== {args.domain.upper()} 可用子类别 ===")
-            subcats = sorted(tag_categories[args.domain])
+            subcats = sorted(data["categories"][args.domain])
             print(f"共 {len(subcats)} 个子类别:\n")
             for i, subcat in enumerate(subcats, 1):
                 print(f"  {i:2d}. {subcat}")
             print("\n提示: 可使用简写，如 btc→bitcoin、eth→ethereum")
             print("      使用 --subcat 参数进行筛选，如: --subcat bitcoin,ethereum")
-            return 0
         else:
             print(f"[ERROR] 领域 '{args.domain}' 没有可用的子类别")
             return 1
+        return 0
 
     # ============================================================
-    # 交互式领域选择
+    # 🆕 交互式配置收集（v3.1重构）
     # ============================================================
+    # 确定是否使用新的交互式菜单
+    use_new_menu = CLI_AVAILABLE and not args.no_interactive and not getattr(args, 'backtest', False)
+
+    # 初始化输出
+    if use_new_menu:
+        output = ScannerOutput()
+        output.welcome("v3.1")
+    else:
+        output = None
+
     # 确定要扫描的领域
     domain = args.domain  # 默认为 "crypto"
 
-    # 默认启用交互式选择（除非通过 --no-interactive 禁用）
-    # 注意：移除了 sys.stdin.isatty() 检查，因为 uv run 等工具会导致它返回 False
-    if not args.no_interactive:
-        print(f"\n[配置] 当前领域: {domain}")
-        change = input("是否更改领域? (y/n, 直接回车=n): ").strip().lower()
-        if change in ['y', 'yes']:
-            domain = interactive_domain_select(args.domain)
+    if use_new_menu:
+        # 创建持久的菜单对象（整个会话共享，保存LLM配置等状态）
+        menu = InteractiveMenu()
+
+        # 🆕 显示当前LLM配置（v3.3新增）
+        menu.display_current_llm_config()
+
+        # 使用新的交互式菜单（循环处理，支持连续操作）
+        while True:
+            action = menu.main_menu()
+            if action == "exit":
+                print("[INFO] 退出程序")
+                return 0
+            elif action == "help":
+                menu.show_help()
+                # 继续循环，显示主菜单
+                continue
+            elif action == "classify_tags":
+                # Tags智能分类（会使用menu中保存的LLM配置）
+                menu.tags_classify_menu()
+                # 继续循环，显示主菜单
+                continue
+            elif action == "config":
+                # TODO: 实现配置菜单
+                print("[INFO] 配置菜单功能待实现")
+                # 继续循环，显示主菜单
+                continue
+            elif action == "llm_config":
+                # 处理LLM配置选择
+                llm_config_result = menu.select_llm_profile()
+
+                if llm_config_result:
+                    selected_profile = llm_config_result.get('profile', 'unknown')
+                    selected_model = llm_config_result.get('model', 'default')
+                    print(f"[green]✓ 已选择LLM配置: {selected_profile} - {selected_model}[/green]")
+                    print("[dim]提示: 本次会话将使用此配置[/dim]")
+                else:
+                    print("[yellow]⚠ 未选择LLM配置，使用默认配置[/yellow]")
+
+                # 继续循环，显示主菜单
+                continue
+            elif action == "sensitivity_analysis":
+                # 运行灵敏度分析
+                try:
+                    app_config = AppConfig.load(args.config)
+                    scanner = ArbitrageScanner(app_config, profile_name=args.profile)
+                    engine = BacktestEngine(scanner)
+
+                    ts = engine.get_available_timestamps()
+                    if not ts:
+                        print("[ERROR] 数据库为空，无法进行灵敏度分析。请先运行扫描积累数据。")
+                        input("\n按回车键返回主菜单...")
+                        continue
+
+                    # 默认最近 24 小时
+                    end_time = ts[-1]
+                    start_time = (datetime.fromisoformat(end_time.replace('Z', '+00:00')) - timedelta(days=1)).isoformat()
+
+                    # 提示用户确认时间范围或使用默认
+                    print(f"\n[INFO] 灵敏度分析时间范围: {start_time} -> {end_time}")
+                    confirm = input("是否以此范围运行? (y=是, n=进入回测菜单自定义, 直接回车=y): ").strip().lower()
+
+                    if confirm == 'n':
+                        print("  -> 请在 '历史回测' 菜单中自定义高级参数。")
+                        input("\n按回车键返回主菜单...")
+                        continue
+
+                    thresholds = [0.005, 0.01, 0.015, 0.02, 0.03, 0.05]
+                    engine.run_sensitivity_analysis(start_time, end_time, thresholds)
+                    input("\n按回车键返回主菜单...")
+                except Exception as e:
+                    print(f"[ERROR] 灵敏度分析执行失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    input("\n按回车键返回主菜单...")
+                continue
+            elif action == "sync_settlements":
+                # 同步结算状态
+                try:
+                    app_config = AppConfig.load(args.config)
+                    scanner = ArbitrageScanner(app_config, profile_name=args.profile)
+                    scanner.sync_settlements()
+                    input("\n按回车键返回主菜单...")
+                except Exception as e:
+                    print(f"[ERROR] 同步结算状态失败: {e}")
+                    input("\n按回车键返回主菜单...")
+                continue
+            elif action == "stats":
+                # 显示 PnL 统计数据
+                try:
+                    app_config = AppConfig.load(args.config)
+                    scanner = ArbitrageScanner(app_config, profile_name=args.profile)
+                    scanner._show_execution_stats()
+                    input("\n按回车键返回主菜单...")
+                except Exception as e:
+                    print(f"[ERROR] 获取统计数据失败: {e}")
+                    input("\n按回车键返回主菜单...")
+                continue
+            elif action == "backtest":
+                # 收集回测配置
+                bt_config = menu.gather_backtest_config()
+                if not bt_config:
+                    continue
+                
+                # 临时加载配置用于回测
+                try:
+                    # 加载基础配置
+                    app_config = AppConfig.load(args.config)
+                    
+                    # 确定使用的 LLM Profile (优先使用菜单选择的，其次是命令行的)
+                    profile_to_use = args.profile
+                    model_to_use = args.model
+                    
+                    if menu.current_llm_profile:
+                        profile_to_use = menu.current_llm_profile.get("profile")
+                        model_to_use = menu.current_llm_profile.get("model")
+                        
+                    # 初始化扫描器
+                    scanner = ArbitrageScanner(
+                        app_config,
+                        profile_name=profile_to_use,
+                        model_override=model_to_use
+                    )
+                    
+                    # 初始化回测引擎
+                    engine = BacktestEngine(scanner)
+                    
+                    # 运行回测
+                    engine.run_backtest(
+                        start_time=bt_config["start_time"],
+                        end_time=bt_config["end_time"],
+                        strategies=bt_config["strategies"]
+                    )
+                    
+                    input("\n按回车键返回主菜单...")
+                except Exception as e:
+                    print(f"[ERROR] 回测启动失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    input("\n按回车键返回主菜单...")
+                
+                continue
+            elif action == "scan":
+                # 开始扫描流程，跳出循环
+                break
+            else:
+                print(f"[WARNING] 未知操作: {action}")
+                return 0
+
+        # action == "scan" 继续，稍后在初始化 scanner 后选择类别
+        pass
 
     # 列出配置
     if args.list_profiles:
@@ -4461,10 +3643,130 @@ def main():
     # 覆盖配置
     if args.min_profit:
         config.scan.min_profit_pct = args.min_profit
+    if hasattr(args, 'min_apy') and args.min_apy:
+        config.scan.min_apy = args.min_apy
+    if hasattr(args, 'target_size') and args.target_size:
+        config.scan.target_size_usd = args.target_size
     if args.market_limit:
         config.scan.market_limit = args.market_limit
 
-    # 🆕 处理子类别参数（v2.1新增）
+    # 确定最终使用的 profile_name
+    # 优先级: 1. 交互菜单中选择的 (menu.current_llm_profile)
+    #        2. 命令行参数 (args.profile)
+    #        3. 配置文件中的 active_profile (config.active_profile)
+    final_profile_name = args.profile
+    final_model_override = args.model
+
+    if use_new_menu:
+        if menu.current_llm_profile:
+            final_profile_name = menu.current_llm_profile
+        if menu.current_llm_model:
+            final_model_override = menu.current_llm_model
+
+    # 如果仍为空，回退到配置文件的 active_profile
+    if not final_profile_name and config.active_profile:
+        final_profile_name = config.active_profile
+        # 如果使用了 config.active_profile，也检查一下是否有对应的 model 配置
+        # (ArbitrageScanner 内部会处理，但这里为了明确性可以不做)
+
+    # 运行模式选择
+    run_mode = None
+    if args.mode:
+        # 命令行明确指定模式
+        run_mode = RunMode(args.mode)
+        print(f"[INFO] 运行模式: {args.mode.upper()}")
+    elif use_new_menu:
+        # 使用新的交互式菜单选择模式
+        run_mode_str = menu.select_run_mode()
+        run_mode = RunMode(run_mode_str)
+
+    if run_mode is None:
+        # 默认：生产模式
+        run_mode = RunMode.PRODUCTION
+        print("[INFO] 运行模式: PRODUCTION (默认)")
+
+    # 初始化扫描器
+    scanner = ArbitrageScanner(
+        config,
+        profile_name=final_profile_name,
+        model_override=final_model_override,
+        run_mode=run_mode
+    )
+
+    # 🆕 回测模式入口 (Phase 6.3)
+    if getattr(args, 'backtest', False):
+        try:
+            print("[INFO] 启动历史回测模式...")
+            engine = BacktestEngine(scanner)
+
+            # 确定回测时间范围
+            target_date = getattr(args, 'date', None)
+            if target_date:
+                start_time = f"{target_date}T00:00:00"
+                end_time = f"{target_date}T23:59:59"
+            else:
+                # 默认涵盖所有记录
+                start_time = "2024-01-01T00:00:00"
+                end_time = datetime.now().isoformat()
+
+            engine.run_backtest(start_time, end_time)
+            return 0
+        except Exception as e:
+            logging.error(f"回测执行失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
+
+    # ✅ 启用动态分类 (v3.1新增)
+    scanner.use_dynamic_categories = args.use_dynamic_categories or getattr(config.scan, 'use_dynamic_categories', False)
+
+    # ============================================================
+    # 🆕 类别选择 (v3.1重构)
+    # ============================================================
+    selected_category = None
+    available_categories = scanner.get_available_categories()
+
+    if use_new_menu:
+        # 使用新的交互式菜单选择类别
+        selected_category = menu.select_category(scanner)
+    else:
+        # 非交互模式：通过 ID 匹配命令行指定的 domain
+        selected_category = next((c for c in available_categories if c.id == domain), None)
+        if not selected_category:
+            # 如果没找到匹配的，使用第一个（通常是 crypto）
+            selected_category = available_categories[0]
+            print(f"[INFO] 未找到匹配类别 '{domain}'，使用默认: {selected_category.name_zh}")
+
+    # 更新 domain 变量为最终选定的类别 ID，以保持后续逻辑兼容
+    domain = selected_category.id
+    try:
+        print(f"[INFO] 扫描类别: {selected_category.icon} {selected_category.name_zh} ({selected_category.name_en})")
+    except UnicodeEncodeError:
+        # Fallback for environments that don't support special icons/characters
+        print(f"[INFO] 扫描类别: {selected_category.name_zh} ({selected_category.name_en})")
+
+    # ============================================================
+    # 策略选择
+    # ============================================================
+    # 确定要执行的套利策略
+    selected_strategy_ids = None
+
+    if args.strategies:
+        # 命令行指定策略
+        selected_strategy_ids = [s.strip() for s in args.strategies.split(",")]
+        print(f"[INFO] 使用指定策略: {', '.join(selected_strategy_ids)}")
+    elif use_new_menu:
+        # 使用新的交互式菜单选择策略
+        selected_strategy_ids = menu.select_strategies(domain)
+        print(f"[INFO] 已选择策略: {', '.join(selected_strategy_ids)}")
+
+    # 如果没有选择策略，使用该领域的所有可用策略
+    if selected_strategy_ids is None:
+        available = StrategyRegistry.get_for_domain(domain)
+        selected_strategy_ids = [m.id for m in available]
+        print(f"[INFO] 使用默认策略: {', '.join(selected_strategy_ids)}")
+
+    # 子类别选择
     subcategories = None
     if args.subcat:
         # 使用命令行参数指定的子类别
@@ -4483,7 +3785,7 @@ def main():
                 data = json.load(f)
                 tag_categories = data.get("categories", {})
 
-            all_tags = tag_categories.get(args.domain, [])
+            all_tags = tag_categories.get(domain, [])
 
             # 检查每个子类别是否能扩展为有效标签
             final_subcats = []
@@ -4505,49 +3807,15 @@ def main():
         if expanded:
             subcategories = expanded
             print(f"[INFO] 子类别筛选: {', '.join(sorted(set(expanded)))}")
-    elif not args.no_interactive:
-        # 🆕 交互式子类别选择（v2.1新增）
-        # 用户没有通过 --subcat 指定，且允许交互
-        selected = interactive_subcategory_select(domain)
-        if selected:
-            subcategories = selected
-
-    # 创建扫描器
-    # 默认启用向量化模式，使用 --no-semantic 禁用
-    use_semantic = not args.no_semantic
+    elif use_new_menu:
+        # 使用新的交互式菜单选择子类别
+        subcategories = menu.select_subcategories(domain)
+        if subcategories:
+            print(f"[INFO] 已选择子类别: {', '.join(subcategories)}")
 
     # ============================================================
-    # 🆕 运行模式选择（v2.2新增）
+    # 🆕 缓存选择（v3.1重构）
     # ============================================================
-    # 优先级: --mode > --verify > 交互式选择 > 默认(PRODUCTION)
-    if args.mode:
-        # 命令行明确指定模式
-        run_mode = RunMode(args.mode)
-        print(f"[INFO] 运行模式: {args.mode.upper()}")
-    elif args.verify:
-        # 向后兼容：--verify 等价于 --mode debug
-        run_mode = RunMode.DEBUG
-        print("[INFO] 运行模式: DEBUG (通过 --verify 参数)")
-    elif not args.no_interactive:
-        # 交互式选择模式
-        run_mode = interactive_mode_select()
-    else:
-        # 默认：生产模式
-        run_mode = RunMode.PRODUCTION
-        print("[INFO] 运行模式: PRODUCTION (默认)")
-
-    scanner = ArbitrageScanner(
-        config,
-        profile_name=args.profile,
-        model_override=args.model,
-        use_semantic=use_semantic,  # 默认启用向量化模式
-        run_mode=run_mode,          # 🆕 运行模式
-        # 向后兼容参数
-        verify_mode=args.verify,    # @deprecated
-        verify_auto_save=args.verify_auto_save
-    )
-
-    # 🆕 缓存控制交互（v2.1新增）
     force_refresh = False
 
     if args.refresh:
@@ -4558,72 +3826,207 @@ def main():
         # CLI参数明确指定使用缓存
         force_refresh = False
         print("[INFO] 使用缓存模式")
-    elif not args.no_interactive:
-        # 交互模式：询问用户
-        cache_dir = scanner.config.output.cache_dir
-        # 构建可能的缓存文件名
-        cache_files_to_check = [f"{domain}_markets.json"]
-        if subcategories:
-            subcat_suffix = "_".join(sorted(subcategories))
-            cache_files_to_check.append(f"{domain}_{subcat_suffix}_markets.json")
-
-        has_cache = False
-        cache_file_path = None
-        for cf in cache_files_to_check:
-            fp = os.path.join(cache_dir, cf)
-            if os.path.exists(fp):
-                has_cache = True
-                cache_file_path = fp
-                break
-
-        if has_cache:
-            print(f"\n[缓存] 发现缓存的 {domain} 市场数据")
-            choice = input("是否使用缓存？(y=使用缓存, n=重新获取, 直接回车=y): ").strip().lower()
-            if choice in ['n', 'no']:
-                force_refresh = True
-                print("[INFO] 将重新获取市场数据")
+    elif use_new_menu:
+        # 使用新的交互式菜单选择缓存选项
+        force_refresh = menu.select_cache_option()
+        if output:
+            if force_refresh:
+                output.print_info("将重新获取市场数据")
             else:
-                print("[INFO] 使用缓存数据")
+                output.print_info("使用缓存数据")
 
-    try:
-        # 根据模式选择扫描方法
-        if args.monotonicity_check:
-            # 🆕 单调性违背扫描（Sprint 0）
-            subcat_info = f", 子类别: {subcategories}" if subcategories else ""
-            logging.info(f"[START] 单调性违背扫描 - 领域: {domain}{subcat_info}")
-            opportunities = scanner.scan_monotonicity(
-                domain=domain,
-                subcategories=subcategories,
-                force_refresh=force_refresh
-            )
-        elif use_semantic:
-            subcat_info = f", 子类别: {subcategories}" if subcategories else ""
-            logging.info(f"[START] 向量化模式 - 领域: {domain}{subcat_info}, 阈值: {args.threshold}")
-            opportunities = scanner.scan_semantic(
-                domain=domain,
-                semantic_threshold=args.threshold,
-                subcategories=subcategories,
-                force_refresh=force_refresh  # 🆕 传入刷新标志
-            )
-        else:
-            logging.info("[START] 传统模式（关键词搜索）")
-            opportunities = scanner.scan()
+    # ============================================================
+    # 🆕 配置确认（v3.1新增）
+    # ============================================================
+    if use_new_menu:
+        config_dict = {
+            "domain": domain,
+            "strategies": selected_strategy_ids or ["全部"],
+            "subcategories": subcategories or ["全部"],
+            "mode": run_mode.value,
+            "force_refresh": force_refresh
+        }
+        if not menu.confirm_config(config_dict):
+            print("[INFO] 取消扫描")
+            return 0
 
-        print("\n" + "=" * 65)
-        print("扫描完成！")
-        print("=" * 65)
-        
-        if opportunities:
-            print("\n下一步行动:")
-            print("  1. 仔细阅读每个机会的复核项目")
-            print("  2. 在Polymarket上验证当前价格")
-            print("  3. 阅读市场的结算规则")
-            print("  4. 小额测试（$10-50）")
-        
-        return len(opportunities)
-        
-    finally:
-        scanner.close()
+    # ============================================================
+    # 🆕 扫描执行 (v3.1重构 / Phase 5.3 高频模式)
+    # ============================================================
+    import time
+
+    def perform_scan_task():
+        """执行单次扫描任务"""
+        start_time = time.time()
+        opportunities = []
+        try:
+            if output:
+                output.print_step(1, 2, "获取市场数据...")
+
+            # 获取市场数据
+            if scanner.use_dynamic_categories:
+                markets = scanner.fetch_markets_for_category(selected_category, limit=config.scan.market_limit, force_refresh=force_refresh)
+            else:
+                markets = scanner._fetch_domain_markets(domain, subcategories, force_refresh)
+
+            if output:
+                output.print_market_fetch(len(markets), domain, subcategories)
+
+            # ✅ 记录市场价格快照 (Phase 6.1)
+            if hasattr(scanner, 'recorder'):
+                scanner.recorder.record_markets(markets)
+
+            if output:
+                output.print_step(2, 2, "执行套利策略...")
+
+            # ✅ 执行语义聚类发现关联市场 (Phase 5.1)
+            clusters = []
+            if getattr(config.scan, 'use_semantic_clustering', True) and scanner.clusterer:
+                try:
+                    # 仅对流动性达标的市场进行聚类以节省计算资源
+                    cluster_candidates = [m for m in markets if m.liquidity >= getattr(config.scan, 'min_liquidity', 1000)]
+                    if len(cluster_candidates) >= 2:
+                        clusters = scanner.clusterer.cluster_markets(
+                            cluster_candidates,
+                            similarity_threshold=getattr(config.scan, 'semantic_threshold', 0.85)
+                        )
+                        if output:
+                            output.print_info(f"语义聚类发现 {len(clusters)} 个关联簇")
+                except Exception as e:
+                    logging.warning(f"语义聚类失败: {e}")
+
+            # ✅ 批量聚类深度分析 (Phase 5.2 优化)
+            # 如果启用了聚类且选择了逻辑类策略，则执行批量分析以节省 Token 并提升召回率
+            logic_strategy_ids = ['implication', 'equivalent']
+            logic_strategy_active = any(s_id in selected_strategy_ids for s_id in logic_strategy_ids)
+
+            if clusters and logic_strategy_active:
+                if output:
+                    output.print_step(2, 2, f"正在对 {len(clusters)} 个语义簇进行批量逻辑挖掘...")
+
+                for i, cluster in enumerate(clusters):
+                    if len(cluster) < 2:
+                        continue
+
+                    try:
+                        batch_opps = scanner._analyze_cluster_fully(cluster)
+                        if batch_opps:
+                            # 排除掉已经通过策略发现的重复机会
+                            for b_opp in batch_opps:
+                                if not any(o.id == b_opp.id for o in opportunities):
+                                    opportunities.append(b_opp)
+                                    if output:
+                                        output.print_opportunity(b_opp)
+                    except Exception as e:
+                        logging.debug(f"批量分析簇 {i+1} 失败: {e}")
+
+            # 按优先级获取策略并执行
+            strategies = StrategyRegistry.get_by_ids(selected_strategy_ids)
+
+            for strategy in strategies:
+                # ✅ 修正：使用 strategy.metadata.id (Phase 5.2 修复)
+                if strategy.metadata.id in logic_strategy_ids and clusters:
+                    continue
+
+                if output:
+                    output.print_strategy_start(strategy.metadata.name)
+
+                try:
+                    opps = strategy.scan(
+                        markets,
+                        {
+                            "min_profit_pct": config.scan.min_profit_pct,
+                            "domain": domain,
+                            "subcategories": subcategories,
+                            "scan": config.scan,  # 传入完整配置
+                            "analyzer": scanner.analyzer,  # 传入 LLM 分析器
+                            "clusters": clusters  # 🆕 传入语义聚类结果 (Phase 5.1)
+                        },
+                        progress_callback=lambda curr, total, msg: (
+                            output.print_step(1, len(strategies), msg) if output else None
+                        ) if output else None
+                    )
+
+                    # ✅ 执行五层验证与风控填充 (Phase 2.5)
+                    valid_opps = []
+                    for opp in opps:
+                        validated_opp = scanner._validate_and_enrich_opportunity(opp, markets)
+                        if validated_opp:
+                            valid_opps.append(validated_opp)
+
+                    opportunities.extend(valid_opps)
+
+                    if output:
+                        output.print_strategy_result(strategy.metadata.name, len(valid_opps))
+
+                except Exception as e:
+                    if output:
+                        output.print_error(f"{strategy.metadata.name} 执行失败: {e}")
+
+            # 保存报告
+            if opportunities:
+                scanner._save_report(opportunities, domain)
+
+                # ✅ 记录套利机会存续历史 (Phase 6.1)
+                if hasattr(scanner, 'recorder'):
+                    scanner.recorder.record_opportunities(opportunities)
+
+                if output:
+                    output.print_report_saved(
+                        Path(scanner.config.output.output_dir) / f"scan_{domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                    )
+
+            # 显示结果摘要
+            elapsed_time = time.time() - start_time
+            if output:
+                output.print_summary(opportunities, elapsed_time)
+            else:
+                print("\n" + "=" * 65)
+                print("扫描完成！")
+                print("=" * 65)
+
+            if opportunities:
+                print("\n下一步行动:")
+                print("  1. 仔细阅读每个机会的复核项目")
+                print("  2. 在Polymarket上验证当前价格")
+                print("  3. 阅读市场的结算规则")
+                print("  4. 小额测试（$10-50）")
+
+            return len(opportunities)
+
+        except Exception as e:
+            import traceback
+            logging.error(f"扫描执行过程中出现异常: {e}")
+            traceback.print_exc()
+            return -1
+
+    # 逻辑控制：单次扫描 vs 高频循环模式 (Phase 5.3)
+    if not getattr(args, 'loop', False):
+        try:
+            return perform_scan_task()
+        finally:
+            scanner.close()
+    else:
+        # 进入高频循环模式
+        iteration = 1
+        interval = getattr(args, 'interval', 300)
+        print(f"\n[🚀 START] 进入高频扫描模式 | 间隔: {interval}s")
+        try:
+            while True:
+                print(f"\n{'='*60}")
+                print(f"迭代 #{iteration} | 开始时间: {datetime.now().strftime('%H:%M:%S')}")
+                print(f"{'='*60}")
+
+                perform_scan_task()
+
+                print(f"\n[WAIT] 扫描完成，等待 {interval} 秒进入下一次迭代...")
+                time.sleep(interval)
+                iteration += 1
+        except KeyboardInterrupt:
+            print("\n[STOP] 用户中断，退出高频模式")
+            return 0
+        finally:
+            scanner.close()
 
 
 if __name__ == "__main__":

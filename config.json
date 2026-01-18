@@ -3,16 +3,25 @@
   "_说明": {
     "_llm_profiles": "可配置多个LLM，通过 active_profile 切换使用",
     "_api_key": "api_key 可以直接填写，也可以留空通过环境变量设置（更安全）",
-    "_切换配置": "修改 active_profile 字段即可切换不同的LLM配置"
+    "_切换配置": "修改 active_profile 字段即可切换不同的LLM配置",
+    "_scenario_models": "场景化模型配置：为不同任务指定专用模型"
   },
   "llm_profiles": {
     "siliconflow": {
       "_description": "SiliconFlow - 国内聚合平台，推荐使用",
       "provider": "openai_compatible",
       "api_base": "https://api.siliconflow.cn/v1",
-      "api_key": "sk-yayehrysmtzbfbmpewdzjtwvpfnjzmelypfrtbnvcduketzf",
+      "api_key": "sk-ytejzhpgukdhzhltpkbxmtdiikahggwbiweixguhudnqogog",
       "model": "deepseek-ai/DeepSeek-V3",
-      "embedding_model": "BAAI/bge-large-zh-v1.5"
+      "_scenario_models": "场景化模型配置（可选）",
+      "scenario_models": {
+        "_说明": "为不同场景指定专用模型，留空或未配置则使用默认model",
+        "tag_classification": "deepseek-ai/DeepSeek-R1",
+        "_tag_classification": "Tag分类场景 - 使用思考模型进行智能分类",
+        "strategy_scan": "deepseek-ai/DeepSeek-V3",
+        "_strategy_scan": "策略扫描场景 - 使用快速模型进行套利策略分析"
+      },
+      "embedding_model": "BAAI/bge-m3"
     },
     "deepseek": {
       "_description": "DeepSeek官方API",
@@ -20,15 +29,34 @@
       "api_base": "https://api.deepseek.com/v1",
       "api_key": "",
       "model": "deepseek-chat",
+      "scenario_models": {
+        "tag_classification": "deepseek-reasoner",
+        "strategy_scan": "deepseek-chat"
+      },
       "embedding_model": "BAAI/bge-large-zh-v1.5"
     },
     "modelscope": {
       "_description": "ModelScope - 阿里云模型托管平台",
       "provider": "modelscope",
       "api_base": "https://api-inference.modelscope.cn/v1",
-      "api_key": "ms-4c9c3f47-cf98-43fa-b4ca-4a36e9ca1a63",
+      "api_key": "",
       "model": "Qwen/Qwen2.5-72B-Instruct",
+      "scenario_models": {
+        "tag_classification": "deepseek-ai/DeepSeek-R1",
+        "strategy_scan": "Qwen/Qwen2.5-32B-Instruct"
+      },
       "embedding_model": "Qwen/Qwen3-Embedding-8B"
+    },
+    "ollama": {
+      "_description": "本地Ollama - 免费离线",
+      "provider": "openai_compatible",
+      "api_base": "http://127.0.0.1:8045/v1",
+      "api_key": "sk-03b0af6474ea4cfc8547f6266683a18e",
+      "model": "gemini-3-flash",
+      "scenario_models": {
+        "tag_classification": "gemini-3-pro-high",
+        "strategy_scan": "gemini-3-flash"
+      }
     },
     "aliyun": {
       "_description": "阿里云通义千问",
@@ -63,7 +91,7 @@
       "embedding_model": "BAAI/bge-large-zh-v1.5"
     }
   },
-  "active_profile": "modelscope",
+  "active_profile": "ollama",
   "llm": {
     "_comment": "保留此字段用于向后兼容，新项目建议使用 llm_profiles + active_profile",
     "provider": "openai_compatible",
@@ -80,14 +108,26 @@
     "min_profit_pct": 2.0,
     "min_liquidity": 10000,
     "min_confidence": 0.8,
-    "max_llm_calls": 300,
+    "max_llm_calls": 30,
     "use_semantic_clustering": true,
     "semantic_threshold": 0.85,
     "embedding_model": "BAAI/bge-large-zh-v1.5",
     "enable_cache": true,
     "cache_ttl": 3600,
     "scan_domain": "crypto",
-    "enable_full_fetch": true,
+    "_子类别配置": {
+      "_scan_subcategories": "子类别筛选，留空获取全部。数组格式，支持简写",
+      "_示例": "[\"btc\", \"eth\"] 等同于 [\"bitcoin\", \"ethereum\"]",
+      "_说明": "输入bitcoin会自动包含bitcoin-prices、bitcoin-volatility等相关标签"
+    },
+    "scan_subcategories": [],
+    "_分页配置": {
+      "_enable_full_fetch": "是否启用全量获取（false=保持旧行为，最多100个市场）",
+      "_fetch_page_size": "每页大小（默认100）",
+      "_fetch_max_per_tag": "每个tag最大获取数量（0=全量获取）",
+      "_fetch_rate_limit": "API请求速率限制，每秒请求数（默认2.0）"
+    },
+    "enable_full_fetch": false,
     "fetch_page_size": 100,
     "fetch_max_per_tag": 0,
     "fetch_rate_limit": 2.0

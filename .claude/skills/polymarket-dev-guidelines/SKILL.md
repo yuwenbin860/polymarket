@@ -1,11 +1,11 @@
 ---
 name: polymarket-dev-guidelines
-description: Polymarket套利系统开发准则：小步快跑、进度持久化、开放创新、核心聚焦、LLM赋能、实证优先、策略迭代。在开发任务、架构决策、优先级判断时自动引用。
+description: Polymarket套利系统开发准则：小步快跑、进度持久化、开放创新、核心聚焦、LLM赋能、实证优先、策略迭代、交互优先、渐进披露、即时反馈、可扩展架构。在开发任务、架构决策、优先级判断时自动引用。
 ---
 
 # Polymarket 开发准则
 
-本项目遵循7条核心开发准则，在执行任何开发任务时都应参考这些原则。
+本项目遵循11条核心开发准则，在执行任何开发任务时都应参考这些原则。
 
 ## 2.1 小步快跑 (Incremental Progress)
 
@@ -137,6 +137,76 @@ description: Polymarket套利系统开发准则：小步快跑、进度持久化
 - 经验证的策略及时"晋升"到正式章节
 - 保持项目圣经作为"活文档"，持续演进
 
+## 2.8 交互优先 (Interactive-First)
+
+**原则**：用户界面设计以交互式体验为优先，命令行参数作为高级用法。
+
+**执行要点**：
+- 进入程序后默认显示交互式菜单
+- 主菜单只显示核心操作（扫描、配置、帮助、退出）
+- 命令行参数保留用于自动化脚本和高级用户
+- 使用 `--no-interactive` 禁用交互式菜单进入CLI模式
+
+**相关模块**：
+- `cli/menu.py` - 交互式菜单系统
+- `cli/output.py` - 规范化输出
+
+## 2.9 渐进披露 (Progressive Disclosure)
+
+**原则**：复杂配置和高级选项按需展开，不一次性展示所有选项。
+
+**执行要点**：
+- 主菜单只显示核心操作
+- 高级选项按需展开
+- 默认值对新手友好
+- 复杂配置使用分步引导而非一次性表单
+
+## 2.10 即时反馈 (Immediate Feedback)
+
+**原则**：每个操作步骤都提供清晰的反馈，让用户知道系统在做什么。
+
+**执行要点**：
+- 每个步骤清楚显示正在做什么（获取哪些市场、执行哪个策略）
+- 进度条显示耗时操作
+- 发现机会时立即高亮显示
+- 错误信息具有指导性，告诉用户如何解决而非只报错
+
+## 2.11 可扩展架构 (Extensible Architecture)
+
+**原则**：新增套利策略只需实现接口并注册，无需修改主流程。
+
+**执行要点**：
+- 新增套利策略只需实现 `BaseArbitrageStrategy` 接口
+- 使用 `@StrategyRegistry.register` 装饰器注册
+- 输出格式统一通过 `cli/output.py:ScannerOutput` 处理
+- 策略优先级、领域过滤通过 `StrategyMetadata` 配置
+- 菜单系统自动发现已注册策略，无需手动维护选项列表
+
+**策略注册示例**：
+```python
+from strategies import BaseArbitrageStrategy, StrategyMetadata, StrategyRegistry
+
+@StrategyRegistry.register
+class MyNewStrategy(BaseArbitrageStrategy):
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            id="my_strategy",
+            name="我的新策略",
+            name_en="My New Strategy",
+            description="策略描述",
+            priority=6,
+            requires_llm=False,
+            domains=["crypto"],
+            risk_level=RiskLevel.LOW,
+            min_profit_threshold=2.0
+        )
+
+    def scan(self, markets, config, progress_callback=None):
+        # 实现扫描逻辑
+        pass
+```
+
 ---
 
 ## 使用方式
@@ -150,3 +220,4 @@ description: Polymarket套利系统开发准则：小步快跑、进度持久化
 - **LLM使用** → 参考 2.5 LLM赋能
 - **新功能设计** → 参考 2.6 实证优先
 - **发现新模式** → 参考 2.7 策略迭代
+- **交互界面设计** → 参考 2.8-2.11 交互设计原则

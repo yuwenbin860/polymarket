@@ -81,6 +81,15 @@ class ScanSettings:
     # 会自动包含相关标签，如 "bitcoin" 自动包含 "bitcoin-prices", "bitcoin-volatility" 等
     scan_subcategories: List[str] = field(default_factory=list)
 
+    # 🆕 动态分类相关配置（v3.1新增）
+    # 是否启用动态分类发现（默认 False，保持向后兼容）
+    use_dynamic_categories: bool = False
+
+    # 动态分类发现参数
+    category_discovery_max: int = 12      # 最多发现的类别数量
+    category_discovery_min_tags: int = 5  # 每个类别最少包含的 tags 数量
+    category_cache_ttl: int = 86400       # 缓存有效期（秒，默认24小时）
+
     # 🆕 分页相关配置
     # 是否启用全量获取（默认False=保持旧行为，最多100个市场）
     enable_full_fetch: bool = False
@@ -93,6 +102,19 @@ class ScanSettings:
 
     # API请求速率限制（每秒请求数）
     fetch_rate_limit: float = 2.0
+
+    # 🆕 订单簿配置
+    enable_orderbook: bool = True
+    min_orderbook_depth: float = 500.0  # 最小订单簿深度 (USD)
+    max_spread_pct: float = 10.0        # 最大允许价差百分比
+
+    # 🆕 市场状态过滤
+    exclude_resolved: bool = True
+    min_hours_to_expiration: int = 1   # 最少剩余小时数
+
+    # 🆕 风控与收益门槛 (Phase 2.5)
+    min_apy: float = 15.0              # 最小年化收益率 (%)
+    target_size_usd: float = 500.0     # 模拟交易规模 (用于验证滑点)
 
 
 @dataclass
@@ -112,11 +134,26 @@ class OutputSettings:
 
 
 @dataclass
+class NotificationSettings:
+    """通知配置"""
+    enable_telegram: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    enable_wechat: bool = False
+    wechat_webhook_url: str = ""  # 企业微信机器人等
+
+    # 推送门槛
+    min_apy_to_notify: float = 30.0    # 仅推送高收益机会
+
+
+@dataclass
 class Config:
     """主配置类"""
     llm: LLMSettings = field(default_factory=LLMSettings)
     scan: ScanSettings = field(default_factory=ScanSettings)
     output: OutputSettings = field(default_factory=OutputSettings)
+    notify: NotificationSettings = field(default_factory=NotificationSettings)
 
     # 🆕 多LLM配置支持
     llm_profiles: Dict[str, Any] = field(default_factory=dict)  # 多个LLM配置
@@ -150,6 +187,14 @@ class Config:
                 output_dir=os.getenv("OUTPUT_DIR", "./output"),
                 log_level=os.getenv("LOG_LEVEL", "INFO"),
                 detailed_log=os.getenv("DETAILED_LOG", "true").lower() == "true",
+            ),
+            notify=NotificationSettings(
+                enable_telegram=os.getenv("ENABLE_TELEGRAM", "false").lower() == "true",
+                telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+                telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+                enable_wechat=os.getenv("ENABLE_WECHAT", "false").lower() == "true",
+                wechat_webhook_url=os.getenv("WECHAT_WEBHOOK_URL", ""),
+                min_apy_to_notify=float(os.getenv("MIN_APY_TO_NOTIFY", "30.0")),
             )
         )
     
@@ -181,6 +226,7 @@ class Config:
             llm=LLMSettings(**_filter_for_llm_settings(llm_data)) if llm_data else LLMSettings(),
             scan=ScanSettings(**_filter_comments(data.get("scan", {}))),
             output=OutputSettings(**_filter_comments(data.get("output", {}))),
+            notify=NotificationSettings(**_filter_comments(data.get("notify", {}))),
             llm_profiles=llm_profiles,
             active_profile=active_profile,
         )
@@ -191,6 +237,7 @@ class Config:
             "llm": asdict(self.llm),
             "scan": asdict(self.scan),
             "output": asdict(self.output),
+            "notify": asdict(self.notify),
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -279,6 +326,14 @@ DEFAULT_CONFIG_TEMPLATE = """{
     "cache_dir": "./cache",
     "log_level": "INFO",
     "detailed_log": true
+  },
+  "notify": {
+    "enable_telegram": false,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "enable_wechat": false,
+    "wechat_webhook_url": "",
+    "min_apy_to_notify": 30.0
   }
 }
 """

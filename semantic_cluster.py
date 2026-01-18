@@ -58,10 +58,25 @@ class SemanticClusterer:
             profile = config.llm_profiles[config.active_profile]
             # 过滤掉注释字段
             profile = {k: v for k, v in profile.items() if not k.startswith('_')}
+
+            # 🆕 智能选择 Embedding 供应商 (Phase 5.4)
+            # 如果当前 profile 是 ollama 且没有定义 embedding_model，
+            # 自动寻找第一个配置了 embedding_model 的云端供应商
             self.api_base = profile.get('api_base', 'https://api.siliconflow.cn/v1')
             self.api_key = profile.get('api_key', '')
-            # 从 profile 读取 embedding_model，如果没有则使用默认值
-            self.embed_model = profile.get('embedding_model', 'BAAI/bge-large-zh-v1.5')
+            self.embed_model = profile.get('embedding_model')
+
+            if not self.embed_model and "127.0.0.1" in self.api_base:
+                # 尝试回退到 siliconflow 专门用于 embedding
+                sf_profile = config.llm_profiles.get('siliconflow', {})
+                if sf_profile.get('api_key'):
+                    print(f"[INFO] 当前模型 ({config.active_profile}) 不支持 Embedding，正在回退到 SiliconFlow...")
+                    self.api_base = sf_profile.get('api_base', 'https://api.siliconflow.cn/v1')
+                    self.api_key = sf_profile.get('api_key', '')
+                    self.embed_model = sf_profile.get('embedding_model', 'BAAI/bge-m3')
+
+            if not self.embed_model:
+                self.embed_model = 'BAAI/bge-large-zh-v1.5' # 默认值
         else:
             # 回退到 llm 字段（向后兼容）
             self.api_base = config.llm.api_base or 'https://api.siliconflow.cn/v1'
@@ -80,36 +95,54 @@ class SemanticClusterer:
         return self.get_embeddings([text])[0]
 
     def get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """批量获取文本向量嵌入"""
+        """批量获取文本向量嵌入 (带重试逻辑)"""
+        import time
         url = f"{self.api_base}/embeddings"
-
-        # 分批处理，避免请求过大 (SiliconFlow限制较小)
         batch_size = 10
         all_embeddings = []
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-
             payload = {
                 "model": self.embed_model,
                 "input": batch,
                 "encoding_format": "float"
             }
 
-            try:
-                response = self.session.post(url, json=payload, timeout=60)
-                response.raise_for_status()
-                result = response.json()
+            success = False
+            for attempt in range(3):
+                try:
+                    # 🆕 增加基础延迟，避免触发 API 防御 (Phase 5.4 修复)
+                    if attempt > 0:
+                        time.sleep(2 ** attempt)
+                    else:
+                        time.sleep(0.5) # 基础间隔 500ms
 
-                # 提取embeddings
-                for item in result.get('data', []):
-                    all_embeddings.append(item['embedding'])
+                    response = self.session.post(url, json=payload, timeout=20)
 
-            except Exception as e:
-                print(f"Embedding API error: {e}")
-                # 返回零向量作为fallback
-                for _ in batch:
-                    all_embeddings.append([0.0] * 1024)  # BGE-large维度
+                    if response.status_code == 429: # Rate limit
+                        continue
+
+                    response.raise_for_status()
+                    result = response.json()
+                    for item in result.get('data', []):
+                        all_embeddings.append(item['embedding'])
+                    success = True
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        continue
+                    print(f"Embedding API error on batch {i}: {e}")
+
+            if not success:
+                # 🆕 局部降级: 如果 API 失败，为该批次生成简单的特征向量 (保底)
+                print(f"Using fallback features for batch {i}")
+                for t in batch:
+                    # 创建一个基于字符分布的简单固定维度向量
+                    fallback_vec = np.zeros(1024)
+                    for char in t:
+                        fallback_vec[ord(char) % 1024] += 1
+                    all_embeddings.append(fallback_vec.tolist())
 
         return np.array(all_embeddings)
 

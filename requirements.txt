@@ -21,8 +21,22 @@ numpy>=1.24.0                  # 向量计算
 rich>=13.0.0                   # 终端格式化、进度条、表格
 questionary>=2.0.0             # 交互式提示菜单
 
+# Phase 6: 交易执行与签名
+eth-account>=0.8.0             # 以太坊钱包与签名
+web3>=6.0.0                    # Web3交互
+py-clob-client>=0.19.0         # Polymarket官方CLOB客户端 (可选，作为参考)
+
 # 可选：向量数据库（大规模市场时使用）
 # chromadb>=0.4.0
+
+# Phase 7: Web UI Dashboard
+streamlit>=1.30.0                # Web UI 框架
+pandas>=2.0.0                     # 数据处理
+plotly>=5.18.0                    # 数据可视化
+
+# Phase 8: WebSocket Real-time Monitoring
+websockets>=12.0.0                # WebSocket 客户端
+asyncio                           # 异步并发支持
 
 # 开发依赖（可选）
 # pytest>=7.0.0

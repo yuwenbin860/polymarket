@@ -740,7 +740,29 @@ CLUSTER_ANALYSIS_PROMPT = """你正在分析一个语义聚类的市场组，这
 - 阈值市场需注意边界值（$100k 是否包含等于？）
 - 流动性低的市场可能存在定价偏差
 
-请使用标准的RELATIONSHIP_ANALYSIS_PROMPT_V2格式进行分析。
+请深入分析以上市场，识别所有可能的逻辑违背，并严格按以下 JSON 格式回答（仅输出 JSON，不要包含其他解释）：
+
+```json
+{{
+  "relationships": [
+    {{
+      "market_a_id": "市场A的ID",
+      "market_b_id": "市场B的ID",
+      "relationship": "IMPLIES_AB|IMPLIES_BA|EQUIVALENT|MUTUAL_EXCLUSIVE",
+      "confidence": 0.95,
+      "reasoning": "逻辑分析说明"
+    }}
+  ],
+  "synthetic_opportunities": [
+    {{
+      "type": "EXHAUSTIVE_SET|TIME_LADDER",
+      "market_ids": ["ID1", "ID2", "ID3"],
+      "action": "具体的交易组合建议",
+      "logic": "为何这组市场构成套利"
+    }}
+  ]
+}}
+```
 """
 
 
@@ -776,4 +798,123 @@ Focus on:
 
 Use standard RELATIONSHIP_ANALYSIS_PROMPT_V2 format for analysis.
 """
+
+
+# ============================================================
+# 动态分类发现 Prompt (v3.1新增)
+# ============================================================
+
+CATEGORY_DISCOVERY_PROMPT = """你是Polymarket预测市场的领域分析专家。
+
+## 任务
+分析提供的tags分布数据，发现**自然形成的主要市场类别**。
+
+## 输入数据
+我们从Polymarket API获取了所有tags及其市场数量：
+
+{tag_distribution}
+
+## 分析要求
+
+### 第一步：识别主题聚类
+观察tags的语义相似性，识别明显的主题聚类。例如：
+- "bitcoin", "ethereum", "crypto" → 加密货币类
+- "nba", "nfl", "world-cup" → 体育类
+- "election", "trump", "congress" → 政治类
+
+### 第二步：定义类别
+为每个聚类定义一个**清晰、独特**的类别，要求：
+1. 类别名称简洁明了（中英文）
+2. 覆盖足够多的tags（至少{min_tags}个）
+3. 类别之间互不重叠
+4. 最多发现{max_categories}个类别
+
+### 第三步：分配tags
+将每个tag分配到最合适的类别。如果某个tag不属于任何主要类别，归入"other"。
+
+## 输出格式
+
+严格按照以下JSON格式返回（不要添加其他文字）：
+
+```json
+{{
+  "categories": [
+    {{
+      "id": "crypto",
+      "name_zh": "加密货币",
+      "name_en": "Cryptocurrency",
+      "description": "比特币、以太坊、区块链、DeFi、NFT等数字资产市场",
+      "tags": ["bitcoin", "ethereum", "crypto", "defi", "nft"],
+      "icon": "₿",
+      "priority": 1,
+      "confidence": 0.95,
+      "reasoning": "tags语义高度集中，市场数量大"
+    }},
+    {{
+      "id": "politics",
+      "name_zh": "政治",
+      "name_en": "Politics",
+      "description": "选举、政府、政策、法律相关市场",
+      "tags": ["election", "trump", "biden", "congress"],
+      "icon": "🏛️",
+      "priority": 2,
+      "confidence": 0.92,
+      "reasoning": "选举和政治人物相关tags集中"
+    }},
+    {{
+      "id": "other",
+      "name_zh": "其他",
+      "name_en": "Other",
+      "description": "未归类的其他市场",
+      "tags": [],
+      "icon": "📦",
+      "priority": 999,
+      "confidence": 0.5,
+      "reasoning": "兜底类别"
+    }}
+  ],
+  "discovery_reasoning": "发现了X个主要类别，覆盖Y%的tags...",
+  "suggested_max_categories": 8
+}}
+```
+
+## 重要原则
+
+1. **数据驱动**：根据实际tag分布发现类别，不要预设类别
+2. **语义聚合**：同一类别的tags应该语义相关
+3. **市场覆盖**：优先形成覆盖大量市场的类别
+4. **互斥性**：每个tag只能属于一个类别
+5. **可扩展**：为未来新类别留出空间
+
+现在请开始分析。
+"""
+
+
+def format_category_discovery_prompt(
+    tag_stats: list,
+    max_categories: int = 12,
+    min_tags: int = 5
+) -> str:
+    """
+    格式化分类发现提示词
+
+    Args:
+        tag_stats: Tag 统计信息列表 [{"slug": str, "label": str, "market_count": int}, ...]
+        max_categories: 最多发现的类别数量
+        min_tags: 每个类别最少包含的 tags 数量
+
+    Returns:
+        str: 格式化后的提示词
+    """
+    # 取前100个tag用于分析（成本优化）
+    tag_distribution = "\n".join([
+        f"  {i+1}. {tag['slug']} ({tag.get('label', tag['slug'])}) - {tag.get('market_count', 0)} markets"
+        for i, tag in enumerate(tag_stats[:100])
+    ])
+
+    return CATEGORY_DISCOVERY_PROMPT.format(
+        tag_distribution=tag_distribution,
+        max_categories=max_categories,
+        min_tags=min_tags
+    )
 
